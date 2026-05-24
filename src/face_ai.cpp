@@ -22,6 +22,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #include "esp_camera.h"
 #include "esp_heap_caps.h"
@@ -137,6 +138,24 @@ namespace
     // is atomic w.r.t. the render task on the other core.
     portMUX_TYPE          g_overlay_mux = portMUX_INITIALIZER_UNLOCKED;
     face_overlay_t        g_overlay     = {};
+
+    // Known-face database. Each entry packages the L2-normalised
+    // embedding (used by the matcher), a downsampled RGB565 thumbnail
+    // cropped from the enrolment frame (served by the web UI), and a
+    // user-set name (likewise mutated through the web UI). The mutex
+    // gates every reader/writer; contention is rare (writers fire on
+    // enrolment, the matcher reads inside one critical section per
+    // detection, the HTTP handlers read on user demand) so a plain
+    // FreeRTOS mutex is plenty.
+    struct KnownFace
+    {
+        std::vector<float>    feat;
+        std::vector<uint16_t> thumb;        // FACE_THUMB_DIM^2 RGB565BE pixels
+        char                  name[FACE_NAME_MAX] = {0};
+        uint32_t              enrolled_ms = 0;
+    };
+    std::vector<KnownFace> g_known_faces;
+    SemaphoreHandle_t      g_db_mux = nullptr;
 
     inline uint32_t now_ms() noexcept
     {
@@ -515,6 +534,63 @@ namespace
         return ny > (e0y + e1y) / 2;
     }
 
+    // Crop a square region centred on the detected face from the raw
+    // camera fb (display-frame coords) and downsample it to the fixed
+    // thumbnail dimensions consumed by the web UI. The crop is widened
+    // ~20 % over the bbox so the saved thumb actually looks like the
+    // person (forehead + chin context) rather than a tight portrait
+    // mask. Nearest-neighbour resample is fine here — the thumb is
+    // 64x64 from a 240x240 source, and the image is consumed by
+    // human glance recognition, not pixel-precision tooling.
+    void crop_face_thumb(const uint16_t *fb_pixels,
+                         const dl::detect::result_t *det,
+                         Orient locked_orient,
+                         std::vector<uint16_t> *out_thumb) noexcept
+    {
+        int x0 = det->box[0], y0 = det->box[1];
+        int x1 = det->box[2], y1 = det->box[3];
+        unrotate_point(locked_orient, FRAME_DIM, x0, y0);
+        unrotate_point(locked_orient, FRAME_DIM, x1, y1);
+        const int xmin = std::min(x0, x1);
+        const int xmax = std::max(x0, x1);
+        const int ymin = std::min(y0, y1);
+        const int ymax = std::max(y0, y1);
+
+        const int bw = xmax - xmin;
+        const int bh = ymax - ymin;
+        const int cx = (xmin + xmax) / 2;
+        const int cy = (ymin + ymax) / 2;
+        int       side = std::max(bw, bh);
+        side = side + side / 5;        // +20 % forehead / chin context
+        const int half = side / 2;
+
+        int cx0 = std::max(0, cx - half);
+        int cy0 = std::max(0, cy - half);
+        int cx1 = std::min(FRAME_DIM, cx + half);
+        int cy1 = std::min(FRAME_DIM, cy + half);
+        // Re-square after edge-clipping so the resample stays
+        // isotropic; bias toward keeping the bbox visible by anchoring
+        // on (cx0, cy0).
+        const int s = std::min(cx1 - cx0, cy1 - cy0);
+        cx1 = cx0 + s;
+        cy1 = cy0 + s;
+        if (s <= 0) {
+            out_thumb->clear();
+            return;
+        }
+
+        out_thumb->resize((size_t)FACE_THUMB_DIM * FACE_THUMB_DIM);
+        uint16_t *dst = out_thumb->data();
+        for (int ty = 0; ty < FACE_THUMB_DIM; ++ty) {
+            const int sy = cy0 + (ty * s) / FACE_THUMB_DIM;
+            const uint16_t *srow = fb_pixels + (size_t)sy * FRAME_DIM;
+            for (int tx = 0; tx < FACE_THUMB_DIM; ++tx) {
+                const int sx = cx0 + (tx * s) / FACE_THUMB_DIM;
+                dst[ty * FACE_THUMB_DIM + tx] = srow[sx];
+            }
+        }
+    }
+
     float head_roll_for(const dl::detect::result_t *det, Orient o)
     {
         if (!det || det->keypoint.size() < 6)
@@ -581,10 +657,18 @@ namespace
             return;
         }
 
-        // In-memory known-face store. Each entry is the float embedding for
-        // one enrolled face; resets on every boot (i.e. this constructor).
-        std::vector<std::vector<float>> known_feats;
-        known_feats.reserve(8);
+        // The known-face DB lives at module scope (g_known_faces /
+        // g_db_mux) so the web server can read it from another task.
+        // The task acquires g_db_mux for every read or write below.
+        // Pre-reserve so the matcher's pointer to the embedding stays
+        // valid for the lifetime of the entry.
+        {
+            xSemaphoreTake(g_db_mux, portMAX_DELAY);
+            if (g_known_faces.capacity() < MAX_KNOWN_FACES) {
+                g_known_faces.reserve(MAX_KNOWN_FACES);
+            }
+            xSemaphoreGive(g_db_mux);
+        }
 
         // Counters for the per-second heartbeat.
         int64_t stats_next_us = esp_timer_get_time() + STATS_PERIOD_US;
@@ -645,7 +729,7 @@ namespace
                          (unsigned)s_frames, (unsigned)s_detections,
                          (unsigned)s_too_small, (unsigned)s_too_blurry,
                          (unsigned)s_recognised, (unsigned)s_enrolled,
-                         (unsigned)known_feats.size(),
+                         (unsigned)g_known_faces.size(),
                          (int)try_orient);
                 s_frames = s_detections = s_too_small = s_too_blurry =
                     s_recognised = s_enrolled = 0;
@@ -835,18 +919,26 @@ namespace
             }
             const float *raw_feat = t->get_element_ptr<float>();
 
-            // Compare against every stored embedding.
+            // Compare against every stored embedding. We hold the
+            // DB mutex for the duration so a concurrent rename from
+            // the web server can't tear the read; the loop is at most
+            // MAX_KNOWN_FACES * feat_len floats (~16 K FLOPs after
+            // SIMD), well under a millisecond of critical section.
             float best_sim = -2.f;
             int best_id = -1;
-            for (size_t i = 0; i < known_feats.size(); ++i)
+            xSemaphoreTake(g_db_mux, portMAX_DELAY);
+            for (size_t i = 0; i < g_known_faces.size(); ++i)
             {
-                const float s = cosine_sim(raw_feat, known_feats[i].data(), feat_len);
+                const float s = cosine_sim(raw_feat,
+                                           g_known_faces[i].feat.data(),
+                                           feat_len);
                 if (s > best_sim)
                 {
                     best_sim = s;
                     best_id = (int)i + 1; // 1-based for logging niceness
                 }
             }
+            xSemaphoreGive(g_db_mux);
 
             if (best_id > 0 && best_sim >= MATCH_THR)
             {
@@ -883,7 +975,23 @@ namespace
             // overlay, refreshing both the deadline and the rotation angle
             // so the text always reads upright relative to the current
             // face pose.
-            if (known_feats.size() >= MAX_KNOWN_FACES)
+            bool hit_cap = false;
+            size_t new_count = 0;
+            xSemaphoreTake(g_db_mux, portMAX_DELAY);
+            if (g_known_faces.size() >= MAX_KNOWN_FACES) {
+                hit_cap = true;
+            } else {
+                KnownFace entry;
+                entry.feat.assign(raw_feat, raw_feat + feat_len);
+                crop_face_thumb(src, biggest, locked_orient, &entry.thumb);
+                entry.name[0]    = '\0';
+                entry.enrolled_ms = now_ms();
+                g_known_faces.emplace_back(std::move(entry));
+                new_count = g_known_faces.size();
+            }
+            xSemaphoreGive(g_db_mux);
+
+            if (hit_cap)
             {
                 ESP_LOGD(TAG,
                          "skip enroll: hit global cap (%u), best_sim=%.3f",
@@ -891,7 +999,6 @@ namespace
             }
             else
             {
-                known_feats.emplace_back(raw_feat, raw_feat + feat_len);
                 ++s_enrolled;
 
                 // Only (re)render the banner if one isn't already on
@@ -914,8 +1021,8 @@ namespace
 
                     ESP_LOGI(TAG,
                              "NEW face enrolled id=%u (total=%u, bbox=%dx%d, focus=%d, orient=%d, roll=%.0fdeg)",
-                             (unsigned)known_feats.size(),
-                             (unsigned)known_feats.size(),
+                             (unsigned)new_count,
+                             (unsigned)new_count,
                              bw, bh, focus, (int)locked_orient,
                              (double)(roll * 180.f / 3.14159265f));
                 }
@@ -923,8 +1030,8 @@ namespace
                 {
                     ESP_LOGI(TAG,
                              "supplementary enrol id=%u (banner already up; total=%u, bbox=%dx%d, focus=%d)",
-                             (unsigned)known_feats.size(),
-                             (unsigned)known_feats.size(),
+                             (unsigned)new_count,
+                             (unsigned)new_count,
                              bw, bh, focus);
                 }
             }
@@ -938,6 +1045,17 @@ namespace
 
 esp_err_t face_ai_init(void)
 {
+    // The DB mutex must exist before face_ai_task starts touching the
+    // global g_known_faces. Init is idempotent: a second call to
+    // face_ai_init (shouldn't happen, but defensive) won't leak the
+    // old mutex because we only create one on the first pass.
+    if (!g_db_mux) {
+        g_db_mux = xSemaphoreCreateMutex();
+    }
+    if (!g_db_mux) {
+        return ESP_ERR_NO_MEM;
+    }
+
     const BaseType_t ok = xTaskCreatePinnedToCore(
         face_ai_task, "face_ai", TASK_STACK, nullptr,
         TASK_PRIO, nullptr, TASK_CORE);
@@ -957,4 +1075,72 @@ void face_ai_get_overlay(face_overlay_t *out)
     portENTER_CRITICAL(&g_overlay_mux);
     *out = g_overlay;
     portEXIT_CRITICAL(&g_overlay_mux);
+}
+
+int face_db_count(void)
+{
+    if (!g_db_mux) {
+        return 0;
+    }
+    xSemaphoreTake(g_db_mux, portMAX_DELAY);
+    const int n = (int)g_known_faces.size();
+    xSemaphoreGive(g_db_mux);
+    return n;
+}
+
+bool face_db_get_entry(int idx, face_db_entry_t *out)
+{
+    if (!out || !g_db_mux) {
+        return false;
+    }
+    bool ok = false;
+    xSemaphoreTake(g_db_mux, portMAX_DELAY);
+    if (idx >= 0 && idx < (int)g_known_faces.size()) {
+        const auto &kf  = g_known_faces[idx];
+        out->idx         = idx;
+        out->enrolled_ms = kf.enrolled_ms;
+        out->thumb_w     = FACE_THUMB_DIM;
+        out->thumb_h     = FACE_THUMB_DIM;
+        std::memcpy(out->name, kf.name, FACE_NAME_MAX);
+        ok = true;
+    }
+    xSemaphoreGive(g_db_mux);
+    return ok;
+}
+
+bool face_db_copy_thumb(int idx, uint16_t *dst, size_t dst_capacity_pixels)
+{
+    if (!dst || !g_db_mux ||
+        dst_capacity_pixels < (size_t)FACE_THUMB_DIM * FACE_THUMB_DIM) {
+        return false;
+    }
+    bool ok = false;
+    xSemaphoreTake(g_db_mux, portMAX_DELAY);
+    if (idx >= 0 && idx < (int)g_known_faces.size()) {
+        const auto &kf = g_known_faces[idx];
+        if (kf.thumb.size() == (size_t)FACE_THUMB_DIM * FACE_THUMB_DIM) {
+            std::memcpy(dst, kf.thumb.data(),
+                        kf.thumb.size() * sizeof(uint16_t));
+            ok = true;
+        }
+    }
+    xSemaphoreGive(g_db_mux);
+    return ok;
+}
+
+bool face_db_set_name(int idx, const char *name)
+{
+    if (!name || !g_db_mux) {
+        return false;
+    }
+    bool ok = false;
+    xSemaphoreTake(g_db_mux, portMAX_DELAY);
+    if (idx >= 0 && idx < (int)g_known_faces.size()) {
+        auto &kf = g_known_faces[idx];
+        std::strncpy(kf.name, name, FACE_NAME_MAX - 1);
+        kf.name[FACE_NAME_MAX - 1] = '\0';
+        ok = true;
+    }
+    xSemaphoreGive(g_db_mux);
+    return ok;
 }

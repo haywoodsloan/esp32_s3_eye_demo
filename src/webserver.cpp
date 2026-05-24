@@ -1,0 +1,410 @@
+// On-device HTTP server. Serves a one-page web UI that lets the user
+// inspect every face the detector has enrolled this boot and (re)name
+// them.
+//
+// Design notes:
+//
+//   * Thumbnails are stored internally as RGB565 big-endian (the
+//     camera's native format). We expand them to 24-bit BMP at
+//     serve time -- ~13 KB per 64x64 thumb -- because every browser
+//     can render BMP without any JS-side decoding and we don't have
+//     to pull in a JPEG encoder just for this.
+//
+//   * URI dispatch uses ESP-IDF's wildcard matcher (`*`). One GET
+//     handler covers /api/face/<id>/thumb and one POST handler covers
+//     /api/face/<id>/name; each parses the id out of req->uri.
+//
+//   * Cross-task safety is delegated to the face_db_* accessors in
+//     face_ai.cpp. We never hold a face DB lock across a socket
+//     write -- handlers snapshot what they need into stack /
+//     heap-local buffers, drop the lock, then stream.
+
+#include "webserver.h"
+#include "face_ai.h"
+
+#include "esp_check.h"
+#include "esp_err.h"
+#include "esp_http_server.h"
+#include "esp_log.h"
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+static const char *TAG = "web";
+static httpd_handle_t s_server = nullptr;
+
+// --- HTML page ------------------------------------------------------
+
+// Single-file UI. Inline CSS + JS keep us at one HTTP round-trip and
+// avoid having to serve a static asset directory. Polling every few
+// seconds is enough -- enrollments are rare and the UI is meant to be
+// looked at, not stared at.
+static const char INDEX_HTML[] = R"HTML(<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32-S3-EYE faces</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    font-family: system-ui, sans-serif;
+    background: #0f1115; color: #e9eaee;
+    margin: 0; padding: 24px;
+  }
+  h1 { margin: 0 0 16px; font-weight: 600; }
+  #status { color: #888; font-size: 13px; margin-bottom: 16px; }
+  #grid { display: grid; gap: 16px;
+          grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); }
+  .card {
+    background: #1a1d24;
+    border: 1px solid #2a2e38;
+    border-radius: 12px;
+    padding: 12px;
+    text-align: center;
+  }
+  .card img {
+    width: 128px; height: 128px;
+    image-rendering: pixelated;
+    background: #000;
+    border-radius: 8px;
+    display: block; margin: 0 auto 8px;
+  }
+  .meta { font-size: 12px; color: #888; margin-bottom: 8px; }
+  .row { display: flex; gap: 6px; }
+  input[type=text] {
+    flex: 1; min-width: 0;
+    background: #0f1115; color: #e9eaee;
+    border: 1px solid #2a2e38; border-radius: 6px;
+    padding: 6px 8px; font: inherit;
+  }
+  button {
+    background: #2a78ff; color: white; border: 0;
+    border-radius: 6px; padding: 6px 12px; cursor: pointer;
+    font: inherit;
+  }
+  button:hover { background: #3a88ff; }
+  .empty { color: #888; padding: 32px; text-align: center; }
+</style>
+</head>
+<body>
+<h1>Detected faces</h1>
+<div id="status">loading\u2026</div>
+<div id="grid"></div>
+<script>
+let lastCount = -1;
+async function load() {
+  try {
+    const r = await fetch('/api/faces');
+    const list = await r.json();
+    document.getElementById('status').textContent =
+      list.length + ' face' + (list.length === 1 ? '' : 's') + ' enrolled';
+    if (list.length === lastCount) {
+      // Same count; only refresh names (avoids flashing thumbnails).
+      for (const f of list) {
+        const input = document.querySelector('#face-' + f.id + ' input');
+        if (input && document.activeElement !== input) input.value = f.name || '';
+      }
+      return;
+    }
+    lastCount = list.length;
+    const grid = document.getElementById('grid');
+    if (list.length === 0) {
+      grid.innerHTML = '<div class="empty">No faces yet. Stand in front of the camera.</div>';
+      return;
+    }
+    grid.innerHTML = '';
+    for (const f of list) {
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.id = 'face-' + f.id;
+      card.innerHTML =
+        '<img src="/api/face/' + f.id + '/thumb">'
+        + '<div class="meta">#' + (f.id + 1) + '</div>'
+        + '<div class="row">'
+        +   '<input type="text" placeholder="name" value="'
+        +     (f.name || '').replace(/"/g, '&quot;') + '">'
+        +   '<button>Save</button>'
+        + '</div>';
+      const input = card.querySelector('input');
+      card.querySelector('button').onclick = async () => {
+        await fetch('/api/face/' + f.id + '/name', {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain' },
+          body: input.value
+        });
+        load();
+      };
+      input.addEventListener('keydown', e => {
+        if (e.key === 'Enter') card.querySelector('button').click();
+      });
+      grid.appendChild(card);
+    }
+  } catch (err) {
+    document.getElementById('status').textContent = 'error: ' + err;
+  }
+}
+load();
+setInterval(load, 2000);
+</script>
+</body>
+</html>
+)HTML";
+
+// --- helpers --------------------------------------------------------
+
+// Parse the integer id out of "/api/face/<id>/<suffix>". Returns -1
+// on any parsing failure or out-of-range id.
+static int parse_face_id(const char *uri)
+{
+    int id = -1;
+    // sscanf with a fixed prefix is enough -- the URIs are short and
+    // well-controlled; we don't need a full URI parser here.
+    if (std::sscanf(uri, "/api/face/%d", &id) != 1) {
+        return -1;
+    }
+    return id;
+}
+
+// Expand one 64-pixel-wide RGB565BE row into a 24-bit BGR BMP row.
+// BMP rows are 4-byte aligned; for FACE_THUMB_DIM * 3 = 192 we're
+// already aligned, but we pad explicitly so any future thumb size
+// still works.
+static void bmp_pack_row(const uint16_t *src, int width, uint8_t *dst)
+{
+    const uint8_t *sb = (const uint8_t *)src;
+    int           out = 0;
+    for (int x = 0; x < width; ++x) {
+        // BE: byte[0] = RRRRRGGG, byte[1] = GGGBBBBB.
+        const uint8_t hi = sb[x * 2];
+        const uint8_t lo = sb[x * 2 + 1];
+        const uint8_t r5 = (uint8_t)(hi >> 3);
+        const uint8_t g6 = (uint8_t)(((hi & 0x07) << 3) | (lo >> 5));
+        const uint8_t b5 = (uint8_t)(lo & 0x1F);
+        // 5 / 6 / 5 -> 8 / 8 / 8 via bit replication.
+        const uint8_t r8 = (uint8_t)((r5 << 3) | (r5 >> 2));
+        const uint8_t g8 = (uint8_t)((g6 << 2) | (g6 >> 4));
+        const uint8_t b8 = (uint8_t)((b5 << 3) | (b5 >> 2));
+        // BMP pixel order is BGR.
+        dst[out++] = b8;
+        dst[out++] = g8;
+        dst[out++] = r8;
+    }
+    // Pad to a multiple of 4 bytes (BMP requirement).
+    while (out & 3) {
+        dst[out++] = 0;
+    }
+}
+
+// --- handlers -------------------------------------------------------
+
+static esp_err_t handle_root(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t handle_faces_list(httpd_req_t *req)
+{
+    // Worst-case body size: MAX_KNOWN_FACES (32) entries of
+    // {"id":NN,"name":"<=31 chars JSON-escaped"} ~= 80 bytes each,
+    // plus brackets/commas. 4 KB is comfortable and stack-allocatable.
+    char   buf[4096];
+    size_t pos = 0;
+    pos += std::snprintf(buf + pos, sizeof(buf) - pos, "[");
+
+    const int n = face_db_count();
+    bool      first = true;
+    for (int i = 0; i < n; ++i) {
+        face_db_entry_t e;
+        if (!face_db_get_entry(i, &e)) {
+            continue;
+        }
+        // Escape backslash and double quote in the name; everything
+        // else 7-bit ASCII passes through. We don't expect non-ASCII
+        // from the form input, but truncate to FACE_NAME_MAX-1 above
+        // is the only enforced sanitisation.
+        char esc[FACE_NAME_MAX * 2 + 1];
+        size_t o = 0;
+        for (size_t k = 0; e.name[k] != '\0' && k < FACE_NAME_MAX - 1; ++k) {
+            const char c = e.name[k];
+            if (c == '"' || c == '\\') {
+                esc[o++] = '\\';
+            }
+            esc[o++] = c;
+        }
+        esc[o] = '\0';
+
+        pos += std::snprintf(buf + pos, sizeof(buf) - pos,
+                             "%s{\"id\":%d,\"name\":\"%s\",\"enrolled_ms\":%u}",
+                             first ? "" : ",",
+                             e.idx, esc, (unsigned)e.enrolled_ms);
+        first = false;
+        if (pos >= sizeof(buf) - 128) {
+            break; // safety -- truncate rather than overflow.
+        }
+    }
+    pos += std::snprintf(buf + pos, sizeof(buf) - pos, "]");
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, buf, pos);
+}
+
+static esp_err_t handle_face_thumb(httpd_req_t *req)
+{
+    const int id = parse_face_id(req->uri);
+    if (id < 0) {
+        return httpd_resp_send_404(req);
+    }
+
+    static constexpr int W = FACE_THUMB_DIM;
+    static constexpr int H = FACE_THUMB_DIM;
+    static constexpr int ROW_BYTES = ((W * 3 + 3) / 4) * 4;
+    static constexpr int PIX_BYTES = ROW_BYTES * H;
+    static constexpr int FILE_BYTES = 54 + PIX_BYTES;
+
+    uint16_t thumb[W * H];
+    if (!face_db_copy_thumb(id, thumb, W * H)) {
+        return httpd_resp_send_404(req);
+    }
+
+    // BMP file + DIB header. Hand-packed little-endian so we don't
+    // depend on host endianness assumptions.
+    uint8_t hdr[54] = {0};
+    auto put_u16 = [](uint8_t *p, uint16_t v) {
+        p[0] = (uint8_t)(v & 0xff);
+        p[1] = (uint8_t)((v >> 8) & 0xff);
+    };
+    auto put_u32 = [](uint8_t *p, uint32_t v) {
+        p[0] = (uint8_t)(v & 0xff);
+        p[1] = (uint8_t)((v >> 8) & 0xff);
+        p[2] = (uint8_t)((v >> 16) & 0xff);
+        p[3] = (uint8_t)((v >> 24) & 0xff);
+    };
+    hdr[0] = 'B'; hdr[1] = 'M';
+    put_u32(hdr + 2, FILE_BYTES);
+    put_u32(hdr + 10, 54);
+    put_u32(hdr + 14, 40);
+    put_u32(hdr + 18, (uint32_t)W);
+    // Negative height -> top-down row order, matches our buffer layout.
+    put_u32(hdr + 22, (uint32_t)(-H));
+    put_u16(hdr + 26, 1);
+    put_u16(hdr + 28, 24);
+    put_u32(hdr + 34, PIX_BYTES);
+
+    httpd_resp_set_type(req, "image/bmp");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    httpd_resp_send_chunk(req, (const char *)hdr, sizeof(hdr));
+
+    uint8_t row[ROW_BYTES];
+    for (int y = 0; y < H; ++y) {
+        bmp_pack_row(thumb + (size_t)y * W, W, row);
+        httpd_resp_send_chunk(req, (const char *)row, ROW_BYTES);
+    }
+    return httpd_resp_send_chunk(req, nullptr, 0);
+}
+
+static esp_err_t handle_face_name(httpd_req_t *req)
+{
+    const int id = parse_face_id(req->uri);
+    if (id < 0) {
+        return httpd_resp_send_404(req);
+    }
+
+    // Names are short by spec (FACE_NAME_MAX). Allow a bit of
+    // surrounding whitespace / a trailing newline that some HTTP
+    // clients tack on and still fit on the stack.
+    char body[FACE_NAME_MAX + 16] = {0};
+    int  recv_total = 0;
+    while (recv_total < (int)sizeof(body) - 1) {
+        const int r = httpd_req_recv(req, body + recv_total,
+                                     sizeof(body) - 1 - recv_total);
+        if (r <= 0) {
+            if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+                continue;
+            }
+            break;
+        }
+        recv_total += r;
+    }
+    body[recv_total] = '\0';
+
+    // Trim trailing whitespace / CR / LF so a form-style trailing
+    // newline doesn't pollute the stored name.
+    while (recv_total > 0) {
+        const char c = body[recv_total - 1];
+        if (c == '\n' || c == '\r' || c == ' ' || c == '\t') {
+            body[--recv_total] = '\0';
+        } else {
+            break;
+        }
+    }
+
+    if (!face_db_set_name(id, body)) {
+        return httpd_resp_send_404(req);
+    }
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
+// --- public entrypoint ----------------------------------------------
+
+esp_err_t webserver_init(void)
+{
+    if (s_server) {
+        return ESP_OK;
+    }
+
+    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    // Bump stack / max URIs over the IDF defaults so the dynamic JSON
+    // builder and the wildcard handlers fit comfortably.
+    cfg.stack_size       = 8192;
+    cfg.max_uri_handlers = 8;
+    // Enable wildcard URI matching so a single handler can serve
+    // /api/face/<id>/thumb for every id.
+    cfg.uri_match_fn     = httpd_uri_match_wildcard;
+
+    ESP_RETURN_ON_ERROR(httpd_start(&s_server, &cfg), TAG, "httpd_start");
+
+    const httpd_uri_t uri_root = {
+        .uri      = "/",
+        .method   = HTTP_GET,
+        .handler  = handle_root,
+        .user_ctx = nullptr,
+    };
+    const httpd_uri_t uri_list = {
+        .uri      = "/api/faces",
+        .method   = HTTP_GET,
+        .handler  = handle_faces_list,
+        .user_ctx = nullptr,
+    };
+    // Both /thumb and /name share the /api/face/* prefix. We register
+    // a GET handler that serves the thumbnail and a POST handler that
+    // updates the name; the wildcard matcher dispatches by method.
+    const httpd_uri_t uri_face_get = {
+        .uri      = "/api/face/*",
+        .method   = HTTP_GET,
+        .handler  = handle_face_thumb,
+        .user_ctx = nullptr,
+    };
+    const httpd_uri_t uri_face_post = {
+        .uri      = "/api/face/*",
+        .method   = HTTP_POST,
+        .handler  = handle_face_name,
+        .user_ctx = nullptr,
+    };
+
+    ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_server, &uri_root),
+                        TAG, "register /");
+    ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_server, &uri_list),
+                        TAG, "register /api/faces");
+    ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_server, &uri_face_get),
+                        TAG, "register GET /api/face/*");
+    ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_server, &uri_face_post),
+                        TAG, "register POST /api/face/*");
+
+    ESP_LOGI(TAG, "HTTP server up on port %u", (unsigned)cfg.server_port);
+    return ESP_OK;
+}

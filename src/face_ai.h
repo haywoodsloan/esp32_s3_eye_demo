@@ -32,3 +32,42 @@ typedef struct {
 // should treat the data as stale if `(now_ms - out->stamp_ms)` exceeds
 // the detector's expected per-frame budget. Safe to call from any task.
 void face_ai_get_overlay(face_overlay_t *out);
+
+// ---------------------------------------------------------------
+// Known-face database (in-memory, resets on every boot)
+// ---------------------------------------------------------------
+//
+// Each enrolment stores not just the embedding but also a small
+// thumbnail crop of the face and an optional human-readable name.
+// The web UI consumes the accessors below to render the gallery and
+// to PATCH the names.
+
+#define FACE_THUMB_DIM 64    // thumbnails are FACE_THUMB_DIM x FACE_THUMB_DIM, RGB565BE
+#define FACE_NAME_MAX  32
+
+typedef struct {
+    int      idx;                 // 0-based position in the face DB
+    uint32_t enrolled_ms;         // millis-since-boot when first enrolled
+    int      thumb_w;             // thumbnail width in pixels (== FACE_THUMB_DIM)
+    int      thumb_h;             // thumbnail height in pixels (== FACE_THUMB_DIM)
+    char     name[FACE_NAME_MAX]; // user-set name; empty string if unset
+} face_db_entry_t;
+
+// Number of known faces currently in the database.
+int  face_db_count(void);
+
+// Copy metadata for face `idx` into *out. Returns false if `idx` is
+// out of range. Thread-safe.
+bool face_db_get_entry(int idx, face_db_entry_t *out);
+
+// Copy thumbnail pixels (RGB565 big-endian, FACE_THUMB_DIM ** 2 pixels)
+// for face `idx` into `dst`. `dst_capacity_pixels` must be at least
+// FACE_THUMB_DIM*FACE_THUMB_DIM. Returns false if `idx` is out of
+// range or `dst` is too small. Thread-safe.
+bool face_db_copy_thumb(int idx, uint16_t *dst,
+                        size_t dst_capacity_pixels);
+
+// Set the human-readable name for face `idx`. The string is copied;
+// at most FACE_NAME_MAX-1 chars are stored (truncated, NUL-terminated).
+// Returns false if `idx` is out of range. Thread-safe.
+bool face_db_set_name(int idx, const char *name);

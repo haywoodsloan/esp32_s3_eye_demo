@@ -19,6 +19,7 @@
 #include "camera.h"
 #include "display.h"
 #include "face_ai.h"
+#include "webserver.h"
 #include "wifi.h"
 
 #include <algorithm>
@@ -252,7 +253,15 @@ extern "C" void app_main(void)
     // the live preview starts immediately and a slow / failed Wi-Fi
     // associate doesn't gate the user-facing experience. wifi_init()
     // logs the IP on success; failure just leaves us offline.
-    if (wifi_init() != ESP_OK) {
+    if (wifi_init() == ESP_OK) {
+        // Web UI only makes sense if we have a netif up; start it
+        // alongside the rest of the app rather than gating the AI
+        // pipeline on httpd_start so a port-bind failure stays
+        // non-fatal.
+        if (webserver_init() != ESP_OK) {
+            ESP_LOGW(TAG, "web server failed to start; continuing");
+        }
+    } else {
         ESP_LOGW(TAG, "continuing without Wi-Fi");
     }
 
