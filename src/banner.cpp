@@ -50,7 +50,7 @@ static const char *TAG = "banner";
    edges of the face's view (and, after rotation, the corresponding
    pair of LCD edges). Sized so the text + outline still fits inside
    the 240 px buffer at every multiple-of-90-deg rotation. */
-#define LINE_OFFSET_PX      84
+#define LINE_OFFSET_PX      92
 /* A full CELL_W between words looked far too airy (the glyphs already
    carry ~1 col of empty source padding on each side, plus LETTER_GAP_PX
    between cells). Render the space character with a half-width cell so
