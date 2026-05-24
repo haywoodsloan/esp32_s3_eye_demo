@@ -1,0 +1,960 @@
+// Face-recognition task. Owns the ESP-WHO HumanFaceDetect detector plus
+// a HumanFaceFeat embedder, and maintains its own in-memory list of
+// known-face embeddings. Runs on core 0 so it shares CPU with the
+// camera HAL but never touches core 1 (where the LCD render loop lives);
+// the render task remains free to push camera frames at full FPS.
+//
+// Why we bypass HumanFaceRecognizer:
+//   * Its match threshold is a private constant set to 0.5 in the
+//     library; the public API exposes no setter. With the OV2640 +
+//     MobileFaceNet pairing on a 240x240 RGB565 frame we see same-face
+//     similarities in the 0.55-0.75 range and a non-trivial fraction of
+//     frames slip below 0.5, which is enough to spawn a brand-new id
+//     for an already-known face.
+//   * The spec calls for an "internal list" that resets on board reset.
+//     HumanFaceFeat + a std::vector here matches that wording exactly
+//     and skips a SPIFFS round-trip we don't otherwise need.
+// HumanFaceFeat::run returns an L2-normalised float embedding, so cosine
+// similarity collapses to a plain dot product.
+
+#include "face_ai.h"
+#include "banner.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "esp_camera.h"
+#include "esp_heap_caps.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+
+#include "human_face_detect.hpp"
+#include "human_face_recognition.hpp" // HumanFaceFeat lives here
+#include "dl_tensor_base.hpp"
+
+#include "esp_dsp.h"          // dsps_dotprod_f32: SIMD dot product
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <list>
+#include <vector>
+
+namespace
+{
+
+    constexpr const char *TAG = "face_ai";
+
+    // Task placement. Pinned to core 1 because core 0 is already busy
+    // with the camera HAL (cam_hal, prio 23) and the render task, both
+    // of which are short bursts that finish quickly but happen at the
+    // sensor's full frame rate. Inference on this task takes ~50-100 ms
+    // per detection-frame and would otherwise starve the camera HAL of
+    // CPU. Splitting them across cores lets the camera/render pipeline
+    // run at full FPS while the AI loop chews through frames in
+    // parallel.
+    //
+    // Priority is still kept above the render task's priority so that
+    // when both happen to be waiting on the camera fb queue at the same
+    // instant (rare — they're on different cores now — but possible)
+    // FreeRTOS hands the next fb to the AI task. Render is the
+    // background consumer that picks up every fb the AI loop hasn't
+    // grabbed.
+    constexpr UBaseType_t TASK_PRIO = 6;
+    constexpr BaseType_t TASK_CORE = 1;
+    constexpr uint32_t TASK_STACK = 16 * 1024;
+
+    // Banner hold duration, in milliseconds (matches g_banner_until_ms).
+    // The banner is now a non-intrusive overlay on top of the live
+    // preview rather than a full-screen takeover, and the message is
+    // split across the top and bottom edges of the screen — giving the
+    // user a comfortable 5 s to read both halves while keeping the
+    // centre of the frame clear of text.
+    constexpr uint32_t BANNER_HOLD_MS = 5000;
+
+    // Minimum face bounding-box edge in pixels. Tiny detections are usually
+    // false positives or too small for the embedder to be reliable on.
+    // On the 240x240 sensor frame, 83 px is ~35% of the frame edge (~12%
+    // of the area); 15% larger than the previous 72 px gate so the user
+    // has to be a bit closer before recognition / enrolment kicks in.
+    constexpr int MIN_FACE_PX = 83;
+
+    // Sharpness gate - average per-sample (|dx| + |dy|) on the green channel
+    // inside the face bbox. Bumped from 10 to 25 because the duplicate-id
+    // log we saw was driven by low-focus frames slipping through and
+    // producing noisy embeddings that fell below the match threshold.
+    constexpr int MIN_SHARPNESS = 25;
+
+    // Cosine-similarity threshold for "this is an already-known face".
+    // Lower than HumanFaceRecognizer's hard-coded 0.5 because we observed
+    // same-face similarities as low as ~0.40 on the OV2640 + MFN combo
+    // across head-pose / lighting drift between sessions, and we want
+    // recognition to win in those cases. Cross-person similarities on the
+    // same hardware are typically <= 0.30, so 0.40 still leaves margin.
+    constexpr float MATCH_THR = 0.40f;
+
+    // How many consecutive frames must (a) be sharp, (b) have a confident
+    // face detection, and (c) NOT match any known embedding before we
+    // commit to enrolling a new face. Two frames is enough to reject a
+    // single noisy frame while keeping first-enrollment latency low.
+    constexpr int ENROLL_DEBOUNCE_FRAMES = 2;
+
+    // Hard cap on the in-memory known-face list. The list resets on every
+    // boot, but within a single power-on session this bounds how much
+    // PSRAM the embedder vector can chew through if recognition keeps
+    // mis-firing on the same person. ~32 * feat_len(=512) * 4 B ~= 64 KB,
+    // well within budget on this board.
+    constexpr size_t MAX_KNOWN_FACES = 32;
+
+    // Throttle the AI loop when no face is in frame. Without this, the
+    // detection-only path takes ~50-100 ms and starves the render task of
+    // camera frames (both tasks block on the same fb queue, and AI's prio 6
+    // outranks render's prio 5, so AI wins the wakeup every time the
+    // camera HAL produces a new fb). Tighter than before (was 80 ms) to
+    // minimise the wait between orientation-cycle tries; render still gets
+    // the camera HAL's full output rate on the other core.
+    constexpr uint32_t NO_FACE_DELAY_MS = 40;
+
+    // Throttled diagnostics: one summary log per second so the serial
+    // output is useful but never flooded.
+    constexpr int64_t STATS_PERIOD_US = 1000LL * 1000LL;
+
+    // Banner-end deadline as a millisecond count since boot, accessed
+    // cross-task by the AI task (writer) and the render task + AI loop
+    // (readers). Stored as uint32_t -- and NOT int64_t -- because the
+    // Xtensa LX7 has lock-free 32-bit atomics (`s32c1i`) but no native
+    // 8-byte CAS: `std::atomic<int64_t>` lowers to libatomic calls that
+    // take a global mutex, which we'd be paying on every render frame
+    // and every AI iteration. uint32 milliseconds gives ~49 days of
+    // headroom from boot, well past any plausible session lifetime.
+    std::atomic<uint32_t> g_banner_until_ms{0};
+
+    // Latest face detection in DISPLAY-frame coordinates, published
+    // each successful detection for the render task to draw on top of
+    // the live preview. Guarded by a portMUX so the multi-field write
+    // is atomic w.r.t. the render task on the other core.
+    portMUX_TYPE          g_overlay_mux = portMUX_INITIALIZER_UNLOCKED;
+    face_overlay_t        g_overlay     = {};
+
+    inline uint32_t now_ms() noexcept
+    {
+        return static_cast<uint32_t>(esp_timer_get_time() / 1000);
+    }
+
+    // Cheap focus / motion-blur metric: average of |g(x,y) - g(x+1,y)| +
+    // |g(x,y) - g(x,y+1)| over a strided sample of the face bbox, where g
+    // is taken from the high byte of the BE-stored uint16_t pixel (green
+    // dominates that byte in RGB565). A sharp face yields ~30-80, a blurry
+    // or motion-smeared face ~5-15.
+    int focus_metric(const uint16_t *__restrict__ rgb565, int img_w, int img_h,
+                     int x0, int y0, int x1, int y1) noexcept
+    {
+        if (x0 < 1)
+            x0 = 1;
+        if (y0 < 1)
+            y0 = 1;
+        if (x1 > img_w - 2)
+            x1 = img_w - 2;
+        if (y1 > img_h - 2)
+            y1 = img_h - 2;
+        if (x1 - x0 < 8 || y1 - y0 < 8)
+            return 0;
+
+        int n = 0;
+        int sum = 0;
+        for (int y = y0; y < y1; y += 3)
+        {
+            const uint16_t *row = rgb565 + y * img_w;
+            for (int x = x0; x < x1 - 1; x += 3)
+            {
+                const int g = (row[x] >> 8) & 0xFF;
+                const int gx = (row[x + 1] >> 8) & 0xFF;
+                const int gy = (row[x + img_w] >> 8) & 0xFF;
+                sum += std::abs(g - gx) + std::abs(g - gy);
+                ++n;
+            }
+        }
+        return n ? sum / n : 0;
+    }
+
+    // Embeddings are L2-normalised by FeatPostprocessor::l2_norm() before
+    // they leave the model, so cosine similarity collapses to a plain dot
+    // product. ESP-DSP ships an Xtensa LX7 SIMD (PIE) implementation of
+    // dsps_dotprod_f32 that hits roughly 6x the throughput of a plain C
+    // loop on this chip, which matters as the known-face list grows.
+    float cosine_sim(const float *__restrict__ a,
+                     const float *__restrict__ b, int n) noexcept
+    {
+        float s = 0.f;
+        dsps_dotprod_f32(a, b, &s, n);
+        return s;
+    }
+
+    // --- Orientation handling -------------------------------------------------
+    //
+    // ESP-WHO's face detector is only trained on upright faces; rotate the
+    // board 90 deg and detection stops working. We work around that by
+    // pre-rotating each camera frame into a PSRAM scratch buffer (0/90/180/
+    // /270 deg) and feeding the rotated frame to the detector. One
+    // orientation is tried per frame; if it fails we advance to the next on
+    // the next frame, so unsuccessful discovery costs at most 4 frames of
+    // latency. Once an orientation succeeds we lock onto it (subsequent
+    // frames re-use that orientation and detection is single-shot again)
+    // until we lose the face, then the cycle resumes.
+
+    enum class Orient : uint8_t
+    {
+        ROT_0 = 0,
+        ROT_90_CW = 1,
+        ROT_180 = 2,
+        ROT_270_CW = 3
+    };
+
+    constexpr int FRAME_DIM = 240; // OV2640 is configured for 240x240 RGB565.
+
+    // ---------------------------------------------------------------
+    // Detector-input pipeline
+    // ---------------------------------------------------------------
+    //
+    // For every frame we have to (potentially) (1) sample the frame to
+    // decide whether to contrast-stretch, (2) rotate the frame to make
+    // the face upright, and (3) apply the stretch. The naive version
+    // did each step as a separate full pass over 240x240 RGB565 in
+    // PSRAM, which on the S3 burns ~3-4 ms per pass on memory
+    // bandwidth alone. The fused version below does all three in at
+    // most one full pass plus one subsampled pass:
+    //
+    //   * analyze_luma_subsampled() walks every PREP_STRIDE-th pixel
+    //     in both axes (=> 1/16 of the frame) to build a coarse luma
+    //     histogram and pick the 2/98 percentile bounds. This is
+    //     plenty of statistical resolution for a frame-level stretch
+    //     decision and keeps the analysis pass effectively free.
+    //
+    //   * If the frame is already well-exposed *and* the requested
+    //     orientation is ROT_0, we skip every subsequent step and
+    //     point the detector straight at the camera fb (zero copy).
+    //
+    //   * Otherwise prep_detect_input() runs exactly one pass that
+    //     fuses the rotation index math with an optional per-channel
+    //     LUT apply (the contrast stretch). The LUT branch is hoisted
+    //     out of the hot loop via a non-type template parameter so
+    //     the inner loop is straight-line on each instantiation.
+    //
+    // Net effect on the worst case (need stretch + rotate) drops from
+    // 3 full PSRAM passes down to ~1.06. The common-case live-preview
+    // path (well exposed, ROT_0 locked) drops to a single subsampled
+    // pass.
+
+    constexpr int PREP_STRIDE = 4;       // 1/16 of pixels sampled
+    constexpr int STRETCH_RANGE_MAX = 200; // already-good frames skip stretch
+
+    // Returns true when the frame's 2/98-percentile luma spread is
+    // narrow enough to benefit from a contrast stretch. On true,
+    // y_lo / y_hi hold the percentile bounds in 8-bit luma space.
+    bool analyze_luma_subsampled(const uint16_t *pixels, int n_side,
+                                 int &y_lo, int &y_hi) noexcept
+    {
+        uint32_t hist[256] = {0};
+        const uint8_t *p8 = (const uint8_t *)pixels;
+        int samples = 0;
+        for (int y = 0; y < n_side; y += PREP_STRIDE) {
+            const uint8_t *row = p8 + (size_t)y * n_side * 2;
+            for (int x = 0; x < n_side; x += PREP_STRIDE) {
+                const uint8_t hi = row[x * 2];     // RRRRR GGG
+                const uint8_t lo = row[x * 2 + 1]; // GGG BBBBB
+                const uint8_t g6 = (uint8_t)(((hi & 0x07) << 3) | (lo >> 5));
+                const uint8_t y8 = (uint8_t)((g6 << 2) | (g6 >> 4));
+                ++hist[y8];
+                ++samples;
+            }
+        }
+        const uint32_t low_n  = (uint32_t)samples * 2  / 100;
+        const uint32_t high_n = (uint32_t)samples * 98 / 100;
+        uint32_t acc = 0;
+        int lo_v = 0, hi_v = 255;
+        for (int v = 0; v < 256; ++v) {
+            acc += hist[v];
+            if (acc >= low_n) { lo_v = v; break; }
+        }
+        acc = 0;
+        for (int v = 0; v < 256; ++v) {
+            acc += hist[v];
+            if (acc >= high_n) { hi_v = v; break; }
+        }
+        y_lo = lo_v;
+        y_hi = hi_v;
+        return (hi_v - lo_v) < STRETCH_RANGE_MAX;
+    }
+
+    // Build a 256-entry 8-bit -> 8-bit LUT that maps [y_lo, y_hi] to
+    // [0, 255]. Guards against degenerate (near-zero) ranges that
+    // would blow up the gain.
+    void build_stretch_lut(int y_lo, int y_hi, uint8_t lut[256]) noexcept
+    {
+        int range = y_hi - y_lo;
+        if (range < 32) {
+            range = 32;
+        }
+        const int32_t gain_q8 = (255 << 8) / range;
+        for (int v = 0; v < 256; ++v) {
+            int32_t o = ((v - y_lo) * gain_q8) >> 8;
+            if (o < 0)   o = 0;
+            if (o > 255) o = 255;
+            lut[v] = (uint8_t)o;
+        }
+    }
+
+    // Per-pixel kernel: read one RGB565BE word from `sp`, optionally
+    // run its three channels through `lut`, and write the result to
+    // `dp`. With WithLut=false this collapses to a single uint16_t
+    // copy; with WithLut=true it's load-byte / unpack / 3x LUT /
+    // repack / store-byte.
+    template <bool WithLut>
+    inline void copy_pixel(const uint16_t *__restrict__ sp,
+                           uint16_t *__restrict__ dp,
+                           const uint8_t *lut) noexcept
+    {
+        if constexpr (!WithLut) {
+            *dp = *sp;
+        } else {
+            const uint8_t *sb = (const uint8_t *)sp;
+            uint8_t       *db = (uint8_t *)dp;
+            const uint8_t hi = sb[0];
+            const uint8_t lo = sb[1];
+            const uint8_t r5 = (uint8_t)(hi >> 3);
+            const uint8_t g6 = (uint8_t)(((hi & 0x07) << 3) | (lo >> 5));
+            const uint8_t b5 = (uint8_t)(lo & 0x1F);
+            const uint8_t r8 = (uint8_t)((r5 << 3) | (r5 >> 2));
+            const uint8_t g8 = (uint8_t)((g6 << 2) | (g6 >> 4));
+            const uint8_t b8 = (uint8_t)((b5 << 3) | (b5 >> 2));
+            const uint8_t nr5 = (uint8_t)(lut[r8] >> 3);
+            const uint8_t ng6 = (uint8_t)(lut[g8] >> 2);
+            const uint8_t nb5 = (uint8_t)(lut[b8] >> 3);
+            db[0] = (uint8_t)((nr5 << 3) | (ng6 >> 3));
+            db[1] = (uint8_t)((ng6 << 5) | nb5);
+        }
+    }
+
+    // Fused rotate + optional stretch. Each orient gets a dedicated
+    // double-loop with branch-free indexing; WithLut is a template
+    // parameter so the inner kernel is straight-line in either mode.
+    template <bool WithLut>
+    void rotate_to_scratch(Orient o,
+                           const uint16_t *__restrict__ src,
+                           uint16_t *__restrict__ dst,
+                           int n, const uint8_t *lut) noexcept
+    {
+        switch (o) {
+        case Orient::ROT_0: {
+            if constexpr (!WithLut) {
+                // Plain copy beats the templated per-pixel loop here
+                // because libc memcpy uses wider loads/stores than
+                // the kernel can express.
+                memcpy(dst, src, (size_t)n * n * sizeof(uint16_t));
+            } else {
+                const int total = n * n;
+                for (int i = 0; i < total; ++i) {
+                    copy_pixel<true>(src + i, dst + i, lut);
+                }
+            }
+            break;
+        }
+        case Orient::ROT_90_CW: {
+            for (int y = 0; y < n; ++y) {
+                for (int x = 0; x < n; ++x) {
+                    copy_pixel<WithLut>(src + y * n + x,
+                                        dst + x * n + (n - 1 - y),
+                                        lut);
+                }
+            }
+            break;
+        }
+        case Orient::ROT_180: {
+            const int total = n * n;
+            for (int i = 0; i < total; ++i) {
+                copy_pixel<WithLut>(src + total - 1 - i, dst + i, lut);
+            }
+            break;
+        }
+        case Orient::ROT_270_CW: {
+            for (int y = 0; y < n; ++y) {
+                for (int x = 0; x < n; ++x) {
+                    copy_pixel<WithLut>(src + y * n + x,
+                                        dst + (n - 1 - x) * n + y,
+                                        lut);
+                }
+            }
+            break;
+        }
+        }
+    }
+
+    // Prepare the buffer the detector will read this frame. Returns
+    // the pointer to feed into HumanFaceDetect::run(). May return
+    // `src` (zero-copy fast path) or `scratch` (after a rotate /
+    // stretch / both).
+    const uint16_t *prep_detect_input(Orient o,
+                                      const uint16_t *src,
+                                      uint16_t *scratch,
+                                      int n) noexcept
+    {
+        int y_lo = 0, y_hi = 255;
+        const bool need_stretch =
+            analyze_luma_subsampled(src, n, y_lo, y_hi);
+
+        // Fast path: nothing to do, hand the camera fb to the
+        // detector directly. Triggers whenever the user is in good
+        // lighting and the detector has locked onto the natural
+        // (ROT_0) orientation, which is the dominant runtime case.
+        if (!need_stretch && o == Orient::ROT_0) {
+            return src;
+        }
+
+        if (need_stretch) {
+            uint8_t lut[256];
+            build_stretch_lut(y_lo, y_hi, lut);
+            rotate_to_scratch<true>(o, src, scratch, n, lut);
+        } else {
+            rotate_to_scratch<false>(o, src, scratch, n, nullptr);
+        }
+        return scratch;
+    }
+
+    // Banner rotation = how the on-screen face is tilted relative to upright
+    // in the *un-rotated* camera frame (which is what the user sees on the
+    // LCD). If we rotated the image by N*90 deg CW to make the face upright
+    // for the detector, then in the original frame the face was tilted by
+    // the SAME amount CCW, so the banner rotates that much CCW. The sign
+    // below was chosen empirically against the previous keypoint-based
+    // calibration; if upright text comes out rotated the wrong way, flip
+    // the sign.
+    float banner_angle_for(Orient o)
+    {
+        constexpr float quarter = 3.14159265358979323846f * 0.5f;
+        return -(float)((int)o) * quarter;
+    }
+
+    // Refines banner_angle_for() using the actual head tilt measured from
+    // the detector's eye + nose keypoints. The MNP postprocessor emits 5
+    // keypoints in detection-frame coords as a flat [x0,y0, x1,y1, ...]
+    // vector; indices 0..1 and 2..3 are the two eyes, 4..5 is the nose.
+    //
+    // We unrotate the keypoints back into the *display* camera frame (the
+    // un-rotated frame the LCD shows), compute the head's local "down"
+    // direction (eye-midpoint -> nose), derive the banner's text-right
+    // vector from it, and snap to the nearest quarter turn. Using the
+    // eye+nose triangle removes the image-left vs subject-left eye-labelling
+    // ambiguity entirely: "down" always points from forehead to chin, so
+    // the orientation we recover is unambiguous up to noise. The discrete
+    // orientation cycling that gates the detector is no longer used for
+    // banner placement; the banner snaps to whichever cardinal the head
+    // actually points to.
+    //
+    // Returns the angle in radians that banner_render() expects (positive =
+    // CW in y-down image coords).
+    void unrotate_point(Orient o, int n, int &x, int &y)
+    {
+        const int xd = x, yd = y;
+        switch (o)
+        {
+        case Orient::ROT_0:
+            x = xd;
+            y = yd;
+            break;
+        case Orient::ROT_90_CW:
+            // rotate_90cw: dst[x*n + (n-1-y)] = src[y*n + x]
+            // Source (xs, ys) lands at (n-1-ys, xs) in the detector frame.
+            x = yd;
+            y = n - 1 - xd;
+            break;
+        case Orient::ROT_180:
+            x = n - 1 - xd;
+            y = n - 1 - yd;
+            break;
+        case Orient::ROT_270_CW:
+            // rotate_270cw: dst[(n-1-x)*n + y] = src[y*n + x]
+            // Source (xs, ys) lands at (ys, n-1-xs) in the detector frame.
+            x = n - 1 - yd;
+            y = xd;
+            break;
+        }
+    }
+
+    // Faces are roughly symmetric top-to-bottom (forehead/chin both
+    // rounded; eyes can be confused for nostrils under motion blur or
+    // poor lighting), and ESP-WHO's detector occasionally fires on an
+    // upside-down face even though it's only trained on upright ones.
+    // When that false-positive happens during orientation cycling we
+    // lock onto the wrong Orient, head_roll_for() un-rotates the
+    // keypoints under the wrong assumption, and the banner ends up
+    // rendered 180 deg flipped.
+    //
+    // Reject those false positives by checking keypoint geometry IN THE
+    // DETECTOR INPUT FRAME (no un-rotation). A genuine upright detection
+    // must have the nose below the eye midpoint, with a margin that's a
+    // fraction of the inter-eye distance so noise on a near-frontal face
+    // doesn't kick us out. If the test fails the caller treats the
+    // detection as a miss and continues cycling orientations until the
+    // real upright is found.
+    bool keypoints_look_upright(const dl::detect::result_t *det)
+    {
+        if (!det || det->keypoint.size() < 6)
+        {
+            // No keypoints to validate — trust the bbox.
+            return true;
+        }
+        const int e0y = det->keypoint[1];
+        const int e1y = det->keypoint[3];
+        const int ny  = det->keypoint[5];
+        // In the detector's input frame (y-down), a genuine upright face
+        // must have the nose below the eye midpoint. >0 is sufficient
+        // because the detector itself rejects sideways-by-90 faces; we
+        // only need to catch the ~180 deg false-positive case here.
+        return ny > (e0y + e1y) / 2;
+    }
+
+    float head_roll_for(const dl::detect::result_t *det, Orient o)
+    {
+        if (!det || det->keypoint.size() < 6)
+        {
+            return banner_angle_for(o); // missing keypoints -> fall back
+        }
+
+        // Eye midpoint + nose in detection frame, then unrotated into the
+        // display frame (= the LCD's view of the world).
+        int e0x = det->keypoint[0], e0y = det->keypoint[1];
+        int e1x = det->keypoint[2], e1y = det->keypoint[3];
+        int nx = det->keypoint[4], ny = det->keypoint[5];
+        unrotate_point(o, FRAME_DIM, e0x, e0y);
+        unrotate_point(o, FRAME_DIM, e1x, e1y);
+        unrotate_point(o, FRAME_DIM, nx, ny);
+
+        // Head-local "down" direction in display-frame coords. For an upright
+        // forward-facing face this is (0, +1) (nose below eye midpoint).
+        const float dx = (float)(nx - (e0x + e1x) / 2);
+        const float dy = (float)(ny - (e0y + e1y) / 2);
+        if (dx == 0.0f && dy == 0.0f)
+        {
+            return banner_angle_for(o);
+        }
+
+        // banner_render rotates the text's local +x axis to (cos a, sin a) in
+        // image coords. The banner's "text-right" should be perpendicular to
+        // and 90 deg CCW (visually) from "down": text_right = (down_y, -down_x).
+        // So a = atan2(text_right.y, text_right.x) = atan2(-down_x, down_y).
+        constexpr float pi = 3.14159265358979323846f;
+        constexpr float quarter = pi * 0.5f;
+        // The +quarter offset is an empirically-tuned correction: the
+        // un-rotation + atan2 derivation alone leaves the banner 90 deg
+        // CCW of the head, so we rotate it one quarter-turn CW.
+        const float a = atan2f(-dx, dy) + quarter;
+
+        // Snap to nearest 90 deg bucket. Head tilts between buckets round
+        // to whichever cardinal is closest.
+        return roundf(a / quarter) * quarter;
+    }
+
+    void face_ai_task(void *)
+    {
+        ESP_LOGI(TAG, "task running on core %d, prio %d",
+                 xPortGetCoreID(), (int)TASK_PRIO);
+
+        // Construction loads the .espdl files out of the model partitions.
+        // Costs ~1 second up-front.
+        auto *detect = new HumanFaceDetect();
+        auto *feat = new HumanFaceFeat();
+        const int feat_len = feat->get_feat_len();
+
+        // Scratch buffer for orientation-rotated frames. Sized for a square
+        // FRAME_DIM x FRAME_DIM RGB565 image; lives in PSRAM since this is
+        // the same memory class as the camera fb. Allocated once.
+        const size_t scratch_bytes = (size_t)FRAME_DIM * FRAME_DIM * sizeof(uint16_t);
+        auto *scratch = (uint16_t *)heap_caps_aligned_alloc(
+            16, scratch_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!scratch)
+        {
+            ESP_LOGE(TAG, "failed to alloc %u-byte orientation scratch in PSRAM",
+                     (unsigned)scratch_bytes);
+            vTaskDelete(nullptr);
+            return;
+        }
+
+        // In-memory known-face store. Each entry is the float embedding for
+        // one enrolled face; resets on every boot (i.e. this constructor).
+        std::vector<std::vector<float>> known_feats;
+        known_feats.reserve(8);
+
+        // Counters for the per-second heartbeat.
+        int64_t stats_next_us = esp_timer_get_time() + STATS_PERIOD_US;
+        uint32_t s_frames = 0;     // frames pulled from camera
+        uint32_t s_detections = 0; // raw detection-list non-empty
+        uint32_t s_too_small = 0;  // largest box rejected for size
+        uint32_t s_too_blurry = 0; // largest box rejected for focus
+        uint32_t s_recognised = 0; // matched an existing enrollment
+        uint32_t s_enrolled = 0;   // new face added
+
+        // Debounce: consecutive frames so far that look like a new face.
+        int unknown_streak = 0;
+
+        // Orientation to TRY on this frame. After a successful detection we
+    // leave this alone so the next frame uses the same orientation; on a
+    // failed detection we may stick on it for a couple more attempts
+    // (orient-sticky retry, see ORIENT_STICKY_MISSES below) before
+    // advancing to the next of the four.
+    Orient try_orient = Orient::ROT_0;
+
+    // Consecutive miss frames in the current detection-loss streak. Used
+    // by the orient-sticky retry: a quick blink / occlusion / motion blur
+    // is FAR more likely than the user actually rotating the device
+    // between frames, so we retry the last-known-good orient before
+    // burning frames on the other three buckets. Reset on each success.
+    int consecutive_misses = 0;
+    // Number of misses we'll stay on the known-good orient before
+    // cycling. ORIENT_STICKY_MISSES=2 keeps us responsive to genuine
+    // rotation (worst case ~3-4 detection frames to discover the new
+    // orient) while making transient blinks effectively free.
+    constexpr int ORIENT_STICKY_MISSES = 2;
+
+    // Number of consecutive misses we'll tolerate before treating the
+    // face as actually gone and hiding the on-screen overlay.
+    // Decoupled from ORIENT_STICKY_MISSES on purpose: we want
+    // orientation cycling to react quickly (after just a couple of
+    // misses) but we DON'T want the overlay to blink off and back on
+    // every time the detector skips a frame on a blink, motion blur,
+    // or pose change. At ~10 detections/sec this gives the user about
+    // 0.8 s of grace before the box disappears, which matches the
+    // perceived "they're still here" window without leaving stale
+    // boxes around after they actually walk away.
+    constexpr int OVERLAY_CLEAR_MISSES = 8;
+
+        ESP_LOGI(TAG, "ESP-WHO ready, feat_len=%d, entering scan loop", feat_len);
+
+        while (true)
+        {
+            // Heartbeat first - placed before every early-continue so we get
+            // a per-second log even when the loop is degenerate (fb_get
+            // timing out, banner pinning us, model errors). Silence here
+            // means the task is wedged, not just unlucky.
+            const int64_t now_us = esp_timer_get_time();
+            if (now_us >= stats_next_us)
+            {
+                ESP_LOGI(TAG,
+                         "1s: frames=%u dets=%u small=%u blurry=%u known=%u new=%u (db=%u o=%d)",
+                         (unsigned)s_frames, (unsigned)s_detections,
+                         (unsigned)s_too_small, (unsigned)s_too_blurry,
+                         (unsigned)s_recognised, (unsigned)s_enrolled,
+                         (unsigned)known_feats.size(),
+                         (int)try_orient);
+                s_frames = s_detections = s_too_small = s_too_blurry =
+                    s_recognised = s_enrolled = 0;
+                stats_next_us = now_us + STATS_PERIOD_US;
+            }
+
+            // The banner is now an overlay composited into the live
+            // preview by the render task, so we don't pause inference
+            // while it's up — the detector keeps running, and any new
+            // enrolment will simply refresh the overlay's deadline /
+            // angle.
+
+            camera_fb_t *fb = esp_camera_fb_get();
+            if (!fb)
+            {
+                vTaskDelay(pdMS_TO_TICKS(20));
+                continue;
+            }
+            ++s_frames;
+
+            // Pre-process the camera fb into something the detector
+            // will be happy with: optional 90/180/270 rotation so the
+            // face is upright in the input, and an optional luma
+            // contrast stretch when the OV2640's AE has clipped the
+            // frame into a narrow band. Both are folded into at most
+            // one full pass over the buffer (see prep_detect_input);
+            // the well-exposed ROT_0 fast path skips the copy entirely
+            // and points the detector at fb->buf directly.
+            //
+            // We deliberately do NOT mutate fb->buf: the render task
+            // is reading it on the other core for the live preview,
+            // and the user expects the preview to look like the raw
+            // sensor output, not the contrast-stretched detector view.
+            const uint16_t *src = (const uint16_t *)fb->buf;
+            const uint16_t *to_detect = src;
+            if (fb->width == FRAME_DIM && fb->height == FRAME_DIM)
+            {
+                to_detect = prep_detect_input(try_orient, src, scratch,
+                                              FRAME_DIM);
+            }
+
+            dl::image::img_t img = {};
+            img.data = (void *)to_detect;
+            img.width = fb->width;
+            img.height = fb->height;
+            // Camera outputs RGB565 high-byte-first in memory; ESP-DL's
+            // preprocessor consumes that format directly.
+            img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565BE;
+
+            std::list<dl::detect::result_t> &detections = detect->run(img);
+            if (!detections.empty())
+            {
+                ++s_detections;
+            }
+
+            // Act only on the largest-area detection. Avoids cross-enrolling
+            // two people in frame and biases toward whoever is closest to
+            // the camera.
+            const dl::detect::result_t *biggest = nullptr;
+            int best_area = 0;
+            for (const auto &d : detections)
+            {
+                const int a = d.box_area();
+                if (a > best_area)
+                {
+                    best_area = a;
+                    biggest = &d;
+                }
+            }
+
+            if (!biggest || !keypoints_look_upright(biggest))
+            {
+                if (biggest)
+                {
+                    // Detector fired on a non-upright face (false positive
+                    // from rough top/bottom symmetry). Don't count it as a
+                    // detection — fall through to the miss path so
+                    // orientation cycling can find the real upright.
+                    --s_detections;
+                }
+                unknown_streak = 0;
+                // Orient-sticky retry: the first few misses after a
+                // successful detection re-try the same orient (the most
+                // likely cause of a single miss is a blink / motion blur,
+                // not a device rotation). Only after consecutive_misses
+                // crosses the threshold do we begin cycling through the
+                // other three orients.
+                ++consecutive_misses;
+                if (consecutive_misses > ORIENT_STICKY_MISSES)
+                {
+                    try_orient = static_cast<Orient>(((int)try_orient + 1) & 0x3);
+                }
+                if (consecutive_misses > OVERLAY_CLEAR_MISSES)
+                {
+                    // Sustained miss streak -- the face has almost
+                    // certainly left. Hide the bbox / dots so the
+                    // user gets visual feedback that the tracker
+                    // lost lock. Shorter streaks (single blinks,
+                    // motion blur, a half-second of orient cycling
+                    // after a rotation) leave the overlay alone so
+                    // it doesn't flicker every time the detector
+                    // skips one frame.
+                    portENTER_CRITICAL(&g_overlay_mux);
+                    g_overlay.valid = false;
+                    portEXIT_CRITICAL(&g_overlay_mux);
+                }
+                esp_camera_fb_return(fb);
+                // Yield camera frames to the render task while nothing
+                // interesting is going on. See NO_FACE_DELAY_MS comment.
+                vTaskDelay(pdMS_TO_TICKS(NO_FACE_DELAY_MS));
+                continue;
+            }
+
+            // Detection succeeded in this orientation; lock it in (don't
+            // touch try_orient) so the next frame stays single-shot.
+            const Orient locked_orient = try_orient;
+            consecutive_misses = 0;
+
+            // Publish a display-frame snapshot of the bbox + keypoints
+            // for the render task to draw on top of the live preview.
+            // Both the bbox corners and each keypoint are produced in
+            // the detector's (possibly rotated) input frame, so we
+            // un-rotate them back into the camera frame the LCD shows
+            // before publishing.
+            {
+                face_overlay_t snap = {};
+                snap.valid    = true;
+                snap.stamp_ms = now_ms();
+
+                int p0x = biggest->box[0], p0y = biggest->box[1];
+                int p1x = biggest->box[2], p1y = biggest->box[3];
+                unrotate_point(locked_orient, FRAME_DIM, p0x, p0y);
+                unrotate_point(locked_orient, FRAME_DIM, p1x, p1y);
+                snap.box[0] = (int16_t)std::min(p0x, p1x);
+                snap.box[1] = (int16_t)std::min(p0y, p1y);
+                snap.box[2] = (int16_t)std::max(p0x, p1x);
+                snap.box[3] = (int16_t)std::max(p0y, p1y);
+
+                const int kp_pairs =
+                    std::min(5, (int)biggest->keypoint.size() / 2);
+                for (int i = 0; i < kp_pairs; ++i) {
+                    int kx = biggest->keypoint[2 * i];
+                    int ky = biggest->keypoint[2 * i + 1];
+                    unrotate_point(locked_orient, FRAME_DIM, kx, ky);
+                    snap.keypoints[2 * i]     = (int16_t)kx;
+                    snap.keypoints[2 * i + 1] = (int16_t)ky;
+                }
+
+                portENTER_CRITICAL(&g_overlay_mux);
+                g_overlay = snap;
+                portEXIT_CRITICAL(&g_overlay_mux);
+            }
+
+            const int bw = biggest->box[2] - biggest->box[0];
+            const int bh = biggest->box[3] - biggest->box[1];
+            if (bw < MIN_FACE_PX || bh < MIN_FACE_PX)
+            {
+                ++s_too_small;
+                unknown_streak = 0; // small box ⇒ not evidence of "new face"
+                esp_camera_fb_return(fb);
+                continue;
+            }
+
+            const int focus = focus_metric(to_detect,
+                                           fb->width, fb->height,
+                                           biggest->box[0], biggest->box[1],
+                                           biggest->box[2], biggest->box[3]);
+            if (focus < MIN_SHARPNESS)
+            {
+                ++s_too_blurry;
+                unknown_streak = 0; // blurry ⇒ not trustworthy evidence
+                esp_camera_fb_return(fb);
+                continue;
+            }
+
+            // Run the embedder. The returned TensorBase is owned by the
+            // postprocessor and reused on the NEXT call, so we must copy
+            // its floats before doing anything else that might run the
+            // model again (which currently we don't, but the copy is
+            // ~512 floats so it's not worth the foot-gun).
+            dl::TensorBase *t = feat->run(img, biggest->keypoint);
+            if (!t || t->get_size() != feat_len)
+            {
+                ESP_LOGW(TAG, "feat model returned unexpected tensor");
+                esp_camera_fb_return(fb);
+                continue;
+            }
+            const float *raw_feat = t->get_element_ptr<float>();
+
+            // Compare against every stored embedding.
+            float best_sim = -2.f;
+            int best_id = -1;
+            for (size_t i = 0; i < known_feats.size(); ++i)
+            {
+                const float s = cosine_sim(raw_feat, known_feats[i].data(), feat_len);
+                if (s > best_sim)
+                {
+                    best_sim = s;
+                    best_id = (int)i + 1; // 1-based for logging niceness
+                }
+            }
+
+            if (best_id > 0 && best_sim >= MATCH_THR)
+            {
+                // Recognised — no enroll, no banner. We removed the
+                // "OH... IT'S YOU" path: recognition is now silent so
+                // the only on-screen event is a brand-new face.
+                ++s_recognised;
+                unknown_streak = 0;
+                ESP_LOGI(TAG, "known face: id=%d sim=%.3f focus=%d orient=%d",
+                         best_id, (double)best_sim, focus, (int)locked_orient);
+                esp_camera_fb_return(fb);
+                continue;
+            }
+
+            // Either no enrolled faces at all, or every enrolled face was
+            // below the match threshold. Treat this as evidence of "new
+            // face" but require ENROLL_DEBOUNCE_FRAMES such frames in a row
+            // before actually enrolling — a single low-confidence frame
+            // for a person we already know shouldn't fork a new identity.
+            ++unknown_streak;
+            ESP_LOGD(TAG, "unknown frame: best_sim=%.3f streak=%d/%d focus=%d",
+                     (double)best_sim, unknown_streak,
+                     ENROLL_DEBOUNCE_FRAMES, focus);
+
+            if (unknown_streak < ENROLL_DEBOUNCE_FRAMES)
+            {
+                esp_camera_fb_return(fb);
+                continue;
+            }
+
+            // Commit the enrollment. Copy the float* into the known list
+            // (the source buffer is recycled by the model on the next run).
+            // Every successful enrollment fires the "NEW FACE DETECTED"
+            // overlay, refreshing both the deadline and the rotation angle
+            // so the text always reads upright relative to the current
+            // face pose.
+            if (known_feats.size() >= MAX_KNOWN_FACES)
+            {
+                ESP_LOGD(TAG,
+                         "skip enroll: hit global cap (%u), best_sim=%.3f",
+                         (unsigned)MAX_KNOWN_FACES, (double)best_sim);
+            }
+            else
+            {
+                known_feats.emplace_back(raw_feat, raw_feat + feat_len);
+                ++s_enrolled;
+
+                // Only (re)render the banner if one isn't already on
+                // screen: we want the text orientation to reflect the
+                // face pose AT THE MOMENT we first decided this was a
+                // new face, not whatever angle the user happens to be
+                // at five seconds later. Subsequent enrolments that
+                // land inside the same 5 s window add their embeddings
+                // silently and leave both the angle and the deadline
+                // alone.
+                if (g_banner_until_ms.load(std::memory_order_relaxed) <= now_ms())
+                {
+                    // Banner angle: discrete orientation refined with the
+                    // eye-line roll measured from the detector's keypoints.
+                    // See head_roll_for().
+                    const float roll = head_roll_for(biggest, locked_orient);
+                    banner_render(roll);
+                    g_banner_until_ms.store(now_ms() + BANNER_HOLD_MS,
+                                            std::memory_order_relaxed);
+
+                    ESP_LOGI(TAG,
+                             "NEW face enrolled id=%u (total=%u, bbox=%dx%d, focus=%d, orient=%d, roll=%.0fdeg)",
+                             (unsigned)known_feats.size(),
+                             (unsigned)known_feats.size(),
+                             bw, bh, focus, (int)locked_orient,
+                             (double)(roll * 180.f / 3.14159265f));
+                }
+                else
+                {
+                    ESP_LOGI(TAG,
+                             "supplementary enrol id=%u (banner already up; total=%u, bbox=%dx%d, focus=%d)",
+                             (unsigned)known_feats.size(),
+                             (unsigned)known_feats.size(),
+                             bw, bh, focus);
+                }
+            }
+            unknown_streak = 0;
+
+            esp_camera_fb_return(fb);
+        }
+    }
+
+} // namespace
+
+esp_err_t face_ai_init(void)
+{
+    const BaseType_t ok = xTaskCreatePinnedToCore(
+        face_ai_task, "face_ai", TASK_STACK, nullptr,
+        TASK_PRIO, nullptr, TASK_CORE);
+    return (ok == pdPASS) ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
+bool face_ai_banner_active(void)
+{
+    return g_banner_until_ms.load(std::memory_order_relaxed) > now_ms();
+}
+
+void face_ai_get_overlay(face_overlay_t *out)
+{
+    if (!out) {
+        return;
+    }
+    portENTER_CRITICAL(&g_overlay_mux);
+    *out = g_overlay;
+    portEXIT_CRITICAL(&g_overlay_mux);
+}

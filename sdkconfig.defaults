@@ -1,0 +1,59 @@
+# Target
+CONFIG_IDF_TARGET="esp32s3"
+
+# 8 MB flash on the ESP32-S3-EYE
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
+CONFIG_ESPTOOLPY_HEADER_FLASHSIZE_UPDATE=y
+
+# Custom partition table: 6 MB app + 1 MB SPIFFS for the face DB
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ESP-DL uses C++ exceptions in a few error paths
+CONFIG_COMPILER_CXX_EXCEPTIONS=y
+
+# ESP-WHO face detection (MSR+MNP two-stage) flashed to its own partition.
+# FLASH_PARTITION (rather than FLASH_RODATA) avoids a PlatformIO + esp-dl
+# CMake bug where the BUILD_DIR relative path gets doubled when generating
+# the embedded-binary .S file. It also keeps the app binary small.
+CONFIG_HUMAN_FACE_DETECT_MODEL_IN_FLASH_PARTITION=y
+CONFIG_HUMAN_FACE_DETECT_MSRMNP_S8_V1=y
+CONFIG_FLASH_HUMAN_FACE_DETECT_MSRMNP_S8_V1=y
+
+# ESP-WHO face recognition (MobileFaceNet, smaller/faster of the two) also
+# in its own partition for the same reason.
+CONFIG_HUMAN_FACE_FEAT_MODEL_IN_FLASH_PARTITION=y
+CONFIG_HUMAN_FACE_FEAT_MFN_S8_V1=y
+CONFIG_FLASH_HUMAN_FACE_FEAT_MFN_S8_V1=y
+
+# 8 MB octal PSRAM @ 80 MHz (required by esp32-camera for frame buffers)
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+
+# Run the CPU at full speed
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
+
+# Optimise for performance over size
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# Pin the camera capture task to core 0; the render task runs on core 1.
+CONFIG_CAMERA_CORE0=y
+
+# Brownout detector: when running camera + LCD + ESP-DL inference under
+# USB power the rail can briefly dip below the IDF default threshold
+# (~3.0 V) during peak current draw, even though everything is working
+# correctly. Pick a middle-ground threshold: more permissive than the
+# IDF default (SEL_7, ~3.19 V) so harmless transients don't reset us,
+# but not so low that we let the chip keep running while it's actually
+# under-voltage (which corrupts PSRAM/flash and can hang USB
+# enumeration). If you still see spurious brownouts on a good supply,
+# drop this another step or two.
+CONFIG_ESP_BROWNOUT_DET_LVL_SEL_7=n
+CONFIG_ESP_BROWNOUT_DET_LVL_SEL_4=y
+CONFIG_ESP_BROWNOUT_DET_LVL=4
+

@@ -1,0 +1,16 @@
+## IDF Component Manager manifest for the project's "main" component (src/).
+## PlatformIO + ESP-IDF will pull these in automatically on the next build.
+dependencies:
+  espressif/esp32-camera: "^2.0.15"
+
+  ## ESP-WHO face stack. esp-dl is pulled transitively but pinning it
+  ## explicitly stops surprise major-version bumps.
+  espressif/esp-dl: "^3.3.3"
+  espressif/human_face_detect: "^0.4.2"
+  espressif/human_face_recognition: "^0.3.2"
+
+  ## ESP-DSP for SIMD-accelerated math kernels (dsps_dotprod_f32 in
+  ## the face-recognition similarity loop). Already pulled in
+  ## transitively by esp-dl, but pinned explicitly so we control the
+  ## version of the symbols we depend on directly.
+  espressif/esp-dsp: "^1.3.0"
