@@ -26,6 +26,7 @@
 #include "esp_err.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "mdns.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -34,6 +35,32 @@
 
 static const char *TAG = "web";
 static httpd_handle_t s_server = nullptr;
+static bool           s_mdns_up = false;
+
+// Bring up Multicast DNS so the on-device server is reachable at
+// `<HOSTNAME>.local` from any client on the same L2 segment. Idempotent.
+// Failures are non-fatal -- the server still works by IP.
+static constexpr const char *HOSTNAME      = "esp-face-detect";
+static constexpr const char *INSTANCE_NAME = "ESP32-S3-EYE face detect";
+
+static void mdns_bringup(void)
+{
+    if (s_mdns_up) {
+        return;
+    }
+    if (mdns_init() != ESP_OK) {
+        ESP_LOGW(TAG, "mdns_init failed; reachable by IP only");
+        return;
+    }
+    mdns_hostname_set(HOSTNAME);
+    mdns_instance_name_set(INSTANCE_NAME);
+    // Advertise the HTTP service so clients that browse for _http._tcp
+    // (most mDNS browsers, e.g. avahi-browse, Bonjour) discover us
+    // automatically. The port matches httpd's default 80.
+    mdns_service_add(nullptr, "_http", "_tcp", 80, nullptr, 0);
+    s_mdns_up = true;
+    ESP_LOGI(TAG, "mDNS up: http://%s.local/", HOSTNAME);
+}
 
 // --- HTML page ------------------------------------------------------
 
@@ -356,6 +383,11 @@ esp_err_t webserver_init(void)
     if (s_server) {
         return ESP_OK;
     }
+
+    // Bring up mDNS first so the hostname is advertised the moment the
+    // listener accepts its first connection. mdns_bringup is idempotent
+    // and non-fatal -- a failure just leaves us reachable by raw IP.
+    mdns_bringup();
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     // Bump stack / max URIs over the IDF defaults so the dynamic JSON

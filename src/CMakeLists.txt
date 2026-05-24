@@ -8,5 +8,5 @@ idf_component_register(
         "wifi.cpp"
         "webserver.cpp"
     INCLUDE_DIRS "."
-    REQUIRES driver esp_lcd esp_timer spiffs esp_wifi esp_netif esp_event nvs_flash esp_http_server
+    REQUIRES driver esp_lcd esp_timer spiffs esp_wifi esp_netif esp_event nvs_flash esp_http_server mdns
 )

@@ -14,3 +14,8 @@ dependencies:
   ## transitively by esp-dl, but pinned explicitly so we control the
   ## version of the symbols we depend on directly.
   espressif/esp-dsp: "^1.3.0"
+
+  ## mDNS so the on-device HTTP server is reachable at
+  ## esp-face-detect.local without needing to read the IP off the
+  ## serial console.
+  espressif/mdns: "^1.4.0"

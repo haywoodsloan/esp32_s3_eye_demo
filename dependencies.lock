@@ -116,6 +116,16 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 0.3.2
+  espressif/mdns:
+    component_hash: 8bcf12e37c58c1d584aef32a02b92548124c7a3a9fcf548d3235c844a035e0f0
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.11.1
   idf:
     source:
       type: idf
@@ -126,6 +136,7 @@ direct_dependencies:
 - espressif/esp32-camera
 - espressif/human_face_detect
 - espressif/human_face_recognition
-manifest_hash: 10613f9c862503245250736fa9e6203ea4df84afce228b25c3a6141843c95f2a
+- espressif/mdns
+manifest_hash: 55eebe1110e82d1a763c89ebaef4b31eacf4f3bc47659825523bfd1c9f262b58
 target: esp32s3
 version: 2.0.0
