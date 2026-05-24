@@ -82,6 +82,20 @@ namespace
     // has to be a bit closer before recognition / enrolment kicks in.
     constexpr int MIN_FACE_PX = 83;
 
+    // Minimum detector confidence for a result to be acted on at all.
+    // MSR+MNP's internal threshold is low enough that the detector
+    // occasionally fires on rough face-like blobs (upside-down faces,
+    // textured fabric, hand silhouettes), and once the orient-cycle
+    // locks onto one of those false positives the HUD and the banner
+    // start chasing the wrong target. Anything below this score is
+    // treated as a miss and the orient cycle resumes.
+    //
+    // 0.60 was picked empirically: lower lets noisy faces through and
+    // re-introduces the upside-down false-positive class; higher
+    // starts costing real detections on far-from-camera or partially
+    // occluded faces.
+    constexpr float MIN_DETECT_SCORE = 0.60f;
+
     // Sharpness gate - average per-sample (|dx| + |dy|) on the green channel
     // inside the face bbox. Bumped from 10 to 25 because the duplicate-id
     // log we saw was driven by low-focus frames slipping through and
@@ -800,10 +814,23 @@ namespace
                 }
             }
 
-            if (!biggest || !keypoints_look_upright(biggest))
+            if (!biggest ||
+                biggest->score < MIN_DETECT_SCORE ||
+                !keypoints_look_upright(biggest))
             {
                 if (biggest)
                 {
+                    if (biggest->score < MIN_DETECT_SCORE) {
+                        // Low-confidence detection: don't bother
+                        // running the embedder on it, don't update
+                        // the HUD with a flaky bbox, and don't lock
+                        // the orient cycle onto whatever it landed on.
+                        ESP_LOGD(TAG,
+                                 "drop low-score det: score=%.2f < %.2f (orient=%d)",
+                                 (double)biggest->score,
+                                 (double)MIN_DETECT_SCORE,
+                                 (int)try_orient);
+                    }
                     // Detector fired on a non-upright face (false positive
                     // from rough top/bottom symmetry). Don't count it as a
                     // detection — fall through to the miss path so
