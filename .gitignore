@@ -12,6 +12,11 @@ managed_components/
 # Local point-in-time backups
 snapshots/
 
+# Real Wi-Fi credentials live in src/wifi_credentials.h (gitignored).
+# A tracked template at src/wifi_credentials.h.example documents the
+# expected macros -- copy it and fill in your network's values.
+src/wifi_credentials.h
+
 # src/wifi_credentials.h is INTENTIONALLY tracked (with placeholder
 # values) so a fresh clone builds out of the box. Run
 #   git update-index --skip-worktree src/wifi_credentials.h
