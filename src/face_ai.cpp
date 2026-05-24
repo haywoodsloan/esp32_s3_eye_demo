@@ -94,7 +94,15 @@ namespace
     // re-introduces the upside-down false-positive class; higher
     // starts costing real detections on far-from-camera or partially
     // occluded faces.
-    constexpr float MIN_DETECT_SCORE = 0.60f;
+    // Minimum detector confidence for a result to be acted on at all.
+    // The detector occasionally fires on rough face-like blobs and on
+    // upside-down faces; the upside-down case is already caught much
+    // more reliably by keypoints_look_upright(), so we can afford to
+    // keep this score floor permissive. At close range the detector's
+    // confidence drops (faces fill the frame, out of training
+    // distribution), and a tighter floor here was throwing away real
+    // detections.
+    constexpr float MIN_DETECT_SCORE = 0.50f;
 
     // Recognition cache. The embedder is the most expensive single
     // stage in the pipeline (~50 ms / call on the S8 model), and when
@@ -113,11 +121,13 @@ namespace
     constexpr uint32_t RECOG_CACHE_MS = 500;
     constexpr int      RECOG_IOU_PCT  = 70;
 
-    // Sharpness gate - average per-sample (|dx| + |dy|) on the green channel
-    // inside the face bbox. Bumped from 10 to 25 because the duplicate-id
-    // log we saw was driven by low-focus frames slipping through and
-    // producing noisy embeddings that fell below the match threshold.
-    constexpr int MIN_SHARPNESS = 25;
+    // Sharpness gate — average per-sample (|dx| + |dy|) on the green channel
+    // inside the face bbox. Kept fairly permissive because the OV2640
+    // is fixed-focus around ~30 cm: faces inside that range are genuinely
+    // softer than the gate the original far-face tuning assumed. The
+    // embedder copes well with mild blur; we mostly want this gate to
+    // catch motion-smeared frames, not pose-related softness.
+    constexpr int MIN_SHARPNESS = 15;
 
     // Cosine-similarity threshold for "this is an already-known face".
     // Lower than HumanFaceRecognizer's hard-coded 0.5 because we observed
@@ -472,6 +482,85 @@ namespace
         return scratch;
     }
 
+    // --- Close-range padded fallback -------------------------------
+    //
+    // ESP-WHO's MSR+MNP face detector is trained on faces that occupy
+    // roughly 5-60 % of the image. When the user is very close to the
+    // OV2640 the face fills almost the whole 240x240 frame, which
+    // pushes the detector well outside its training distribution and
+    // causes it to silently fail. The primary detection pass catches
+    // every realistic mid/far-range case; this fallback exists for
+    // when that pass returns nothing despite the user clearly being
+    // there.
+    //
+    // The recipe is dead simple: resample the prepared detector
+    // buffer down into a centred INNER x INNER box of an otherwise
+    // mid-grey 240x240 buffer. A close-up face that was filling ~95 %
+    // of the frame now occupies INNER/FRAME_DIM of it, which lands
+    // back in the model's happy range. Bounding boxes / keypoints
+    // come out in padded coords and have to be remapped before the
+    // rest of the pipeline can use them.
+    //
+    // Coordinate remap: padded coord  xp in [BORDER, BORDER+INNER) maps
+    // to detection-frame  x = (xp - BORDER) * FRAME_DIM / INNER.
+    // Clamped to [0, FRAME_DIM-1] to keep downstream code safe.
+
+    constexpr int PADDED_INNER  = 160;
+    constexpr int PADDED_BORDER = (FRAME_DIM - PADDED_INNER) / 2;
+
+    void shrink_into_padded(const uint16_t *src, uint16_t *dst) noexcept
+    {
+        // RGB565BE for mid-grey: R5=15, G6=31, B5=15 -> 0x7BEF native,
+        // bytes swap to 0xEF7B. memset to a 16-bit value with
+        // identical bytes won't quite get us pure grey, so fill by
+        // hand. ~57k stores in internal/PSRAM, ~1 ms.
+        const uint16_t grey_be = (uint16_t)(((0x7BEFu >> 8) & 0xFF) |
+                                            ((0x7BEFu & 0xFF) << 8));
+        const size_t total = (size_t)FRAME_DIM * FRAME_DIM;
+        for (size_t i = 0; i < total; ++i) {
+            dst[i] = grey_be;
+        }
+        // Nearest-neighbour resample src (FRAME_DIM x FRAME_DIM) into
+        // the centred INNER x INNER region.
+        for (int y = 0; y < PADDED_INNER; ++y) {
+            const int sy = (y * FRAME_DIM) / PADDED_INNER;
+            const uint16_t *srow = src + (size_t)sy * FRAME_DIM;
+            uint16_t       *drow = dst +
+                (size_t)(PADDED_BORDER + y) * FRAME_DIM + PADDED_BORDER;
+            for (int x = 0; x < PADDED_INNER; ++x) {
+                const int sx = (x * FRAME_DIM) / PADDED_INNER;
+                drow[x] = srow[sx];
+            }
+        }
+    }
+
+    // Apply the padded -> detection-frame coord remap in place over a
+    // bbox / keypoint list. Operates on raw ints to match the
+    // dl::detect::result_t storage layout.
+    int remap_padded_axis(int v) noexcept
+    {
+        // Clip to inner box (gray border can't legitimately host
+        // detections, but the postprocessor's NMS sometimes spits out
+        // boxes that slightly overhang the grey).
+        if (v < PADDED_BORDER) v = PADDED_BORDER;
+        if (v > PADDED_BORDER + PADDED_INNER - 1) {
+            v = PADDED_BORDER + PADDED_INNER - 1;
+        }
+        return ((v - PADDED_BORDER) * FRAME_DIM) / PADDED_INNER;
+    }
+
+    void remap_padded_result(dl::detect::result_t *r) noexcept
+    {
+        r->box[0] = remap_padded_axis(r->box[0]);
+        r->box[1] = remap_padded_axis(r->box[1]);
+        r->box[2] = remap_padded_axis(r->box[2]);
+        r->box[3] = remap_padded_axis(r->box[3]);
+        for (size_t i = 0; i + 1 < r->keypoint.size(); i += 2) {
+            r->keypoint[i]     = remap_padded_axis(r->keypoint[i]);
+            r->keypoint[i + 1] = remap_padded_axis(r->keypoint[i + 1]);
+        }
+    }
+
     // Banner rotation = how the on-screen face is tilted relative to upright
     // in the *un-rotated* camera frame (which is what the user sees on the
     // LCD). If we rotated the image by N*90 deg CW to make the face upright
@@ -691,15 +780,13 @@ namespace
         // Construction loads the .espdl files out of the model partitions.
         // Costs ~1 second up-front.
         auto *detect = new HumanFaceDetect();
-        // Raise the MSR (proposal) stage's score floor so the MNP
-        // (refinement) stage gets fewer candidates to work on per
-        // frame. The library defaults to 0.5 / 0.5 for the two
-        // stages; our MIN_DETECT_SCORE gate already discards anything
-        // below 0.60, so we'd be wasting cycles refining proposals
-        // that we'd reject downstream. 0.65 was chosen to sit a notch
-        // above MIN_DETECT_SCORE so a small refinement bump in MNP
-        // can still pull a borderline true positive over the line.
-        detect->set_score_thr(0.65f, 0);
+        // We previously bumped the MSR (proposal) stage's score floor to
+        // 0.65 to speed up MNP refinement. That helped throughput at
+        // mid range but starved real close-range detections whose MSR
+        // confidence is naturally lower (face out of training
+        // distribution). The default 0.5 was the right tradeoff; we now
+        // get the same false-positive resistance from MIN_DETECT_SCORE
+        // + keypoints_look_upright at the app level.
         auto *feat = new HumanFaceFeat();
         const int feat_len = feat->get_feat_len();
 
@@ -731,6 +818,20 @@ namespace
                      (unsigned)scratch_bytes);
             vTaskDelete(nullptr);
             return;
+        }
+
+        // Secondary scratch for the close-range padded fallback. Only
+        // used when the primary detect misses inside the sticky
+        // window, so PSRAM (slower than internal SRAM but plentiful)
+        // is fine -- the bandwidth cost is only paid on the
+        // exception path.
+        auto *padded_scratch = (uint16_t *)heap_caps_aligned_alloc(
+            16, scratch_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!padded_scratch) {
+            ESP_LOGW(TAG,
+                     "no PSRAM for padded fallback (%u B); close-range "
+                     "detection may suffer",
+                     (unsigned)scratch_bytes);
         }
 
         // The known-face DB lives at module scope (g_known_faces /
@@ -884,6 +985,65 @@ namespace
                 {
                     best_area = a;
                     biggest = &d;
+                }
+            }
+
+            // Close-range padded fallback. When the primary pass
+            // misses, AND we either still have an active orient lock
+            // (sticky window) or we're locked to ROT_0 on cold start,
+            // try resampling the detector input into a centred 160x160
+            // box of an otherwise mid-grey 240x240 buffer. That brings
+            // a "face fills the frame" close-up back into the model's
+            // training distribution. If THIS pass returns a usable
+            // detection we remap its coords back into the regular
+            // detection frame and let the rest of the pipeline treat
+            // it like a normal hit.
+            dl::detect::result_t padded_remap;
+            const bool can_try_padded =
+                padded_scratch &&
+                (consecutive_misses < ORIENT_STICKY_MISSES ||
+                 try_orient == Orient::ROT_0);
+            if (!biggest && can_try_padded && fb->width == FRAME_DIM &&
+                fb->height == FRAME_DIM)
+            {
+                shrink_into_padded(to_detect, padded_scratch);
+
+                dl::image::img_t pimg = {};
+                pimg.data     = padded_scratch;
+                pimg.width    = FRAME_DIM;
+                pimg.height   = FRAME_DIM;
+                pimg.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565BE;
+
+                auto &pdetections = detect->run(pimg);
+                const dl::detect::result_t *pbest = nullptr;
+                int pbest_area = 0;
+                for (const auto &d : pdetections) {
+                    const int a = d.box_area();
+                    if (a > pbest_area) {
+                        pbest_area = a;
+                        pbest = &d;
+                    }
+                }
+                if (pbest && pbest->score >= MIN_DETECT_SCORE) {
+                    // Deep-copy into a local result we own, since the
+                    // detector reuses its internal list on the next
+                    // call.
+                    padded_remap.category = pbest->category;
+                    padded_remap.score    = pbest->score;
+                    padded_remap.box      = pbest->box;
+                    padded_remap.keypoint = pbest->keypoint;
+                    remap_padded_result(&padded_remap);
+                    // The upright check is performed in detection-
+                    // frame coords, which after remap are equivalent
+                    // to the primary path's coords -- safe to re-run.
+                    if (keypoints_look_upright(&padded_remap)) {
+                        ESP_LOGI(TAG,
+                                 "padded fallback hit: score=%.2f "
+                                 "(close-range face)",
+                                 (double)padded_remap.score);
+                        biggest = &padded_remap;
+                        ++s_detections;
+                    }
                 }
             }
 
