@@ -96,6 +96,23 @@ namespace
     // occluded faces.
     constexpr float MIN_DETECT_SCORE = 0.60f;
 
+    // Recognition cache. The embedder is the most expensive single
+    // stage in the pipeline (~50 ms / call on the S8 model), and when
+    // the user is sitting still the same face's bbox barely moves
+    // between consecutive detection frames. We cache the last
+    // recognition outcome (matched id or just-enrolled), and if the
+    // next detection's bbox overlaps it strongly we skip the
+    // embedder + cosine sweep entirely and treat it as a continuation
+    // of the same identity.
+    //
+    // RECOG_CACHE_MS bounds the staleness so a swapped-in different
+    // face that happens to land at the same place gets re-identified
+    // within half a second. RECOG_IOU_PCT picks a strict-but-not-
+    // paranoid overlap; head jitter still passes it, but someone
+    // stepping into a different pose does not.
+    constexpr uint32_t RECOG_CACHE_MS = 500;
+    constexpr int      RECOG_IOU_PCT  = 70;
+
     // Sharpness gate - average per-sample (|dx| + |dy|) on the green channel
     // inside the face bbox. Bumped from 10 to 25 because the duplicate-id
     // log we saw was driven by low-focus frames slipping through and
@@ -548,6 +565,26 @@ namespace
         return ny > (e0y + e1y) / 2;
     }
 
+    // IoU between two integer axis-aligned bboxes, returned as a
+    // 0..100 percentage. Used by the recognition cache to decide
+    // whether the latest detection "continues" the previously
+    // identified face.
+    int iou_pct(const int *a, const int *b) noexcept
+    {
+        const int ix0 = std::max(a[0], b[0]);
+        const int iy0 = std::max(a[1], b[1]);
+        const int ix1 = std::min(a[2], b[2]);
+        const int iy1 = std::min(a[3], b[3]);
+        if (ix1 <= ix0 || iy1 <= iy0) {
+            return 0;
+        }
+        const int inter = (ix1 - ix0) * (iy1 - iy0);
+        const int aa    = (a[2] - a[0]) * (a[3] - a[1]);
+        const int bb    = (b[2] - b[0]) * (b[3] - b[1]);
+        const int uni   = aa + bb - inter;
+        return uni > 0 ? (inter * 100) / uni : 0;
+    }
+
     // Crop a square region centred on the detected face from the raw
     // camera fb (display-frame coords) and downsample it to the fixed
     // thumbnail dimensions consumed by the web UI. The crop is widened
@@ -654,18 +691,43 @@ namespace
         // Construction loads the .espdl files out of the model partitions.
         // Costs ~1 second up-front.
         auto *detect = new HumanFaceDetect();
+        // Raise the MSR (proposal) stage's score floor so the MNP
+        // (refinement) stage gets fewer candidates to work on per
+        // frame. The library defaults to 0.5 / 0.5 for the two
+        // stages; our MIN_DETECT_SCORE gate already discards anything
+        // below 0.60, so we'd be wasting cycles refining proposals
+        // that we'd reject downstream. 0.65 was chosen to sit a notch
+        // above MIN_DETECT_SCORE so a small refinement bump in MNP
+        // can still pull a borderline true positive over the line.
+        detect->set_score_thr(0.65f, 0);
         auto *feat = new HumanFaceFeat();
         const int feat_len = feat->get_feat_len();
 
-        // Scratch buffer for orientation-rotated frames. Sized for a square
-        // FRAME_DIM x FRAME_DIM RGB565 image; lives in PSRAM since this is
-        // the same memory class as the camera fb. Allocated once.
+        // Scratch buffer for orientation-rotated frames. Prefer
+        // internal SRAM (~3-4x faster than octal PSRAM at 80 MHz) so
+        // the detector's input read traffic doesn't hit the slow bus.
+        // ~115 KB is a big chunk of the S3's 320 KB internal heap but
+        // it fits comfortably alongside the existing IDF + camera
+        // stacks; if for some reason it doesn't, we transparently
+        // fall back to PSRAM and lose only the bandwidth bonus.
         const size_t scratch_bytes = (size_t)FRAME_DIM * FRAME_DIM * sizeof(uint16_t);
         auto *scratch = (uint16_t *)heap_caps_aligned_alloc(
-            16, scratch_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            16, scratch_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (scratch) {
+            ESP_LOGI(TAG, "orientation scratch in internal SRAM (%u B)",
+                     (unsigned)scratch_bytes);
+        } else {
+            scratch = (uint16_t *)heap_caps_aligned_alloc(
+                16, scratch_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (scratch) {
+                ESP_LOGW(TAG,
+                         "internal SRAM full; orientation scratch in PSRAM (%u B)",
+                         (unsigned)scratch_bytes);
+            }
+        }
         if (!scratch)
         {
-            ESP_LOGE(TAG, "failed to alloc %u-byte orientation scratch in PSRAM",
+            ESP_LOGE(TAG, "failed to alloc %u-byte orientation scratch",
                      (unsigned)scratch_bytes);
             vTaskDelete(nullptr);
             return;
@@ -695,6 +757,17 @@ namespace
 
         // Debounce: consecutive frames so far that look like a new face.
         int unknown_streak = 0;
+
+        // Recognition cache. While the same face stays in roughly
+        // the same place we treat consecutive detections as the same
+        // identity and skip the embedder + cosine sweep. See
+        // RECOG_CACHE_MS / RECOG_IOU_PCT.
+        struct {
+            bool     valid       = false;
+            int      box[4]      = {0, 0, 0, 0};   // detection-frame coords
+            Orient   orient      = Orient::ROT_0;  // bbox is only comparable in same orient
+            uint32_t stamp_ms    = 0;
+        } recog_cache;
 
         // Orientation to TRY on this frame. After a successful detection we
     // leave this alone so the next frame uses the same orientation; on a
@@ -932,6 +1005,31 @@ namespace
                 continue;
             }
 
+            // Recognition cache: if the most recent identified face's
+            // bbox overlaps this one strongly (and the cache hasn't
+            // gone stale), treat this frame as a continuation of that
+            // identity and skip the ~50 ms embedder + cosine pass
+            // entirely. The cache is invalidated on orient change so
+            // we don't accidentally cross-compare bboxes from
+            // different coordinate systems.
+            const bool cache_hot =
+                recog_cache.valid &&
+                recog_cache.orient == locked_orient &&
+                (now_ms() - recog_cache.stamp_ms) < RECOG_CACHE_MS &&
+                iou_pct(biggest->box.data(), recog_cache.box) >
+                    RECOG_IOU_PCT;
+            if (cache_hot)
+            {
+                ++s_recognised;
+                unknown_streak = 0;
+                ESP_LOGD(TAG,
+                         "cached recog: iou>%d, %u ms since last embed",
+                         RECOG_IOU_PCT,
+                         (unsigned)(now_ms() - recog_cache.stamp_ms));
+                esp_camera_fb_return(fb);
+                continue;
+            }
+
             // Run the embedder. The returned TensorBase is owned by the
             // postprocessor and reused on the NEXT call, so we must copy
             // its floats before doing anything else that might run the
@@ -976,6 +1074,17 @@ namespace
                 unknown_streak = 0;
                 ESP_LOGI(TAG, "known face: id=%d sim=%.3f focus=%d orient=%d",
                          best_id, (double)best_sim, focus, (int)locked_orient);
+
+                // Cache this hit so the next few frames at roughly
+                // the same bbox can skip the embedder pass.
+                recog_cache.valid    = true;
+                recog_cache.box[0]   = biggest->box[0];
+                recog_cache.box[1]   = biggest->box[1];
+                recog_cache.box[2]   = biggest->box[2];
+                recog_cache.box[3]   = biggest->box[3];
+                recog_cache.orient   = locked_orient;
+                recog_cache.stamp_ms = now_ms();
+
                 esp_camera_fb_return(fb);
                 continue;
             }
@@ -1027,6 +1136,17 @@ namespace
             else
             {
                 ++s_enrolled;
+
+                // Newly enrolled face: prime the cache so we don't
+                // immediately re-embed and re-match it against
+                // itself on the very next frame.
+                recog_cache.valid    = true;
+                recog_cache.box[0]   = biggest->box[0];
+                recog_cache.box[1]   = biggest->box[1];
+                recog_cache.box[2]   = biggest->box[2];
+                recog_cache.box[3]   = biggest->box[3];
+                recog_cache.orient   = locked_orient;
+                recog_cache.stamp_ms = now_ms();
 
                 // Only (re)render the banner if one isn't already on
                 // screen: we want the text orientation to reflect the
