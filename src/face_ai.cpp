@@ -431,6 +431,77 @@ namespace
     constexpr int CLAHE_N        = 4;                          // tile grid (N x N)
     constexpr int CLAHE_TILE_SZ  = FRAME_DIM / CLAHE_N;        // 60
     constexpr int CLAHE_TILE_PX  = CLAHE_TILE_SZ * CLAHE_TILE_SZ;  // 3600
+
+    // ---------------------------------------------------------------
+    // Motion pre-screen
+    // ---------------------------------------------------------------
+    //
+    // Once the detector lock has fully expired (consecutive_misses
+    // beyond OVERLAY_CLEAR_MISSES) the AI loop is just polling a
+    // mostly-empty room. Running CLAHE + the detector + the padded
+    // fallback on every frame in that state is ~80-160 ms of dead
+    // work per cycle for zero benefit.
+    //
+    // Standard embedded-vision trick: take a coarse SAD between
+    // consecutive frames and skip the heavy work when the scene
+    // hasn't changed. We use an 8x8 sample grid (1/900 of pixels
+    // touched, < 50 us per frame) and a generous SAD threshold so
+    // sensor noise at high gain doesn't false-trigger.
+    //
+    // FORCE_INTERVAL guarantees we still run a real detect every N
+    // quiet frames so a slowly-arriving face that stays under the
+    // motion threshold doesn't go invisible forever.
+
+    constexpr int MOTION_GRID                  = 8;
+    constexpr int MOTION_STRIDE                = FRAME_DIM / MOTION_GRID;
+    constexpr int MOTION_SAD_THRESHOLD         = 200;
+    constexpr int MOTION_FORCE_INTERVAL_FRAMES = 50;
+
+    struct MotionState {
+        uint8_t samples[MOTION_GRID * MOTION_GRID] = {};
+        bool    valid       = false;
+        int     quiet_frames = 0;
+    };
+
+    bool scene_is_static(const uint16_t *fb, MotionState &m) noexcept
+    {
+        uint8_t cur[MOTION_GRID * MOTION_GRID];
+        const uint8_t *p8 = (const uint8_t *)fb;
+        for (int j = 0; j < MOTION_GRID; ++j) {
+            const int y = MOTION_STRIDE / 2 + j * MOTION_STRIDE;
+            for (int i = 0; i < MOTION_GRID; ++i) {
+                const int x = MOTION_STRIDE / 2 + i * MOTION_STRIDE;
+                const int idx = (y * FRAME_DIM + x) * 2;
+                const uint8_t hi = p8[idx];
+                const uint8_t lo = p8[idx + 1];
+                const uint8_t g6 =
+                    (uint8_t)(((hi & 0x07) << 3) | (lo >> 5));
+                cur[j * MOTION_GRID + i] =
+                    (uint8_t)((g6 << 2) | (g6 >> 4));
+            }
+        }
+        if (!m.valid) {
+            std::memcpy(m.samples, cur, sizeof(cur));
+            m.valid = true;
+            m.quiet_frames = 0;
+            return false;
+        }
+        int sad = 0;
+        for (int i = 0; i < MOTION_GRID * MOTION_GRID; ++i) {
+            sad += std::abs((int)cur[i] - (int)m.samples[i]);
+        }
+        std::memcpy(m.samples, cur, sizeof(cur));
+        if (sad < MOTION_SAD_THRESHOLD) {
+            ++m.quiet_frames;
+            if (m.quiet_frames >= MOTION_FORCE_INTERVAL_FRAMES) {
+                m.quiet_frames = 0;
+                return false;
+            }
+            return true;
+        }
+        m.quiet_frames = 0;
+        return false;
+    }
     // CLAHE clip limit is driven by the adaptive tuning (see Tuning
     // / g_tuning further down). The compile-time CLAHE_TILE_PX is
     // still useful for the % math when building presets.
@@ -1197,9 +1268,15 @@ namespace
         AEPreset  ae_preset       = AEPreset::MID;
         int64_t   ae_next_check_us =
             esp_timer_get_time() + (int64_t)AE_CHECK_INTERVAL_MS * 1000;
+
+        // Motion pre-screen state. Initialised invalid; first
+        // qualifying frame seeds the comparison and from there the
+        // SAD vs previous tells us if the scene is unchanged.
+        MotionState motion;
         uint32_t s_frames = 0;        // frames pulled from camera
         uint32_t s_raw_dets = 0;      // detector returned >=1 result (any score, any orient)
         uint32_t s_pad_hits = 0;      // padded-fallback rescued a frame
+        uint32_t s_motion_skip = 0;   // skipped detection due to no scene change
         uint32_t s_detections = 0;    // kept after every gate (size/focus/score/upright)
         uint32_t s_rej_score = 0;     // biggest rejected by MIN_DETECT_SCORE
         uint32_t s_rej_geom = 0;      // biggest rejected by keypoints_look_upright
@@ -1309,10 +1386,11 @@ namespace
                 const float avg_score = s_score_n ?
                     (s_score_sum / (float)s_score_n) : 0.f;
                 ESP_LOGI(TAG,
-                         "1s: frame=%u raw=%u pad=%u kept=%u score_avg=%.2f "
+                         "1s: frame=%u skip=%u raw=%u pad=%u kept=%u score_avg=%.2f "
                          "| rej:score=%u geom=%u small=%u blurry=%u "
                          "| known=%u new=%u (db=%u o=%d)",
                          (unsigned)s_frames,
+                         (unsigned)s_motion_skip,
                          (unsigned)s_raw_dets,
                          (unsigned)s_pad_hits,
                          (unsigned)s_detections,
@@ -1324,7 +1402,7 @@ namespace
                          (unsigned)s_recognised, (unsigned)s_enrolled,
                          (unsigned)g_known_faces.size(),
                          (int)try_orient);
-                s_frames = s_raw_dets = s_pad_hits = s_detections =
+                s_frames = s_motion_skip = s_raw_dets = s_pad_hits = s_detections =
                     s_rej_score = s_rej_geom = s_too_small = s_too_blurry =
                     s_recognised = s_enrolled = 0;
                 s_score_sum = 0.f;
@@ -1345,6 +1423,23 @@ namespace
                 continue;
             }
             ++s_frames;
+
+            // Motion pre-screen: once the face has clearly left the
+            // frame (consecutive_misses past the overlay-clear
+            // threshold) and the coarse-luma SAD says the scene
+            // hasn't changed, skip the entire detection pipeline.
+            // Saves ~80-160 ms of dead work per cycle while the
+            // room is empty; cost is < 50 us per frame on the
+            // motion check itself.
+            if (consecutive_misses >= OVERLAY_CLEAR_MISSES &&
+                fb->width == FRAME_DIM && fb->height == FRAME_DIM &&
+                scene_is_static((const uint16_t *)fb->buf, motion))
+            {
+                ++s_motion_skip;
+                esp_camera_fb_return(fb);
+                vTaskDelay(pdMS_TO_TICKS(NO_FACE_DELAY_MS));
+                continue;
+            }
 
             // Pre-process the camera fb into something the detector
             // will be happy with: optional 90/180/270 rotation so the
