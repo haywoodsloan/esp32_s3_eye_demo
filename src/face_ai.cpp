@@ -85,19 +85,31 @@ namespace
     constexpr int MIN_FACE_PX = 83;
 
     // Minimum detector confidence for a result to be acted on at all.
-    // The detector occasionally fires on rough face-like blobs and on
-    // upside-down faces; the upside-down case is already caught much
-    // more reliably by keypoints_look_upright(), so we can afford to
-    // keep this score floor permissive. At close range the detector's
-    // confidence drops (faces fill the frame, out of training
-    // distribution), in low-light scenes the model's confidence drops
-    // further, and faces wearing glasses score lower across the board
-    // (lens reflections / refraction confuse the eye-keypoint
-    // regression). We lean on the keypoint-geometry triple check and
-    // the IoU recognition cache to suppress false positives rather
-    // than this floor; 0.35 is loose enough to let glasses through
-    // while still rejecting most non-face textures.
-    constexpr float MIN_DETECT_SCORE = 0.35f;
+    // Two floors, gated by the orient the detector ran in -- see the
+    // `Orient` enum + `min_detect_score_for()` further down:
+    //
+    //   * `MIN_DETECT_SCORE_ROT0` is loose enough to admit detections
+    //     whose confidence drops a notch -- the common case being
+    //     glasses-wearers (lens reflections / refraction reliably
+    //     knock ~0.05 off the score in our experience), but also
+    //     low-light and close-range / out-of-distribution faces.
+    //
+    //   * `MIN_DETECT_SCORE_ROTATED` is stricter, used for the three
+    //     non-default orients. The cost of accepting a weak detection
+    //     in a wrong orient is high (the cycle locks there and the
+    //     on-screen banner now reads upside-down or sideways relative
+    //     to the real head pose); the cost of demanding more evidence
+    //     is just one or two more cycles around the orient wheel.
+    //     Legitimate rotated detections (user holding the device
+    //     sideways) routinely score 0.7-0.9 so this floor doesn't
+    //     gate genuine use.
+    //
+    // The orient-cycle's other gates -- keypoints_look_upright() and
+    // the IoU recognition cache -- catch the remaining false-positive
+    // classes (upside-down faces with mis-labelled keypoints, blob
+    // misfires on textured backgrounds).
+    constexpr float MIN_DETECT_SCORE_ROT0    = 0.35f;
+    constexpr float MIN_DETECT_SCORE_ROTATED = 0.50f;
 
     // Recognition cache. The embedder is the most expensive single
     // stage in the pipeline (~50 ms / call on the S8 model), and when
@@ -307,6 +319,17 @@ namespace
         ROT_180 = 2,
         ROT_270_CW = 3
     };
+
+    // See `MIN_DETECT_SCORE_ROT0` / `MIN_DETECT_SCORE_ROTATED` above
+    // for the rationale behind the two-tier floor. Selector lives
+    // here rather than next to the constants because it needs the
+    // `Orient` enum (which can't move higher without dragging the
+    // pre-rotation pipeline up with it).
+    constexpr float min_detect_score_for(Orient o) noexcept
+    {
+        return (o == Orient::ROT_0) ? MIN_DETECT_SCORE_ROT0
+                                    : MIN_DETECT_SCORE_ROTATED;
+    }
 
     constexpr int FRAME_DIM = 240; // OV2640 is configured for 240x240 RGB565.
 
@@ -1734,7 +1757,7 @@ namespace
                         pbest = &d;
                     }
                 }
-                if (pbest && pbest->score >= MIN_DETECT_SCORE) {
+                if (pbest && pbest->score >= min_detect_score_for(try_orient)) {
                     // Deep-copy into a local result we own, since the
                     // detector reuses its internal list on the next
                     // call.
@@ -1759,13 +1782,14 @@ namespace
                 }
             }
 
+            const float score_floor = min_detect_score_for(try_orient);
             if (!biggest ||
-                biggest->score < MIN_DETECT_SCORE ||
+                biggest->score < score_floor ||
                 !keypoints_look_upright(biggest))
             {
                 if (biggest)
                 {
-                    if (biggest->score < MIN_DETECT_SCORE) {
+                    if (biggest->score < score_floor) {
                         // Low-confidence detection: don't bother
                         // running the embedder on it, don't update
                         // the HUD with a flaky bbox, and don't lock
@@ -1773,7 +1797,7 @@ namespace
                         ESP_LOGD(TAG,
                                  "drop low-score det: score=%.2f < %.2f (orient=%d)",
                                  (double)biggest->score,
-                                 (double)MIN_DETECT_SCORE,
+                                 (double)score_floor,
                                  (int)try_orient);
                         ++s_rej_score;
                     } else {

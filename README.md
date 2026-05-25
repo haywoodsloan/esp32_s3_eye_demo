@@ -342,13 +342,18 @@ per call and isn't worth it during cold-start orient discovery.
 
 Independent properties any kept detection must pass:
 
-- **`MIN_DETECT_SCORE` (0.35)** — model confidence floor. The detector
-  occasionally fires on rough face-like blobs; below this score we
-  treat the result as a miss and the orient cycle resumes. Tuned
-  loose enough that lens reflections / refraction from glasses don't
-  push real detections under the floor; the `keypoints_look_upright`
-  gate below provides the second line of defence against the
-  upside-down / textured-blob false-positive class.
+- **Detector confidence floor** — a per-orient floor selected by
+  `min_detect_score_for(try_orient)`:
+  - `MIN_DETECT_SCORE_ROT0 = 0.35` for the default upright orient.
+    Loose enough that lens reflections / refraction from glasses
+    don't push real detections under the floor.
+  - `MIN_DETECT_SCORE_ROTATED = 0.50` for the three non-default
+    orients. Cost of letting a marginal wrong-orient through is high
+    (the cycle locks there, banner now rotates with the lock); cost
+    of demanding stronger evidence is one or two extra cycle rounds.
+  The `keypoints_look_upright` gate below provides the second line of
+  defence against the upside-down / textured-blob false-positive
+  class.
 - **`keypoints_look_upright()`** — the nose keypoint must sit at least
   `eye_dx / 8` below the eye midline. The single check that an
   upside-down real face cannot fake, because when the detector does
@@ -462,7 +467,8 @@ ones, with the values used at HEAD:
 |---|---|---|
 | `MIN_FACE_PX` | 83 | Reject detections smaller than this; bigger → user must stand closer |
 | `MIN_SHARPNESS` | 15 | Focus-metric floor (avg `\|dG/dx\| + \|dG/dy\|`) |
-| `MIN_DETECT_SCORE` | 0.35 | Model-confidence floor; below this a detection is treated as a miss. Loose enough to admit glasses-wearer detections (lens reflections / refraction reliably knock ~0.05 off the model's score). |
+| `MIN_DETECT_SCORE_ROT0` | 0.35 | Model-confidence floor when the detector ran with no pre-rotation. Loose enough to admit glasses-wearer detections (lens reflections / refraction reliably knock ~0.05 off the model's score). |
+| `MIN_DETECT_SCORE_ROTATED` | 0.50 | Stricter floor for the three non-default orients. Cost of accepting a weak rotated detection is high (cycle locks there, banner reads upside-down or sideways); cost of demanding more evidence is just an extra cycle round. |
 | `MAX_KNOWN_FACES` | 32 | Per-boot DB cap |
 | `BANNER_HOLD_MS` | 5000 | Green NEW-FACE banner duration |
 | `NAME_BANNER_LINGER_MS` | 1500 | How long the navy name banner stays up past the last recognition |
