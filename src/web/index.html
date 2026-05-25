@@ -95,7 +95,7 @@ async function load() {
         '<img src="/api/face/' + f.id + '/thumb">'
         + '<div class="meta">' + displayName(f).replace(/</g, '&lt;') + '</div>'
         + '<div class="row">'
-        +   '<input type="text" placeholder="name" value="'
+        +   '<input type="text" placeholder="Name" value="'
         +     (f.name || '').replace(/"/g, '&quot;') + '">'
         +   '<button class="save">Save</button>'
         + '</div>'
