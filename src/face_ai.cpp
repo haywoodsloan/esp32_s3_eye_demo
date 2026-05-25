@@ -254,6 +254,12 @@ namespace
     // is taken from the high byte of the BE-stored uint16_t pixel (green
     // dominates that byte in RGB565). A sharp face yields ~30-80, a blurry
     // or motion-smeared face ~5-15.
+    //
+    // Stride scales with the bbox's longer side so work is roughly
+    // constant (~1600 samples) regardless of how close the face is.
+    // Close-range faces can fill the frame (240x240 bbox) which at the
+    // old fixed stride of 3 cost ~6400 iterations per call; the adaptive
+    // stride caps that at ~1600 without losing the metric's stability.
     int focus_metric(const uint16_t *__restrict__ rgb565, int img_w, int img_h,
                      int x0, int y0, int x1, int y1) noexcept
     {
@@ -265,11 +271,14 @@ namespace
             return 0;
         }
 
+        const int side   = std::max(x1 - x0, y1 - y0);
+        const int stride = std::max(3, side / 40);
+
         int n   = 0;
         int sum = 0;
-        for (int y = y0; y < y1; y += 3) {
+        for (int y = y0; y < y1; y += stride) {
             const uint16_t *row = rgb565 + y * img_w;
-            for (int x = x0; x < x1 - 1; x += 3) {
+            for (int x = x0; x < x1 - 1; x += stride) {
                 const int g  = (row[x]         >> 8) & 0xFF;
                 const int gx = (row[x + 1]     >> 8) & 0xFF;
                 const int gy = (row[x + img_w] >> 8) & 0xFF;
@@ -406,9 +415,21 @@ namespace
             }
             break;
         case Orient::ROT_180: {
-            const int total = n * n;
-            for (int i = 0; i < total; ++i) {
-                dst[i] = src[total - 1 - i];
+            // Pair-rotate via uint32_t: each iteration consumes two
+            // pixels from the tail of src and writes them, swapped
+            // within the 32-bit word, to the head of dst. Halves the
+            // loop count vs the scalar version and keeps both src
+            // and dst accesses 32-bit aligned (n=240 -> total even).
+            const int       total       = n * n;
+            const int       total_pairs = total / 2;
+            const uint32_t *src32       = reinterpret_cast<const uint32_t *>(src);
+            uint32_t       *dst32       = reinterpret_cast<uint32_t *>(dst);
+            for (int i = 0; i < total_pairs; ++i) {
+                const uint32_t w = src32[total_pairs - 1 - i];
+                // src word holds (pix_lo, pix_hi); dst needs
+                // (pix_hi, pix_lo) so the reversed sequence stays
+                // pixel-correct, not byte-reversed.
+                dst32[i] = (w >> 16) | (w << 16);
             }
             break;
         }
@@ -1013,26 +1034,34 @@ namespace
     constexpr int PADDED_INNER  = 160;
     constexpr int PADDED_BORDER = (FRAME_DIM - PADDED_INNER) / 2;
 
+    // RGB565 mid-grey (R5=15, G6=31, B5=15 -> 0x7BEF) byte-swapped
+    // for BE storage, packed as a 32-bit pair for fast PSRAM fills.
+    constexpr uint16_t PADDED_GREY_BE      = __builtin_bswap16(uint16_t{0x7BEFu});
+    constexpr uint32_t PADDED_GREY_BE_PAIR =
+        (uint32_t{PADDED_GREY_BE} << 16) | PADDED_GREY_BE;
+
+    // One-time PSRAM fill of the padded scratch buffer with mid-grey.
+    // Called once after allocation; shrink_into_padded() then only
+    // rewrites the centred inner box per call, so the slow PSRAM
+    // border writes (~80 KB of the 115 KB buffer) are paid exactly
+    // once over the device's lifetime instead of every padded retry.
+    void padded_scratch_fill_grey(uint16_t *dst) noexcept
+    {
+        constexpr size_t total_pairs = size_t{FRAME_DIM} * FRAME_DIM / 2;
+        uint32_t *dst32 = reinterpret_cast<uint32_t *>(dst);
+        for (size_t i = 0; i < total_pairs; ++i) {
+            dst32[i] = PADDED_GREY_BE_PAIR;
+        }
+    }
+
     __attribute__((hot))
     void shrink_into_padded(const uint16_t *src, uint16_t *dst) noexcept
     {
-        // RGB565 mid-grey (R5=15, G6=31, B5=15 -> 0x7BEF) byte-swapped
-        // for BE storage. Fill 32 bits at a time (two pixels per write)
-        // -- on a word-aligned PSRAM buffer this is meaningfully
-        // faster than a per-pixel store. FRAME_DIM * FRAME_DIM = 57600
-        // is even, so we never write past the end.
-        constexpr uint16_t grey_native   = 0x7BEFu;
-        constexpr uint16_t grey_be       = __builtin_bswap16(grey_native);
-        constexpr uint32_t grey_be_pair  = (uint32_t{grey_be} << 16) | grey_be;
-        constexpr size_t   total_pairs   = size_t{FRAME_DIM} * FRAME_DIM / 2;
-
-        uint32_t *dst32 = reinterpret_cast<uint32_t *>(dst);
-        for (size_t i = 0; i < total_pairs; ++i) {
-            dst32[i] = grey_be_pair;
-        }
-
-        // Nearest-neighbour resample src (FRAME_DIM x FRAME_DIM) into
-        // the centred INNER x INNER region.
+        // dst's grey border was filled once by padded_scratch_fill_grey()
+        // at task startup and the resample below never touches it,
+        // so we can skip the ~115 KB grey-fill every call. We only
+        // need to nearest-neighbour resample src (FRAME_DIM x FRAME_DIM)
+        // into the centred INNER x INNER region.
         for (int y = 0; y < PADDED_INNER; ++y) {
             const int       sy   = (y * FRAME_DIM) / PADDED_INNER;
             const uint16_t *srow = src + static_cast<size_t>(sy) * FRAME_DIM;
@@ -1360,6 +1389,10 @@ namespace
                      "no PSRAM for padded fallback (%u B); close-range "
                      "detection may suffer",
                      (unsigned)scratch_bytes);
+        } else {
+            // Grey border is invariant -- fill once and let
+            // shrink_into_padded() only rewrite the inner box.
+            padded_scratch_fill_grey(padded_scratch);
         }
 
         // The known-face DB lives at module scope (g_known_faces /
