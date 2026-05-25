@@ -1,15 +1,16 @@
 # esp32_s3_eye_demo
 
-A face detection, recognition, and remembering demo for the
+A face-detection, face-recognition, and face-remembering demo for the
 [**ESP32-S3-EYE**](https://www.espressif.com/en/products/devkits/esp32-s3-eye)
 dev board. Live camera preview on the on-board LCD, on-device neural-network
-inference, an overlay HUD with bbox + facial keypoints, an "I will remember
-you" banner whenever a new face is enrolled, and a tiny mDNS-discoverable
-web UI for browsing and naming everyone the camera has seen since boot.
+inference, an overlay HUD with bbox + facial keypoints, a "NEW FACE
+DETECTED" banner whenever a face is enrolled, a navy name banner whenever
+a known face is recognised, and an mDNS-discoverable web UI for browsing,
+naming, and deleting everyone the camera has seen since boot.
 
-Built with PlatformIO + ESP-IDF and the
-[ESP-WHO](https://github.com/espressif/esp-who) face stack (MSR+MNP
-detector, MobileFaceNet embedder), running entirely on the S3's two
+Built with PlatformIO + ESP-IDF on top of the
+[ESP-WHO](https://github.com/espressif/esp-who) face stack (MSR + MNP
+detector, MobileFaceNet embedder). Everything runs on the S3's two
 Xtensa LX7 cores — no cloud, no companion app, no off-device inference.
 
 ---
@@ -18,51 +19,49 @@ Xtensa LX7 cores — no cloud, no companion app, no off-device inference.
 
 - **Live preview** of the OV2640 camera on the 240×240 ST7789 LCD at the
   sensor's full output rate.
-- **Face detection** that auto-cycles through 0 / 90 / 180 / 270° input
-  rotations so the device works whether you're holding it portrait,
-  landscape, or upside down.
+- **Rotation-invariant detection**: the AI loop auto-cycles through
+  0 / 90 / 180 / 270° input rotations, so the device works whether
+  you're holding it portrait, landscape, or upside down. Once an
+  orientation locks, subsequent frames re-use it for single-shot
+  detection.
 - **Detection HUD** drawn on top of the live preview: green bbox plus
-  five colour-coded keypoint dots (red = L eye, yellow = R eye, lime =
-  nose, magenta = L mouth corner, cyan = R mouth corner) — same look as
-  the stock Espressif demo, persists smoothly through brief detector
-  misses.
-- **Adaptive image-processing pipeline** that walks the detector input
+  five colour-coded keypoint dots (red = left eye, yellow = right eye,
+  lime = nose, magenta = left mouth corner, cyan = right mouth corner).
+  The HUD persists smoothly through brief detector misses and only
+  hides itself when the face has clearly left the frame.
+- **Adaptive image-processing pipeline** — the full detector input goes
   through pre-rotation → CLAHE contrast-limited histogram equalisation
-  (single-pass fused with the histogram build) → MSR+MNP detection →
-  a close-range padded-fallback retry → app-level geometry / size /
-  sharpness gates → recognition-cache short-circuit → MobileFaceNet
-  embedding → cosine-similarity match. See [Image processing
-  pipeline](#image-processing-pipeline) below for the full flow.
-- **Adaptive AE bias** driving the OV2640's gain ceiling / brightness /
-  AE level off the frame's measured mean luma, with three discrete
-  presets (DIM / MID / BRIGHT) and asymmetric hysteresis between them.
-  The same preset cycle also drives the matcher's similarity threshold
-  and the CLAHE clip-limit, so dim and bright scenes use thresholds
-  tuned to their own signal/noise profile.
-- **Motion pre-screen** that compares a coarse 8×8 luma sample grid
-  frame-to-frame and skips the entire detection pipeline when the
-  scene hasn't changed and no recent lock exists. Saves ~80-160 ms per
-  cycle while the room is empty.
-- **Face recognition** using MobileFaceNet embeddings + cosine similarity
-  (SIMD-accelerated via ESP-DSP's `dsps_dotprod_f32` PIE assembly), with
-  an IoU-keyed recognition cache that short-circuits the ~50 ms embedder
-  pass while the same face stays in roughly the same position.
+  (single-pass, fused with the histogram build) → MSR + MNP detection
+  → a close-range padded-fallback retry → geometry / size / sharpness
+  gates → recognition-cache short-circuit → MobileFaceNet embedding
+  → cosine-similarity match. See [Image processing
+  pipeline](#image-processing-pipeline) for the full walkthrough.
+- **Adaptive AE bias** drives the OV2640's gain ceiling, brightness, and
+  AE target off the frame's mean luma, picking between three presets
+  (DIM / MID / BRIGHT) with asymmetric hysteresis. The same preset cycle
+  also pulls the matcher's similarity threshold and the CLAHE clip-limit
+  with it, so each lighting regime uses thresholds tuned to its own
+  signal-to-noise profile.
+- **Motion pre-screen** — a coarse 8×8 luma-sample-grid SAD test that
+  skips the entire detection pipeline when the scene hasn't moved and
+  no face is currently locked. Saves roughly 80–160 ms of CPU per cycle
+  whenever the room is empty.
+- **Face recognition** via MobileFaceNet embeddings + cosine similarity
+  (SIMD-accelerated by ESP-DSP's `dsps_dotprod_f32` PIE assembly). An
+  IoU-keyed recognition cache short-circuits the ~50 ms embedder pass
+  while the same face stays in roughly the same position.
 - **Enrolment banner** — "NEW FACE / DETECTED" composited onto the live
-  preview in dark green with a black outline, text orientation locked at
-  enrolment to whichever way the face was actually facing. Rendered
-  from a real bitmap font (FreeSans 18pt) via Adafruit GFXfont
-  format — see [`src/fonts/`](src/fonts/).
+  preview in dark green with a black outline. Rendered from a real
+  bitmap font (FreeSans 18pt) in Adafruit GFXfont format, and rotated
+  to match the head pose at the moment of enrolment.
 - **Recognition banner** — navy-blue name overlay along the bottom edge
-  of the live preview whenever the matcher returns a known face that
-  has been given a name through the web UI. Uses the same font / outline
-  pipeline as the green banner and the same orientation snap-to-quarter-
-  turn so it reads upright against the head pose.
-- **mDNS-discoverable web UI** at `http://esp-face-detect.local/` —
-  shows every enrolled face's thumbnail, lets you name them, refreshes
-  the displayed name (and the on-LCD navy banner) immediately on save.
-  Index page is shipped as a real `.html` file in
-  [`src/web/`](src/web/) and embedded into firmware via a build-time
-  pre-script.
+  of the live preview whenever the matcher returns a face that has been
+  named in the web UI. Shares the font + outline pipeline with the
+  green banner; rotates to match the head pose.
+- **mDNS-discoverable web UI** at `http://esp-face-detect.local/` — grid
+  of enrolled faces with thumbnails, editable names, and delete
+  buttons. Renaming a face updates both the on-screen card and the
+  on-LCD navy banner the moment the matcher next hits it.
 
 ---
 
@@ -71,12 +70,12 @@ Xtensa LX7 cores — no cloud, no companion app, no off-device inference.
 | Component | Notes |
 |---|---|
 | **ESP32-S3-EYE** (rev 2.1+) | OV2640 camera, ST7789 LCD, 8 MB octal PSRAM, 8 MB flash |
-| **5 V USB-C supply** | Decent supply — face inference + camera + LCD draw ~300 mA bursts |
+| **5 V USB-C supply** | Use a decent cable / port — camera + LCD + ESP-DL inference can hit ~300 mA peaks together |
 
 Tested on the v2.1 board. Nothing in the code is fundamentally
-S3-EYE-specific — the pin map lives in [`src/board_pins.h`](src/board_pins.h)
-and the camera config in [`src/camera.cpp`](src/camera.cpp). Porting
-to another OV2640 + ST7789 board mostly means editing those two files.
+S3-EYE-specific — porting to another OV2640 + ST7789 setup is mostly
+a matter of editing [`src/board_pins.h`](src/board_pins.h) (pin map)
+and [`src/camera.cpp`](src/camera.cpp) (sensor config).
 
 ---
 
@@ -84,10 +83,16 @@ to another OV2640 + ST7789 board mostly means editing those two files.
 
 ### Prerequisites
 
-- [PlatformIO Core](https://platformio.org/install/cli) (the VS Code
-  extension also works)
-- Python 3.10+ on `PATH` (only used by the helper script that packs the
-  ESP-DL model partitions)
+- [PlatformIO Core](https://platformio.org/install/cli) — the VS Code
+  extension works too.
+- Python 3.10+ on `PATH`. Used by two `pre:` extra scripts:
+  - [`scripts/embed_web_html.py`](scripts/embed_web_html.py) bakes
+    [`src/web/index.html`](src/web/index.html) into a C++ raw-string
+    header that the firmware serves over HTTP.
+  - [`scripts/flash_espdl_models.py`](scripts/flash_espdl_models.py)
+    packs the ESP-DL model blobs and appends them to PlatformIO's
+    `FLASH_EXTRA_IMAGES` so they land in their own flash partitions
+    on every `pio run -t upload`.
 
 ### One-time setup
 
@@ -108,13 +113,13 @@ pio run -t upload       # also packs and flashes the ESP-DL model partitions
 pio device monitor      # 115200 baud
 ```
 
-The face-detect and face-feat ESP-DL models live in their own flash
-partitions (see the [partition table](#partition-layout) below) and are
-packed + uploaded by [`scripts/flash_espdl_models.py`](scripts/flash_espdl_models.py),
-which PlatformIO invokes via the `pre:` extra script hook in
-[`platformio.ini`](platformio.ini). This works around an
-[upstream esp-dl bug](#workarounds) with PlatformIO's relative `BUILD_DIR`.
-
+The two ESP-DL model partitions (`human_face_det`, `human_face_feat`)
+are packed and uploaded by
+[`scripts/flash_espdl_models.py`](scripts/flash_espdl_models.py), which
+PlatformIO invokes as a `pre:` extra script (see
+[`platformio.ini`](platformio.ini)). This works around the
+[upstream esp-dl bug](#workarounds) with PlatformIO's relative
+`BUILD_DIR`.
 ### Web UI
 
 Once the device logs `got IP: ...` and `mDNS up: http://esp-face-detect.local/`,
@@ -124,9 +129,9 @@ Android 12+. If your client doesn't speak mDNS, use the IP from the
 serial log directly.
 
 The page polls `/api/faces` every 2 s and renders one card per enrolled
-face — thumbnail, an editable name input, and a Save button. Names are
-stored in RAM and reset on every boot (persistence is a planned future
-feature).
+face — thumbnail, name input + Save, and a Delete button. Names live
+in RAM and reset on every boot ([persistence](#not-yet-implemented) is
+still on the to-do list).
 
 ---
 
@@ -306,13 +311,13 @@ the AE preset cycle. A tiny stride-4 subsampled scan (~3600 pixels,
 
 ### 4. Detection (MSR + MNP cascade)
 
-Hand the prepared 240×240 RGB565BE buffer to `HumanFaceDetect::run()`.
-The model is a two-stage cascade: MSR (Multi-Stage Reduction) proposes
-candidate regions, MNP (Multi-stage Network Predictor) refines bbox
-geometry and emits 5 facial keypoints (two eyes, nose, two mouth
-corners). End-to-end inference is ~60-100 ms on the S3 build of the
-S8-quantised models. We act only on the largest-area result so we
-don't try to enrol two people at once.
+The prepared 240×240 RGB565BE buffer goes to `HumanFaceDetect::run()`.
+The model is a two-stage cascade: a first network ("MSR") proposes
+candidate face regions; a second one ("MNP") refines each candidate's
+bbox and emits five facial keypoints — two eyes, the nose, and two
+mouth corners. End-to-end inference is ~60-100 ms on the S3 build of
+the S8-quantised models. We act only on the largest-area result so we
+don't try to enrol two people from the same frame.
 
 ### 5. Close-range padded fallback
 
@@ -531,6 +536,7 @@ sdkconfig.defaults              key ESP-IDF knobs (PSRAM, exception support, bro
 | `GET` | `/api/faces` | `[{ "id": int, "name": string, "enrolled_ms": uint }, …]` |
 | `GET` | `/api/face/<id>/thumb` | 24-bit BMP, 64×64, content-type `image/bmp` |
 | `POST` | `/api/face/<id>/name` | Request body is the literal name string; responds `{"ok":true}` |
+| `DELETE` | `/api/face/<id>` | Removes the face from the in-memory DB; subsequent ids shift down by one. Responds `{"ok":true}` |
 
 ### C++ (in-process)
 
@@ -545,6 +551,7 @@ int       face_db_count();
 bool      face_db_get_entry(int idx, face_db_entry_t *out);
 bool      face_db_copy_thumb(int idx, uint16_t *dst, size_t capacity_px);
 bool      face_db_set_name(int idx, const char *name);
+bool      face_db_delete(int idx);           // also invalidates the AI task's recog cache
 ```
 
 ---
@@ -601,44 +608,49 @@ they don't get re-discovered the hard way.
    includes directly. The generated header is gitignored.
 
 5. **Brownout detector lowered** from the IDF default `SEL_7` (~3.19 V)
-   to `SEL_4` (~2.79 V) so transient peak-current dips on USB power
-   don't reset the device when camera + LCD + ESP-DL all peak together.
-   The S3 datasheet specifies VDD33 min = 3.0 V, so SEL_4 is already
-   *below* spec — chosen as a clean-reset floor that's still above the
-   LCD's 2.4 V and OV2640's 2.5 V hardware minimums. If you see
-   brownouts on a known-good supply, the right fix is a better USB
-   cable, not a lower threshold.
+   to `SEL_4` (~2.79 V). Transient peak-current dips when camera + LCD
+   + ESP-DL inference all draw at once otherwise reset the device on
+   marginal USB power. The S3 datasheet specifies VDD33 min = 3.0 V,
+   so SEL_4 is already *below* spec — chosen as a clean-reset floor
+   that's still above the LCD's 2.4 V and OV2640's 2.5 V hardware
+   minimums. If you see brownouts on a known-good supply, the fix is
+   a better USB cable, not a lower threshold.
 
 6. **Detector occasionally fires on upside-down faces** (rough top/bottom
-   symmetry of facial features). Guarded by `keypoints_look_upright()`
-   — rejects any detection where the nose is at or above the eye midline
-   in the *detector's input frame* (see [stage 6](#6-app-level-gates)
-   above).
+   symmetry of facial features). Guarded by `keypoints_look_upright()`,
+   which rejects any detection where the nose is at or above the eye
+   midline in the *detector's input frame* (see
+   [stage 6](#6-app-level-gates) above).
 
-7. **HTTPD task stack overflow on thumbnail serve** — the default
-   `cfg.stack_size = 8192` is exactly the size of the in-flight `thumb`
-   buffer (`uint16_t[64*64]` = 8 KB), leaving no headroom for the BMP
-   header, row buffer, lambda captures, log buffers, or call frames.
-   The handler now `std::make_unique<uint16_t[]>`s the thumb instead.
-   The original symptom was a perfectly-valid BMP being served whose
-   bytes were all zeros — it decoded as a solid black 64×64.
+7. **HTTPD task stack overflow on thumbnail serve.** The default
+   `cfg.stack_size` of 8 KB is exactly the size of the in-flight
+   `thumb` buffer (`uint16_t[64*64]`), leaving zero headroom for the
+   BMP header, row buffer, lambda captures, log buffers, and the
+   handler's call frame. The original symptom was a perfectly-valid
+   BMP being served whose pixels were all zeros — it decoded as a
+   solid black 64×64 in the browser. Fix: the handler now
+   heap-allocates the thumb buffer via `std::make_unique<uint16_t[]>`.
 
-8. **HTTPD pinned to core 1** (default is `tskNO_AFFINITY`) so it doesn't
-   float onto core 0 and contend with `cam_hal` + `render` for the live
-   preview path. Slots cleanly into the gaps when `face_ai` sleeps
-   between misses.
+8. **HTTPD pinned to core 1** (default is `tskNO_AFFINITY`) so it
+   doesn't float onto core 0 and contend with `cam_hal` + the render
+   task for the live-preview path. HTTP requests slot cleanly into
+   the gaps when `face_ai` sleeps between misses.
 
 ---
 
 ## Not yet implemented
 
-- **Persistence**: faces and names reset on every boot. SPIFFS partition
-  is already mounted (and currently unused — we wipe it at startup).
-- **HTTPS / auth**: the HTTP server is plaintext and unauthenticated.
+- **Persistence.** Faces and names reset on every boot. The SPIFFS
+  partition exists and is mounted, but the task currently wipes it at
+  startup; rolling it into the face DB's lifecycle is the next
+  obvious feature.
+- **HTTPS / auth.** The HTTP server is plaintext and unauthenticated.
   Fine on a trusted LAN; don't expose to the internet.
-- **OTA updates**: only `factory`-partition flashing is set up.
-- **Multiple-face attention**: only the largest bbox per frame is matched
-  + enrolled, by design.
+- **OTA updates.** Only `factory`-partition flashing is set up.
+- **Multiple-face attention.** Only the largest bbox per frame is
+  matched and enrolled. Deliberate — it avoids cross-enrolling two
+  people in the same shot — but a multi-face mode would be a
+  reasonable opt-in.
 
 ---
 
