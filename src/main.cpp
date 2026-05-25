@@ -197,6 +197,16 @@ static void render_task(void *arg)
                                    fb->width, fb->height);
         }
 
+        // Navy-blue name banner along the bottom edge. Independent of
+        // the green NEW-FACE banner above -- both can be active at
+        // once if the matcher hits a freshly-named face during the
+        // enrollment-overlay window. Cheap when inactive (one atomic
+        // load), so the check is fine on every render frame.
+        if (face_ai_name_banner_active()) {
+            banner_compose_name_overlay((uint16_t *)fb->buf,
+                                        fb->width, fb->height);
+        }
+
         // Draw the live face bbox + keypoints on top of the frame
         // (and on top of the banner, if any) so the user always sees
         // what the detector is tracking, like the stock ESP-WHO demo.

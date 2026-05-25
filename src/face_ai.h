@@ -18,6 +18,15 @@ esp_err_t face_ai_init(void);
 // poll from the render loop on every frame.
 bool face_ai_banner_active(void);
 
+// True while a recognised face's name should be drawn along the bottom
+// edge of the live preview in navy blue. Fires whenever the matcher
+// (or its IoU recognition cache) returns a known face whose user-set
+// name is non-empty. Auto-clears a short window after the matcher
+// stops returning that face, so the name disappears soon after the
+// person leaves the frame. Cheap atomic load -- safe to poll every
+// render frame.
+bool face_ai_name_banner_active(void);
+
 // Snapshot of the most recent successful face detection, transformed
 // back into camera (display) frame coordinates so the render loop can
 // draw the bbox + 5 keypoints directly on top of the live preview.

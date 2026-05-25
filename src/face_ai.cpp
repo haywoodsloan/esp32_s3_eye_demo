@@ -163,6 +163,23 @@ namespace
     // headroom from boot, well past any plausible session lifetime.
     std::atomic<uint32_t> g_banner_until_ms{0};
 
+    // Name-banner deadline: navy-blue banner along the bottom of the
+    // LCD showing the recognised person's name. Refreshed every frame
+    // that the matcher (or its IoU cache) returns a known face whose
+    // user-set name is non-empty; the banner stays up for
+    // NAME_BANNER_LINGER_MS past the last refresh so it doesn't blink
+    // off every time the detector skips a frame on a blink / blur.
+    // Same uint32_t-ms-from-boot lock-free atomic shape as
+    // g_banner_until_ms for the same reason.
+    std::atomic<uint32_t> g_name_banner_until_ms{0};
+
+    // How long after the last successful name-banner refresh the
+    // banner stays up. ~1.5 s feels right: long enough to bridge the
+    // typical recognition gap when the face briefly leaves frame,
+    // short enough that the name doesn't linger awkwardly after the
+    // person actually walks away.
+    constexpr uint32_t NAME_BANNER_LINGER_MS = 1500;
+
     // Latest face detection in DISPLAY-frame coordinates, published
     // each successful detection for the render task to draw on top of
     // the live preview. Guarded by a portMUX so the multi-field write
@@ -1405,7 +1422,63 @@ namespace
             int      box[4]      = {0, 0, 0, 0};   // detection-frame coords
             Orient   orient      = Orient::ROT_0;  // bbox is only comparable in same orient
             uint32_t stamp_ms    = 0;
+            int      matched_id  = 0;              // 1-based DB id; 0 = nothing matched
         } recog_cache;
+
+        // Name-banner state: tracks what we last asked banner_render_name
+        // to draw so we don't re-rasterise unchanged content every frame.
+        // Re-rendering is ~1-2 ms (rasterise + outline dilate); it only
+        // needs to run when the recognised name or its quarter-turn
+        // angle bucket changes.
+        struct {
+            char name[FACE_NAME_MAX] = {0};
+            int  angle_bucket        = -999;       // round(angle / pi/2)
+        } name_banner_cache;
+
+        // Helper: publish the navy-blue name banner for a recognised
+        // face, identified by its 1-based DB id. Reads the name out of
+        // g_known_faces under the DB lock (released before the
+        // expensive rasterise), then only re-runs banner_render_name
+        // if the name or its quarter-turn angle bucket actually
+        // changed. Refreshes the deadline atomically on every call so
+        // the banner stays up while the matcher keeps returning this
+        // face. Names that are empty (unset by the web UI) silently
+        // skip the banner: only user-named faces get the on-screen
+        // overlay.
+        auto publish_name_banner = [&](int id_1based, float angle_rad) {
+            if (id_1based <= 0) {
+                return;
+            }
+            char local_name[FACE_NAME_MAX] = {0};
+            {
+                FaceDbLock lock;
+                const size_t idx = static_cast<size_t>(id_1based - 1);
+                if (idx >= g_known_faces.size()) {
+                    return;
+                }
+                std::strncpy(local_name, g_known_faces[idx].name,
+                             FACE_NAME_MAX - 1);
+                local_name[FACE_NAME_MAX - 1] = '\0';
+            }
+            if (local_name[0] == '\0') {
+                return;             // unnamed face -- skip banner.
+            }
+
+            constexpr float quarter = 3.14159265358979323846f * 0.5f;
+            const int bucket = static_cast<int>(roundf(angle_rad / quarter));
+            if (bucket != name_banner_cache.angle_bucket ||
+                std::strcmp(name_banner_cache.name, local_name) != 0) {
+                banner_render_name(local_name,
+                                   static_cast<float>(bucket) * quarter);
+                std::strncpy(name_banner_cache.name, local_name,
+                             FACE_NAME_MAX - 1);
+                name_banner_cache.name[FACE_NAME_MAX - 1] = '\0';
+                name_banner_cache.angle_bucket = bucket;
+            }
+            g_name_banner_until_ms.store(
+                now_ms() + NAME_BANNER_LINGER_MS,
+                std::memory_order_relaxed);
+        };
 
         // Orientation to TRY on this frame. After a successful detection we
         // leave this alone so the next frame uses the same orientation; on a
@@ -1814,6 +1887,11 @@ namespace
                          "cached recog: iou>%d, %u ms since last embed",
                          RECOG_IOU_PCT,
                          (unsigned)(now_ms() - recog_cache.stamp_ms));
+                // Refresh the name banner if this face is named --
+                // we skip the embedder on cache hits, so we have to
+                // re-publish here to keep the navy overlay alive.
+                publish_name_banner(recog_cache.matched_id,
+                                    head_roll_for(biggest, locked_orient));
                 esp_camera_fb_return(fb);
                 continue;
             }
@@ -1866,13 +1944,19 @@ namespace
 
                 // Cache this hit so the next few frames at roughly
                 // the same bbox can skip the embedder pass.
-                recog_cache.valid    = true;
-                recog_cache.box[0]   = biggest->box[0];
-                recog_cache.box[1]   = biggest->box[1];
-                recog_cache.box[2]   = biggest->box[2];
-                recog_cache.box[3]   = biggest->box[3];
-                recog_cache.orient   = locked_orient;
-                recog_cache.stamp_ms = now_ms();
+                recog_cache.valid      = true;
+                recog_cache.box[0]     = biggest->box[0];
+                recog_cache.box[1]     = biggest->box[1];
+                recog_cache.box[2]     = biggest->box[2];
+                recog_cache.box[3]     = biggest->box[3];
+                recog_cache.orient     = locked_orient;
+                recog_cache.stamp_ms   = now_ms();
+                recog_cache.matched_id = best_id;
+
+                // Show the navy name banner along the bottom of the
+                // preview if this face has been named in the web UI.
+                publish_name_banner(best_id,
+                                    head_roll_for(biggest, locked_orient));
 
                 esp_camera_fb_return(fb);
                 continue;
@@ -1930,13 +2014,19 @@ namespace
                 // Newly enrolled face: prime the cache so we don't
                 // immediately re-embed and re-match it against
                 // itself on the very next frame.
-                recog_cache.valid    = true;
-                recog_cache.box[0]   = biggest->box[0];
-                recog_cache.box[1]   = biggest->box[1];
-                recog_cache.box[2]   = biggest->box[2];
-                recog_cache.box[3]   = biggest->box[3];
-                recog_cache.orient   = locked_orient;
-                recog_cache.stamp_ms = now_ms();
+                recog_cache.valid      = true;
+                recog_cache.box[0]     = biggest->box[0];
+                recog_cache.box[1]     = biggest->box[1];
+                recog_cache.box[2]     = biggest->box[2];
+                recog_cache.box[3]     = biggest->box[3];
+                recog_cache.orient     = locked_orient;
+                recog_cache.stamp_ms   = now_ms();
+                // 1-based id of the entry we just appended. Used by
+                // the cache-hot path so that when the user names this
+                // face from the web UI, the next recognised frame can
+                // pull the name out of the DB without needing to run
+                // the embedder again.
+                recog_cache.matched_id = static_cast<int>(new_count);
 
                 // Only (re)render the banner if one isn't already on
                 // screen: we want the text orientation to reflect the
@@ -2002,6 +2092,11 @@ esp_err_t face_ai_init(void)
 bool face_ai_banner_active(void)
 {
     return g_banner_until_ms.load(std::memory_order_relaxed) > now_ms();
+}
+
+bool face_ai_name_banner_active(void)
+{
+    return g_name_banner_until_ms.load(std::memory_order_relaxed) > now_ms();
 }
 
 void face_ai_get_overlay(face_overlay_t *out)
