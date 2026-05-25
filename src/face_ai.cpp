@@ -542,15 +542,25 @@ namespace
     constexpr Tuning TUNING_BRIGHT = {
         0.45f,
         1,
-        // CLAHE disabled in BRIGHT (clip_lim == 0 -> skip). Direct
-        // light on the face clips skin highlights into the top
-        // histogram bins; CLAHE then redistributes that clipped
-        // excess across the rest of the LUT and flattens the very
-        // facial-feature contrast the detector needs. The default
-        // S3-EYE example feeds raw frames in bright scenes and
-        // detects fine; we converge to that behaviour here while
-        // keeping CLAHE in DIM / MID where it actually earns its
-        // keep.
+        // CLAHE disabled in BRIGHT (clip_lim == 0 -> skip). This is
+        // a conservative simplification, not a claim that CLAHE
+        // "breaks" bright scenes -- the canonical references (Pizer
+        // 1987, Zuiderveld 1994; see also the OpenCV CLAHE tutorial)
+        // are clear that the clip-limit's whole purpose is to keep
+        // CLAHE well-behaved on peaky histograms, so a properly
+        // tuned 3 %% clip should not in itself ruin a bright face.
+        //
+        // The reason to skip it here is twofold:
+        //   * The upstream ESP-DL face-recognition example feeds
+        //     raw frames in every lighting condition and detects
+        //     bright faces reliably, so removing preprocessing is
+        //     known to be safe in this regime.
+        //   * CLAHE's documented win is concentrated in low-
+        //     contrast / shadow-recovery scenarios; in BRIGHT it
+        //     is at best neutral and at worst a mild noise
+        //     amplifier on homogeneous skin-tone tiles (Wikipedia
+        //     AHE "Properties" section). Skipping it removes that
+        //     risk and recovers ~5 ms / frame of CPU.
         0,
     };
 
@@ -602,14 +612,27 @@ namespace
             s->set_brightness(s, 1);
             break;
         case AEPreset::BRIGHT:
-            // Slight under-bias for genuinely bright / direct-light
-            // scenes. ae_level=-1 + brightness=-1 nudges the OV2640
-            // toward protecting face-skin highlights instead of
-            // metering for the global average; combined with the
-            // 4X gain ceiling this keeps facial features out of
-            // the clipping bin in lamp / window-sun conditions
-            // where the previous neutral (0, 0) bias was washing
-            // them out and starving the detector.
+            // The actual fix for "direct light on the face" failures:
+            // bias the OV2640's metering toward protecting face-skin
+            // highlights. With ae_level=0 + brightness=0 the sensor
+            // meters for the global frame average, and if a face is
+            // significantly brighter than its background (lamp,
+            // sunlight through a window) the face's micro-contrast
+            // -- nostrils, eye sockets, lip line -- gets clipped
+            // into the top bins. The MSR+MNP detector was trained
+            // on natural-light faces with that micro-contrast
+            // intact, so the clipped frame is out of its training
+            // distribution and detection silently fails. No amount
+            // of preprocessing can recover what was already clipped
+            // at the sensor, so the lever has to be at the AE
+            // stage.
+            //
+            // ae_level=-1 + brightness=-1 nudges the metering target
+            // ~1 stop lower; combined with the 4X gain ceiling this
+            // keeps facial features off the clip in lamp / sunlight
+            // conditions. Background will look slightly darker on
+            // the live preview -- acceptable trade for the detector
+            // actually firing.
             s->set_gainceiling(s, GAINCEILING_4X);
             s->set_ae_level(s, -1);
             s->set_brightness(s, -1);
