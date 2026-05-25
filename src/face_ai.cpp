@@ -1709,21 +1709,27 @@ namespace
             //   * "sticky lock" -- consecutive_misses < OVERLAY_CLEAR_MISSES,
             //     i.e. the HUD still shows the face as present and we
             //     want to recover the frame the primary skipped.
-            //   * "ROT_0 cold start" -- there's no prior lock at all
-            //     but we're on the upright orient. This is the case a
-            //     user who walks up to the device already in close
-            //     range hits: the orient cycle would otherwise spin
-            //     forever because the primary pass can never lock on
-            //     a face-fills-frame close-up at any of the four
-            //     orients, and without a lock the sticky window stays
-            //     closed. Adding the ROT_0 retry costs ~80 ms once
-            //     per orient cycle (~every fourth idle frame) and
-            //     gives close-range first-contact a way in.
+            //   * "cold start, first miss of this orient" -- there's
+            //     no prior lock at all but the orient cycle has just
+            //     advanced. This is the case a user who walks up to
+            //     the device already in close range hits: the
+            //     primary pass can never lock on a face-fills-frame
+            //     close-up at ANY of the four orients, so without a
+            //     padded retry per orient the cycle would spin
+            //     forever. The device can be physically held at any
+            //     rotation, so we can't assume the close-range face
+            //     is upright -- we have to try padded on whichever
+            //     orient we're currently on. Running it only on the
+            //     first miss of each orient (consecutive_misses %
+            //     ORIENT_STICKY_MISSES == 0) keeps the cold-start
+            //     overhead to ~80 ms once per orient (~20 ms/frame
+            //     amortised) while still giving close-range first-
+            //     contact a way in within one full orient sweep.
             const bool padded_eligible =
                 padded_scratch &&
                 fb->width == FRAME_DIM && fb->height == FRAME_DIM &&
                 (consecutive_misses < OVERLAY_CLEAR_MISSES ||
-                 try_orient == Orient::ROT_0);
+                 (consecutive_misses % ORIENT_STICKY_MISSES) == 0);
             if (!biggest && padded_eligible)
             {
                 shrink_into_padded(to_detect, padded_scratch);
