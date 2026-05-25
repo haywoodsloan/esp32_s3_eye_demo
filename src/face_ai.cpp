@@ -792,42 +792,36 @@ namespace
 
         const int eye_mid_y = (e0y + e1y) / 2;
         const int eye_dx    = std::abs(e1x - e0x);
-        const int eye_dy    = std::abs(e1y - e0y);
 
-        // (1a) Inter-eye distance must be plausible. Faces below
-        // MIN_FACE_PX get rejected downstream regardless, so the
-        // minimum here is just a degenerate-keypoint guard.
+        // Reject degenerate keypoint sets (eyes coincident or
+        // implausibly close). This catches the original false-
+        // positive class where the detector lit up on a near-
+        // symmetric blob and emitted near-identical keypoints --
+        // including the upside-down-faces-look-face-like case --
+        // because in those failures eye_dx collapses toward zero.
         if (eye_dx < 4) {
             return false;
         }
-        // (1b) Eyes more horizontal than vertical. Allows tilts up
-        // to ~45 deg from horizontal, which is what the orient cycle
-        // is designed to leave on the table.
-        if (eye_dx <= eye_dy) {
-            return false;
-        }
 
-        // (2) Nose strictly below the eye midline by a margin
-        // proportional to inter-eye distance. nose_drop < 0 is the
-        // textbook upside-down case; the >= eye_dx/8 margin also
-        // rejects near-coincident keypoint sets where a single
-        // pixel of noise would flip the sign.
+        // The one check that an upside-down real face cannot fake:
+        // the detector's predicted nose must sit below the predicted
+        // eye midline. Real upside-down faces have nose ABOVE the
+        // eye midline in detector input (the predicted keypoints
+        // come out CORRECT for what the model sees, which is flipped).
+        // The margin >= eye_dx / 8 protects against near-coincident
+        // keypoints sneaking past on a single-pixel noise.
+        //
+        // Previous iterations of this function also enforced a
+        // "eyes more horizontal than vertical" check and a "mouth
+        // below nose" check; both rejected too many real upright
+        // detections in low light because high-gain keypoint noise
+        // and the natural ~45 deg tilt the orient cycle leaves on
+        // the table consistently tripped them. Letting those go is
+        // safe -- the nose-below-eyes margin alone is sufficient
+        // for the upside-down case, which was the original concern.
         const int nose_drop = ny - eye_mid_y;
         if (nose_drop * 8 < eye_dx) {
             return false;
-        }
-
-        // (3) Mouth-below-nose. Only checked when the MNP gave us
-        // the full 5-keypoint set (it always does, but stay
-        // defensive). Catches detector mis-labels that happen to
-        // satisfy (2) but get the mouth wrong.
-        if (det->keypoint.size() >= 10) {
-            const int lmy        = det->keypoint[7];
-            const int rmy        = det->keypoint[9];
-            const int mouth_mid_y = (lmy + rmy) / 2;
-            if (mouth_mid_y <= ny) {
-                return false;
-            }
         }
 
         return true;
