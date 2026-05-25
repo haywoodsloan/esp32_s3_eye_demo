@@ -109,7 +109,7 @@ namespace
     // classes (upside-down faces with mis-labelled keypoints, blob
     // misfires on textured backgrounds).
     constexpr float MIN_DETECT_SCORE_ROT0    = 0.35f;
-    constexpr float MIN_DETECT_SCORE_ROTATED = 0.50f;
+    constexpr float MIN_DETECT_SCORE_ROTATED = 0.55f;
 
     // Recognition cache. The embedder is the most expensive single
     // stage in the pipeline (~50 ms / call on the S8 model), and when
@@ -661,7 +661,7 @@ namespace
     constexpr Tuning TUNING_DIM = {
         /*match_thr*/       0.32f,
         /*enroll_debounce*/ 2,
-        /*clahe_clip_lim*/  TILE_PX_HELPER * 7 / 100,   // 252 / 3600 = 7%
+        /*clahe_clip_lim*/  TILE_PX_HELPER * 9 / 100,   // 324 / 3600 = 9%
     };
     constexpr Tuning TUNING_MID = {
         0.38f,
@@ -671,15 +671,14 @@ namespace
     constexpr Tuning TUNING_BRIGHT = {
         0.45f,
         1,
-        // Tight clip-limit (2 % of tile pixel count = 72 / 3600).
-        // CLAHE in bright scenes is for the *low-contrast* failure
-        // modes -- backlit subjects, pale skin against a sunlit
-        // wall, washed-out scenes where the histogram lives in a
-        // narrow bright band -- where the per-tile equaliser
-        // genuinely lifts contrast inside the face. 2 % is the
-        // gentlest clip that still does useful work; anything
-        // looser starts amplifying sensor noise in already-flat
-        // tiles, anything tighter is functionally a no-op.
+        // Bumped from 2 % -> 4 %. 2 % was the gentlest "this still
+        // does useful work" clip, but on backlit scenes (subject
+        // in front of a sunlit window) it left visible shadow
+        // crush on the face. 4 % digs noticeably more out of those
+        // shadows without amplifying sensor noise in the already-
+        // flat bright regions, because CLAHE's clip is a per-tile
+        // cap -- a tile that's already evenly bright has no excess
+        // to redistribute regardless of the cap value.
         //
         // Earlier this slot was 0 (CLAHE disabled outright). The
         // theory at the time -- that the upstream ESP-DL example
@@ -687,7 +686,7 @@ namespace
         // could too -- turned out to be conservative; in practice
         // re-enabling at a low clip recovered noticeable bright-
         // light detections without observable downside.
-        TILE_PX_HELPER * 2 / 100,                       // 72 / 3600 = 2%
+        TILE_PX_HELPER * 4 / 100,                       // 144 / 3600 = 4%
     };
 
     // Live tuning that the rest of the loop reads. Updated alongside
@@ -1013,7 +1012,7 @@ namespace
         // use for an actually-dim scene.
         constexpr int LUMA_SPREAD_FLAT  = 30;
         constexpr int LUMA_SPREAD_HARSH = 90;
-        constexpr int CLIP_HARSH        = TILE_PX_HELPER * 7 / 100;   // DIM-preset value
+        constexpr int CLIP_HARSH        = TILE_PX_HELPER * 9 / 100;   // DIM-preset value
         int clip_lim = g_tuning.clahe_clip_lim;
         if (luma_spread > LUMA_SPREAD_FLAT && clip_lim < CLIP_HARSH) {
             const int ramp = std::min(luma_spread, LUMA_SPREAD_HARSH) -
@@ -1580,6 +1579,25 @@ namespace
         // advancing to the next of the four.
         Orient try_orient = Orient::ROT_0;
 
+        // Non-ROT_0 orient-lock confirmation. A single fluky detection
+        // at a rotated orient can pass score + keypoints_look_upright
+        // checks and lock us onto an upside-down / sideways orient,
+        // even when the user is actually holding the device upright.
+        // Common case: the detector fires on a noisy patch at ROT_180
+        // with a score in the 0.55-0.7 band, banner ends up upside-
+        // down, user has to wait for the cycle to recover. Requiring
+        // two consecutive frames of agreement at the SAME non-ROT_0
+        // orient before committing the lock filters that out without
+        // slowing legitimate rotated tracking by more than one frame.
+        // ROT_0 needs no confirmation (it's the default / cold-start
+        // orient and a wrong lock there is benign), and once we've
+        // locked an orient subsequent frames at that same orient go
+        // through unconditionally so steady-state tracking is
+        // unaffected.
+        Orient last_locked_orient = Orient::ROT_0;
+        Orient pending_orient     = Orient::ROT_0;
+        int    pending_confirm    = 0;
+
         // Consecutive miss frames in the current detection-loss streak. Used
         // by the orient-sticky retry: a quick blink / occlusion / motion blur
         // is FAR more likely than the user actually rotating the device
@@ -1900,6 +1918,11 @@ namespace
                     }
                 }
                 unknown_streak = 0;
+                // A miss votes against any pending non-ROT_0 confirmation:
+                // the candidate orient didn't survive two frames in a row,
+                // so drop the pending state.
+                pending_orient  = Orient::ROT_0;
+                pending_confirm = 0;
                 // Orient-sticky retry: the first few misses after a
                 // successful detection re-try the same orient (the most
                 // likely cause of a single miss is a blink / motion blur,
@@ -1932,9 +1955,41 @@ namespace
                 continue;
             }
 
+            // Detection passed every gate. If this would lock the
+            // orient cycle onto a non-ROT_0 orient that we WEREN'T
+            // already locked to, require one prior frame at the same
+            // orient (i.e. two consecutive confirming hits) before
+            // committing. Same-orient re-locks (already locked there)
+            // and ROT_0 locks bypass the confirmation -- those are
+            // both either already-confirmed or the safe default.
+            if (try_orient != Orient::ROT_0 &&
+                try_orient != last_locked_orient)
+            {
+                if (pending_orient == try_orient) {
+                    ++pending_confirm;
+                } else {
+                    pending_orient  = try_orient;
+                    pending_confirm = 1;
+                }
+                if (pending_confirm < 2) {
+                    ESP_LOGD(TAG,
+                             "non-ROT_0 lock confirm %d/2 at orient=%d score=%.2f",
+                             pending_confirm, (int)try_orient,
+                             (double)biggest->score);
+                    // Don't advance try_orient and don't count this as a
+                    // miss -- next frame retries the same orient. If it
+                    // also passes, we commit; if it fails, the miss path
+                    // will reset pending and resume cycling.
+                    esp_camera_fb_return(fb);
+                    continue;
+                }
+            }
             // Detection succeeded in this orientation; lock it in (don't
             // touch try_orient) so the next frame stays single-shot.
             const Orient locked_orient = try_orient;
+            last_locked_orient = locked_orient;
+            pending_orient     = Orient::ROT_0;
+            pending_confirm    = 0;
             consecutive_misses = 0;
             ++s_detections;
 
