@@ -120,8 +120,8 @@ namespace
     // within half a second. RECOG_IOU_PCT picks a strict-but-not-
     // paranoid overlap; head jitter still passes it, but someone
     // stepping into a different pose does not.
-    constexpr uint32_t RECOG_CACHE_MS = 500;
-    constexpr int      RECOG_IOU_PCT  = 70;
+    constexpr uint32_t RECOG_CACHE_MS = 1500;
+    constexpr int      RECOG_IOU_PCT  = 55;
 
     // Sharpness gate — average per-sample (|dx| + |dy|) on the green channel
     // inside the face bbox. Kept fairly permissive because the OV2640
@@ -137,7 +137,7 @@ namespace
     // across head-pose / lighting drift between sessions, and we want
     // recognition to win in those cases. Cross-person similarities on the
     // same hardware are typically <= 0.30, so 0.40 still leaves margin.
-    constexpr float MATCH_THR = 0.40f;
+    constexpr float MATCH_THR = 0.35f;
 
     // How many consecutive frames must (a) be sharp, (b) have a confident
     // face detection, and (c) NOT match any known embedding before we
@@ -435,7 +435,7 @@ namespace
     constexpr int CLAHE_N        = 4;                          // tile grid (N x N)
     constexpr int CLAHE_TILE_SZ  = FRAME_DIM / CLAHE_N;        // 60
     constexpr int CLAHE_TILE_PX  = CLAHE_TILE_SZ * CLAHE_TILE_SZ;  // 3600
-    constexpr int CLAHE_CLIP_LIM = CLAHE_TILE_PX * 3 / 100;    // 108
+    constexpr int CLAHE_CLIP_LIM = CLAHE_TILE_PX * 5 / 100;    // 180
 
     void apply_clahe(uint16_t *pixels) noexcept
     {
@@ -1068,7 +1068,7 @@ namespace
     // cycling. ORIENT_STICKY_MISSES=2 keeps us responsive to genuine
     // rotation (worst case ~3-4 detection frames to discover the new
     // orient) while making transient blinks effectively free.
-    constexpr int ORIENT_STICKY_MISSES = 2;
+    constexpr int ORIENT_STICKY_MISSES = 4;
 
     // Number of consecutive misses we'll tolerate before treating the
     // face as actually gone and hiding the on-screen overlay.
@@ -1080,7 +1080,7 @@ namespace
     // 0.8 s of grace before the box disappears, which matches the
     // perceived "they're still here" window without leaving stale
     // boxes around after they actually walk away.
-    constexpr int OVERLAY_CLEAR_MISSES = 8;
+    constexpr int OVERLAY_CLEAR_MISSES = 12;
 
         ESP_LOGI(TAG, "ESP-WHO ready, feat_len=%d, entering scan loop", feat_len);
 
@@ -1198,11 +1198,16 @@ namespace
             // detection frame and let the rest of the pipeline treat
             // it like a normal hit.
             dl::detect::result_t padded_remap;
-            const bool can_try_padded =
-                padded_scratch &&
-                (consecutive_misses < ORIENT_STICKY_MISSES ||
-                 try_orient == Orient::ROT_0);
-            if (!biggest && can_try_padded && fb->width == FRAME_DIM &&
+            // Padded retry now runs on EVERY miss frame, not just
+            // inside the sticky window. The ~80 ms extra detector
+            // call per miss is the cost of admitting that the
+            // close-range out-of-distribution case is real and
+            // happens whenever the user gets closer than the model's
+            // training data covers. Cold-start orient discovery is
+            // still cheap because the primary detector pass on
+            // each orient finishes first; we only pay the padded
+            // cost when the primary returned empty.
+            if (!biggest && padded_scratch && fb->width == FRAME_DIM &&
                 fb->height == FRAME_DIM)
             {
                 shrink_into_padded(to_detect, padded_scratch);
