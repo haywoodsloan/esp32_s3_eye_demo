@@ -90,11 +90,14 @@ namespace
     // more reliably by keypoints_look_upright(), so we can afford to
     // keep this score floor permissive. At close range the detector's
     // confidence drops (faces fill the frame, out of training
-    // distribution), and in low-light scenes the model's confidence
-    // drops even further -- we lean on the keypoint-geometry triple
-    // check and the IoU recognition cache to suppress false positives
-    // rather than this floor.
-    constexpr float MIN_DETECT_SCORE = 0.40f;
+    // distribution), in low-light scenes the model's confidence drops
+    // further, and faces wearing glasses score lower across the board
+    // (lens reflections / refraction confuse the eye-keypoint
+    // regression). We lean on the keypoint-geometry triple check and
+    // the IoU recognition cache to suppress false positives rather
+    // than this floor; 0.35 is loose enough to let glasses through
+    // while still rejecting most non-face textures.
+    constexpr float MIN_DETECT_SCORE = 0.35f;
 
     // Recognition cache. The embedder is the most expensive single
     // stage in the pipeline (~50 ms / call on the S8 model), and when
