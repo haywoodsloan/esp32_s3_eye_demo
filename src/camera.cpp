@@ -63,35 +63,43 @@ esp_err_t camera_init(void)
         // permissive classifier, so the false-positive surface
         // doesn't grow.
         //
-        //   gainceiling 16x  raise analogue-gain headroom so AGC has
-        //                    room to expose dark scenes. Default is
-        //                    ~2x. Noise rises with gain but the
-        //                    detector tolerates it; the keypoint
-        //                    geometry check catches the rare noise-
-        //                    driven false positive.
-        //   aec2 on          use the OV2640's alternate auto-
-        //                    exposure algorithm. Empirically copes
-        //                    better with mixed / backlit indoor
-        //                    lighting than the default AEC1.
-        //   ae_level +1      bias the AE target one stop brighter so
-        //                    skin tones land near 50 % grey instead
-        //                    of 30 %.
-        //   brightness +1    post-AE additive offset; opens up the
-        //                    shadows that AE alone leaves crushed.
-        //   contrast +1      slight S-curve so the percentile
-        //                    stretch downstream has wider material
-        //                    to work with on truly flat low-light
-        //                    frames.
+        //   gainceiling 128x ceiling-the-stack analogue gain. CLAHE +
+        //                    the keypoint-geometry check downstream
+        //                    will clean up the noise; we'd rather
+        //                    have a noisy face the detector can find
+        //                    than a quiet black frame it can't.
+        //   aec2 off         the OV2640's alternate AE algorithm
+        //                    biases for highlight retention, which
+        //                    leaves faces under-exposed in dim
+        //                    rooms. The default AEC1 exposes a stop
+        //                    or so brighter in those conditions,
+        //                    which is what we actually want for
+        //                    face detection.
+        //   ae_level +2      maximum AE-target bias. Daytime scenes
+        //                    clip a bit; indoor / dim scenes get
+        //                    the boost they need.
+        //   brightness +2    maximum post-AE additive offset; opens
+        //                    the shadows that AE alone leaves crushed.
+        //   contrast +1      slight S-curve so CLAHE downstream has
+        //                    wider material to work with on truly
+        //                    flat low-light frames.
         //   lenc on          lens shading correction. The OV2640 +
         //                    S3-EYE lens darkens noticeably near
         //                    the corners, exactly where the user's
         //                    face often ends up at close range.
-        s->set_gainceiling(s, GAINCEILING_16X);
-        s->set_aec2(s, 1);
-        s->set_ae_level(s, 1);
-        s->set_brightness(s, 1);
+        //   whitebal on +    explicit AWB-on. Defensive: a recent
+        //   awb_gain on      sensor firmware bug had AWB off after
+        //                    boot on some boards, which gave faces
+        //                    a strong colour cast that hurt the
+        //                    detector.
+        s->set_gainceiling(s, GAINCEILING_128X);
+        s->set_aec2(s, 0);
+        s->set_ae_level(s, 2);
+        s->set_brightness(s, 2);
         s->set_contrast(s, 1);
         s->set_lenc(s, 1);
+        s->set_whitebal(s, 1);
+        s->set_awb_gain(s, 1);
     }
 
     ESP_LOGI(TAG, "OV2640 ready: RGB565 %dx%d, %d fb in PSRAM",

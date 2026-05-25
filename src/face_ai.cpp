@@ -100,9 +100,11 @@ namespace
     // more reliably by keypoints_look_upright(), so we can afford to
     // keep this score floor permissive. At close range the detector's
     // confidence drops (faces fill the frame, out of training
-    // distribution), and a tighter floor here was throwing away real
-    // detections.
-    constexpr float MIN_DETECT_SCORE = 0.50f;
+    // distribution), and in low-light scenes the model's confidence
+    // drops even further -- we lean on the keypoint-geometry triple
+    // check and the IoU recognition cache to suppress false positives
+    // rather than this floor.
+    constexpr float MIN_DETECT_SCORE = 0.40f;
 
     // Recognition cache. The embedder is the most expensive single
     // stage in the pipeline (~50 ms / call on the S8 model), and when
@@ -139,9 +141,11 @@ namespace
 
     // How many consecutive frames must (a) be sharp, (b) have a confident
     // face detection, and (c) NOT match any known embedding before we
-    // commit to enrolling a new face. Two frames is enough to reject a
-    // single noisy frame while keeping first-enrollment latency low.
-    constexpr int ENROLL_DEBOUNCE_FRAMES = 2;
+    // commit to enrolling a new face. Lowered to 1 because low-light
+    // detection is intermittent enough that the previous 2-in-a-row
+    // requirement was effectively never satisfied -- the cosine
+    // similarity threshold is already a strong identity guard.
+    constexpr int ENROLL_DEBOUNCE_FRAMES = 1;
 
     // Hard cap on the in-memory known-face list. The list resets on every
     // boot, but within a single power-on session this bounds how much
@@ -306,65 +310,6 @@ namespace
     // 3 full PSRAM passes down to ~1.06. The common-case live-preview
     // path (well exposed, ROT_0 locked) drops to a single subsampled
     // pass.
-
-    constexpr int PREP_STRIDE = 4;       // 1/16 of pixels sampled
-    constexpr int STRETCH_RANGE_MAX = 200; // already-good frames skip stretch
-
-    // Returns true when the frame's 2/98-percentile luma spread is
-    // narrow enough to benefit from a contrast stretch. On true,
-    // y_lo / y_hi hold the percentile bounds in 8-bit luma space.
-    bool analyze_luma_subsampled(const uint16_t *pixels, int n_side,
-                                 int &y_lo, int &y_hi) noexcept
-    {
-        uint32_t hist[256] = {0};
-        const uint8_t *p8 = (const uint8_t *)pixels;
-        int samples = 0;
-        for (int y = 0; y < n_side; y += PREP_STRIDE) {
-            const uint8_t *row = p8 + (size_t)y * n_side * 2;
-            for (int x = 0; x < n_side; x += PREP_STRIDE) {
-                const uint8_t hi = row[x * 2];     // RRRRR GGG
-                const uint8_t lo = row[x * 2 + 1]; // GGG BBBBB
-                const uint8_t g6 = (uint8_t)(((hi & 0x07) << 3) | (lo >> 5));
-                const uint8_t y8 = (uint8_t)((g6 << 2) | (g6 >> 4));
-                ++hist[y8];
-                ++samples;
-            }
-        }
-        const uint32_t low_n  = (uint32_t)samples * 2  / 100;
-        const uint32_t high_n = (uint32_t)samples * 98 / 100;
-        uint32_t acc = 0;
-        int lo_v = 0, hi_v = 255;
-        for (int v = 0; v < 256; ++v) {
-            acc += hist[v];
-            if (acc >= low_n) { lo_v = v; break; }
-        }
-        acc = 0;
-        for (int v = 0; v < 256; ++v) {
-            acc += hist[v];
-            if (acc >= high_n) { hi_v = v; break; }
-        }
-        y_lo = lo_v;
-        y_hi = hi_v;
-        return (hi_v - lo_v) < STRETCH_RANGE_MAX;
-    }
-
-    // Build a 256-entry 8-bit -> 8-bit LUT that maps [y_lo, y_hi] to
-    // [0, 255]. Guards against degenerate (near-zero) ranges that
-    // would blow up the gain.
-    void build_stretch_lut(int y_lo, int y_hi, uint8_t lut[256]) noexcept
-    {
-        int range = y_hi - y_lo;
-        if (range < 32) {
-            range = 32;
-        }
-        const int32_t gain_q8 = (255 << 8) / range;
-        for (int v = 0; v < 256; ++v) {
-            int32_t o = ((v - y_lo) * gain_q8) >> 8;
-            if (o < 0)   o = 0;
-            if (o > 255) o = 255;
-            lut[v] = (uint8_t)o;
-        }
-    }
 
     // Per-pixel kernel: read one RGB565BE word from `sp`, optionally
     // run its three channels through `lut`, and write the result to
@@ -645,37 +590,23 @@ namespace
     // Prepare the buffer the detector will read this frame. Returns
     // the pointer to feed into HumanFaceDetect::run(). May return
     // `src` (zero-copy fast path) or `scratch` (after a rotate /
-    // stretch / both).
+    // CLAHE / both).
     const uint16_t *prep_detect_input(Orient o,
                                       const uint16_t *src,
                                       uint16_t *scratch,
                                       int n) noexcept
     {
-        int y_lo = 0, y_hi = 255;
-        const bool need_help =
-            analyze_luma_subsampled(src, n, y_lo, y_hi);
-
-        // Fast path: nothing to do, hand the camera fb to the
-        // detector directly. Triggers whenever the user is in good
-        // lighting and the detector has locked onto the natural
-        // (ROT_0) orientation, which is the dominant runtime case.
-        if (!need_help && o == Orient::ROT_0) {
-            return src;
-        }
-
-        // Rotate (or memcpy, for ROT_0) into the detector scratch.
+        // Always apply CLAHE to the detector input. The previous
+        // "only when the histogram looks narrow" heuristic was wrong
+        // for the low-light case it was supposed to help: high
+        // sensor gain produces frames whose noise floor alone gives
+        // a wide histogram range, the heuristic concludes the frame
+        // is fine, CLAHE is skipped, and the real (low-contrast)
+        // signal under the noise stays unrecoverable. Paying ~5 ms
+        // of CLAHE on every detection frame is a fair price for
+        // detection working at all in dim scenes.
         rotate_to_scratch<false>(o, src, scratch, n, nullptr);
-
-        // CLAHE-equalise the detector input whenever the subsampled
-        // luma histogram came back narrow. This subsumes the older
-        // global percentile stretch -- CLAHE is strictly better at
-        // low-light + mixed-light scenes because the equalisation is
-        // local and clip-limited, so a face in shadow against a
-        // bright background no longer disappears into the histogram
-        // floor.
-        if (need_help) {
-            apply_clahe(scratch);
-        }
+        apply_clahe(scratch);
         return scratch;
     }
 
@@ -1097,12 +1028,20 @@ namespace
 
         // Counters for the per-second heartbeat.
         int64_t stats_next_us = esp_timer_get_time() + STATS_PERIOD_US;
-        uint32_t s_frames = 0;     // frames pulled from camera
-        uint32_t s_detections = 0; // raw detection-list non-empty
-        uint32_t s_too_small = 0;  // largest box rejected for size
-        uint32_t s_too_blurry = 0; // largest box rejected for focus
-        uint32_t s_recognised = 0; // matched an existing enrollment
-        uint32_t s_enrolled = 0;   // new face added
+        uint32_t s_frames = 0;        // frames pulled from camera
+        uint32_t s_raw_dets = 0;      // detector returned >=1 result (any score, any orient)
+        uint32_t s_pad_hits = 0;      // padded-fallback rescued a frame
+        uint32_t s_detections = 0;    // kept after every gate (size/focus/score/upright)
+        uint32_t s_rej_score = 0;     // biggest rejected by MIN_DETECT_SCORE
+        uint32_t s_rej_geom = 0;      // biggest rejected by keypoints_look_upright
+        uint32_t s_too_small = 0;     // biggest rejected for bbox size
+        uint32_t s_too_blurry = 0;    // biggest rejected for focus
+        uint32_t s_recognised = 0;    // matched an existing enrollment
+        uint32_t s_enrolled = 0;      // new face added
+        // Running best-score totals so the heartbeat can show
+        // average detector confidence even when our gates reject.
+        float    s_score_sum = 0.f;
+        uint32_t s_score_n   = 0;
 
         // Debounce: consecutive frames so far that look like a new face.
         int unknown_streak = 0;
@@ -1160,15 +1099,29 @@ namespace
             const int64_t now_us = esp_timer_get_time();
             if (now_us >= stats_next_us)
             {
+                const float avg_score = s_score_n ?
+                    (s_score_sum / (float)s_score_n) : 0.f;
                 ESP_LOGI(TAG,
-                         "1s: frames=%u dets=%u small=%u blurry=%u known=%u new=%u (db=%u o=%d)",
-                         (unsigned)s_frames, (unsigned)s_detections,
-                         (unsigned)s_too_small, (unsigned)s_too_blurry,
+                         "1s: frame=%u raw=%u pad=%u kept=%u score_avg=%.2f "
+                         "| rej:score=%u geom=%u small=%u blurry=%u "
+                         "| known=%u new=%u (db=%u o=%d)",
+                         (unsigned)s_frames,
+                         (unsigned)s_raw_dets,
+                         (unsigned)s_pad_hits,
+                         (unsigned)s_detections,
+                         (double)avg_score,
+                         (unsigned)s_rej_score,
+                         (unsigned)s_rej_geom,
+                         (unsigned)s_too_small,
+                         (unsigned)s_too_blurry,
                          (unsigned)s_recognised, (unsigned)s_enrolled,
                          (unsigned)g_known_faces.size(),
                          (int)try_orient);
-                s_frames = s_detections = s_too_small = s_too_blurry =
+                s_frames = s_raw_dets = s_pad_hits = s_detections =
+                    s_rej_score = s_rej_geom = s_too_small = s_too_blurry =
                     s_recognised = s_enrolled = 0;
+                s_score_sum = 0.f;
+                s_score_n = 0;
                 stats_next_us = now_us + STATS_PERIOD_US;
             }
 
@@ -1218,7 +1171,7 @@ namespace
             std::list<dl::detect::result_t> &detections = detect->run(img);
             if (!detections.empty())
             {
-                ++s_detections;
+                ++s_raw_dets;
             }
 
             // Act only on the largest-area detection. Avoids cross-enrolling
@@ -1234,6 +1187,10 @@ namespace
                     best_area = a;
                     biggest = &d;
                 }
+            }
+            if (biggest) {
+                s_score_sum += biggest->score;
+                ++s_score_n;
             }
 
             // Close-range padded fallback. When the primary pass
@@ -1290,7 +1247,9 @@ namespace
                                  "(close-range face)",
                                  (double)padded_remap.score);
                         biggest = &padded_remap;
-                        ++s_detections;
+                        s_score_sum += padded_remap.score;
+                        ++s_score_n;
+                        ++s_pad_hits;
                     }
                 }
             }
@@ -1311,12 +1270,14 @@ namespace
                                  (double)biggest->score,
                                  (double)MIN_DETECT_SCORE,
                                  (int)try_orient);
+                        ++s_rej_score;
+                    } else {
+                        // Detector fired on a face whose keypoint
+                        // geometry doesn't match an upright face --
+                        // most often this is the upside-down /
+                        // sideways false-positive class.
+                        ++s_rej_geom;
                     }
-                    // Detector fired on a non-upright face (false positive
-                    // from rough top/bottom symmetry). Don't count it as a
-                    // detection — fall through to the miss path so
-                    // orientation cycling can find the real upright.
-                    --s_detections;
                 }
                 unknown_streak = 0;
                 // Orient-sticky retry: the first few misses after a
@@ -1355,6 +1316,7 @@ namespace
             // touch try_orient) so the next frame stays single-shot.
             const Orient locked_orient = try_orient;
             consecutive_misses = 0;
+            ++s_detections;
 
             // Publish a display-frame snapshot of the bbox + keypoints
             // for the render task to draw on top of the live preview.
