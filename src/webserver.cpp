@@ -123,6 +123,9 @@ static const char INDEX_HTML[] = R"HTML(<!doctype html>
 <div id="grid"></div>
 <script>
 let lastCount = -1;
+function displayName(f) {
+  return (f.name && f.name.length) ? f.name : ('#' + (f.id + 1));
+}
 async function load() {
   try {
     const r = await fetch('/api/faces');
@@ -132,8 +135,12 @@ async function load() {
     if (list.length === lastCount) {
       // Same count; only refresh names (avoids flashing thumbnails).
       for (const f of list) {
-        const input = document.querySelector('#face-' + f.id + ' input');
+        const card  = document.getElementById('face-' + f.id);
+        if (!card) continue;
+        const input = card.querySelector('input');
+        const meta  = card.querySelector('.meta');
         if (input && document.activeElement !== input) input.value = f.name || '';
+        if (meta) meta.textContent = displayName(f);
       }
       return;
     }
@@ -150,19 +157,24 @@ async function load() {
       card.id = 'face-' + f.id;
       card.innerHTML =
         '<img src="/api/face/' + f.id + '/thumb">'
-        + '<div class="meta">#' + (f.id + 1) + '</div>'
+        + '<div class="meta">' + displayName(f).replace(/</g, '&lt;') + '</div>'
         + '<div class="row">'
         +   '<input type="text" placeholder="name" value="'
         +     (f.name || '').replace(/"/g, '&quot;') + '">'
         +   '<button>Save</button>'
         + '</div>';
       const input = card.querySelector('input');
+      const meta  = card.querySelector('.meta');
       card.querySelector('button').onclick = async () => {
         await fetch('/api/face/' + f.id + '/name', {
           method: 'POST',
           headers: { 'Content-Type': 'text/plain' },
           body: input.value
         });
+        // Optimistic local update so the meta line flips immediately,
+        // before the next poll round-trip lands.
+        f.name = input.value;
+        meta.textContent = displayName(f);
         load();
       };
       input.addEventListener('keydown', e => {
