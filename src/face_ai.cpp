@@ -669,10 +669,16 @@ namespace
         // Precompute the bilinear interpolation tables along each
         // axis once -- `fx`/`fy` are constant given x/y, and the
         // tile-index pair (t0, t1) only changes at tile boundaries.
-        // 240 * 3 * sizeof(int16_t) = 1.4 KB total -- trivial.
+        // We also cache the simple `x / CLAHE_TILE_SZ` map used by
+        // the histogram pass; Xtensa LX7 has no integer-divide
+        // instruction so the compiler lowers /60 to a multiply-by-
+        // reciprocal sequence, and a byte-wide table replaces ~3-5
+        // cycles with a single load.
+        // 240 * 4 * sizeof(int16_t) ~ 1.9 KB total -- trivial.
         static int16_t fx_tab[FRAME_DIM];   // 0..256
         static int16_t tx0_tab[FRAME_DIM];
         static int16_t tx1_tab[FRAME_DIM];
+        static int8_t  tile_idx_tab[FRAME_DIM];
 
         auto build_axis_table = [](int16_t f_out[FRAME_DIM],
                                    int16_t t0_out[FRAME_DIM],
@@ -692,6 +698,9 @@ namespace
         static bool axis_tables_built = false;
         if (!axis_tables_built) {
             build_axis_table(fx_tab, tx0_tab, tx1_tab);
+            for (int x = 0; x < FRAME_DIM; ++x) {
+                tile_idx_tab[x] = (int8_t)(x / CLAHE_TILE_SZ);
+            }
             axis_tables_built = true;
         }
 
@@ -699,16 +708,16 @@ namespace
         std::memset(hist, 0, sizeof(hist));
         const uint8_t *p8 = (const uint8_t *)pixels;
         for (int y = 0; y < FRAME_DIM; ++y) {
-            const int ty = y / CLAHE_TILE_SZ;
-            const int row_base = y * FRAME_DIM;
+            const int ty = tile_idx_tab[y];           // y / CLAHE_TILE_SZ via table
+            const int row_tile_base = ty * CLAHE_N;
+            const uint8_t *row = p8 + (size_t)y * FRAME_DIM * 2;
             for (int x = 0; x < FRAME_DIM; ++x) {
-                const int tx = x / CLAHE_TILE_SZ;
-                const int idx = (row_base + x) * 2;
-                const uint8_t hi = p8[idx];
-                const uint8_t lo = p8[idx + 1];
+                const int idx = x * 2;
+                const uint8_t hi = row[idx];
+                const uint8_t lo = row[idx + 1];
                 const uint8_t g6 = (uint8_t)(((hi & 0x07) << 3) | (lo >> 5));
                 const uint8_t y8 = (uint8_t)((g6 << 2) | (g6 >> 4));
-                ++hist[ty * CLAHE_N + tx][y8];
+                ++hist[row_tile_base + tile_idx_tab[x]][y8];
             }
         }
 
@@ -773,6 +782,19 @@ namespace
         // input, so face skin tones don't drift the way they did
         // under the previous per-channel CLAHE. Bonus: one bilinear
         // interpolation per pixel instead of three.
+        //
+        // Hot-loop micro-optimisations vs the textbook layout:
+        //  * The four neighbouring LUT base pointers (l00..l11) only
+        //    change at tile-column boundaries inside a row, which is
+        //    just 4 times per 240-pixel row. The compiler can't see
+        //    that on its own because they depend on tx0_tab[x] /
+        //    tx1_tab[x] -- so we cache them and refresh only when
+        //    tx0 actually changes.
+        //  * Luma is `(r + 2*g + b) >> 2` instead of `(r+g+b+1)/3`.
+        //    Avoids the multiply-by-reciprocal sequence the compiler
+        //    lowers /3 to; the 0.25R + 0.5G + 0.25B weighting is
+        //    close enough to BT.601 for our use that the detector
+        //    can't tell the difference.
         uint8_t *w8 = (uint8_t *)pixels;
         for (int y = 0; y < FRAME_DIM; ++y) {
             // Per-row vertical tile indices and Q8 fraction.
@@ -785,10 +807,28 @@ namespace
             const int fy     = (ty_frac * 256) / CLAHE_TILE_SZ;
             const int fy_inv = 256 - fy;
             const int row_base = y * FRAME_DIM;
+            const int row_ty0_base = ty0 * CLAHE_N;
+            const int row_ty1_base = ty1 * CLAHE_N;
+
+            // Cached LUT base pointers for the current tile column.
+            // Initialised to "no column matched yet" so the first
+            // iteration unconditionally fetches them.
+            int last_tx0 = -1;
+            const uint8_t *l00 = nullptr;
+            const uint8_t *l01 = nullptr;
+            const uint8_t *l10 = nullptr;
+            const uint8_t *l11 = nullptr;
 
             for (int x = 0; x < FRAME_DIM; ++x) {
                 const int tx0 = tx0_tab[x];
-                const int tx1 = tx1_tab[x];
+                if (tx0 != last_tx0) {
+                    const int tx1 = tx1_tab[x];
+                    l00 = lut[row_ty0_base + tx0];
+                    l01 = lut[row_ty0_base + tx1];
+                    l10 = lut[row_ty1_base + tx0];
+                    l11 = lut[row_ty1_base + tx1];
+                    last_tx0 = tx0;
+                }
                 const int fx  = fx_tab[x];
                 const int fx_inv = 256 - fx;
 
@@ -802,22 +842,11 @@ namespace
                 const int g8e = (int)((g6 << 2) | (g6 >> 4));
                 const int b8e = (int)((b5 << 3) | (b5 >> 2));
 
-                // Luma proxy: simple average. Faster than BT.601-
-                // weighted Y on this CPU (no multiplies) and the
-                // approximation costs nothing the detector cares
-                // about. The luma proxy used to BUILD the histogram
-                // (apply_clahe pass 1, line above) was G6 expanded
-                // to 8 bits, which is also approximate; the only
-                // requirement is that the proxy used to LOOK UP the
-                // LUT is consistent across this function.
-                const int y_in = (r8e + g8e + b8e + 1) / 3;
+                // Luma proxy: 0.25R + 0.5G + 0.25B via shifts.
+                const int y_in = (r8e + g8e * 2 + b8e) >> 2;
 
                 // Bilinear-interp the LUT for Y across the four
                 // surrounding tiles.
-                const uint8_t *l00 = lut[ty0 * CLAHE_N + tx0];
-                const uint8_t *l01 = lut[ty0 * CLAHE_N + tx1];
-                const uint8_t *l10 = lut[ty1 * CLAHE_N + tx0];
-                const uint8_t *l11 = lut[ty1 * CLAHE_N + tx1];
                 const int v00 = l00[y_in];
                 const int v01 = l01[y_in];
                 const int v10 = l10[y_in];
@@ -828,9 +857,7 @@ namespace
 
                 // Apply the luma delta to each channel; clip to
                 // 0..255. Same delta on every channel preserves
-                // chroma. Negative deltas are common in CLAHE (the
-                // brightest tile drags the bright end of its range
-                // down), so we genuinely need both saturation arms.
+                // chroma.
                 const int dy = y_out - y_in;
                 int nr = r8e + dy;
                 int ng = g8e + dy;
@@ -900,14 +927,18 @@ namespace
     void shrink_into_padded(const uint16_t *src, uint16_t *dst) noexcept
     {
         // RGB565BE for mid-grey: R5=15, G6=31, B5=15 -> 0x7BEF native,
-        // bytes swap to 0xEF7B. memset to a 16-bit value with
-        // identical bytes won't quite get us pure grey, so fill by
-        // hand. ~57k stores in internal/PSRAM, ~1 ms.
+        // bytes swap to 0xEF7B. Fill 32 bits at a time (two pixels per
+        // write) -- on a word-aligned PSRAM buffer this is roughly
+        // 2x the throughput of the per-pixel store. FRAME_DIM*FRAME_DIM
+        // is 57600 which is even, so we never write past the end.
         const uint16_t grey_be = (uint16_t)(((0x7BEFu >> 8) & 0xFF) |
                                             ((0x7BEFu & 0xFF) << 8));
-        const size_t total = (size_t)FRAME_DIM * FRAME_DIM;
-        for (size_t i = 0; i < total; ++i) {
-            dst[i] = grey_be;
+        const uint32_t grey_be_pair =
+            ((uint32_t)grey_be << 16) | (uint32_t)grey_be;
+        const size_t total_pairs = (size_t)FRAME_DIM * FRAME_DIM / 2;
+        uint32_t *dst32 = reinterpret_cast<uint32_t *>(dst);
+        for (size_t i = 0; i < total_pairs; ++i) {
+            dst32[i] = grey_be_pair;
         }
         // Nearest-neighbour resample src (FRAME_DIM x FRAME_DIM) into
         // the centred INNER x INNER region.
