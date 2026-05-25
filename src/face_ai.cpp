@@ -42,6 +42,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <list>
+#include <memory>
 #include <vector>
 
 namespace
@@ -187,6 +188,20 @@ namespace
     std::vector<KnownFace> g_known_faces;
     SemaphoreHandle_t      g_db_mux = nullptr;
 
+    // RAII scope guard for g_db_mux. Acquires on construction, releases
+    // on destruction; non-copyable / non-movable so we can't accidentally
+    // hand out a lock. Every critical section against the face DB --
+    // both inside the AI task and inside the public face_db_* readers
+    // called from the web-server task -- goes through this guard.
+    class FaceDbLock
+    {
+    public:
+        FaceDbLock() noexcept { xSemaphoreTake(g_db_mux, portMAX_DELAY); }
+        ~FaceDbLock() noexcept { xSemaphoreGive(g_db_mux); }
+        FaceDbLock(const FaceDbLock &)            = delete;
+        FaceDbLock &operator=(const FaceDbLock &) = delete;
+    };
+
     inline uint32_t now_ms() noexcept
     {
         return static_cast<uint32_t>(esp_timer_get_time() / 1000);
@@ -321,7 +336,7 @@ namespace
             // 16-byte-aligned PSRAM->SRAM 115 KB copy. The exact
             // speedup is workload- and alignment-dependent; ESP-DSP
             // doesn't publish a benchmark for memcpy specifically.
-            dsps_memcpy_aes3(dst, src, (size_t)n * n * sizeof(uint16_t));
+            dsps_memcpy_aes3(dst, src, static_cast<size_t>(n) * n * sizeof(uint16_t));
             break;
         case Orient::ROT_90_CW:
             for (int y = 0; y < n; ++y) {
@@ -422,29 +437,29 @@ namespace
     bool scene_is_static(const uint16_t *fb, MotionState &m) noexcept
     {
         uint8_t cur[MOTION_GRID * MOTION_GRID];
-        const uint8_t *p8 = (const uint8_t *)fb;
+        const uint8_t *p8 = reinterpret_cast<const uint8_t *>(fb);
         for (int j = 0; j < MOTION_GRID; ++j) {
             const int y = MOTION_STRIDE / 2 + j * MOTION_STRIDE;
             for (int i = 0; i < MOTION_GRID; ++i) {
-                const int x = MOTION_STRIDE / 2 + i * MOTION_STRIDE;
+                const int x   = MOTION_STRIDE / 2 + i * MOTION_STRIDE;
                 const int idx = (y * FRAME_DIM + x) * 2;
                 const uint8_t hi = p8[idx];
                 const uint8_t lo = p8[idx + 1];
                 const uint8_t g6 =
-                    (uint8_t)(((hi & 0x07) << 3) | (lo >> 5));
+                    static_cast<uint8_t>(((hi & 0x07) << 3) | (lo >> 5));
                 cur[j * MOTION_GRID + i] =
-                    (uint8_t)((g6 << 2) | (g6 >> 4));
+                    static_cast<uint8_t>((g6 << 2) | (g6 >> 4));
             }
         }
         if (!m.valid) {
             std::memcpy(m.samples, cur, sizeof(cur));
-            m.valid = true;
+            m.valid        = true;
             m.quiet_frames = 0;
             return false;
         }
         int sad = 0;
         for (int i = 0; i < MOTION_GRID * MOTION_GRID; ++i) {
-            sad += std::abs((int)cur[i] - (int)m.samples[i]);
+            sad += std::abs(static_cast<int>(cur[i]) - static_cast<int>(m.samples[i]));
         }
         std::memcpy(m.samples, cur, sizeof(cur));
         if (sad < MOTION_SAD_THRESHOLD) {
@@ -711,17 +726,17 @@ namespace
         // memset specifically so the exact factor is unmeasured
         // here.
         dsps_memset_aes3(hist, 0, sizeof(hist));
-        const uint8_t *p8 = (const uint8_t *)pixels;
+        const uint8_t *p8 = reinterpret_cast<const uint8_t *>(pixels);
         for (int y = 0; y < FRAME_DIM; ++y) {
             const int ty = tile_idx_tab[y];           // y / CLAHE_TILE_SZ via table
             const int row_tile_base = ty * CLAHE_N;
-            const uint8_t *row = p8 + (size_t)y * FRAME_DIM * 2;
+            const uint8_t *row = p8 + static_cast<size_t>(y) * FRAME_DIM * 2;
             for (int x = 0; x < FRAME_DIM; ++x) {
                 const int idx = x * 2;
                 const uint8_t hi = row[idx];
                 const uint8_t lo = row[idx + 1];
-                const uint8_t g6 = (uint8_t)(((hi & 0x07) << 3) | (lo >> 5));
-                const uint8_t y8 = (uint8_t)((g6 << 2) | (g6 >> 4));
+                const uint8_t g6 = static_cast<uint8_t>(((hi & 0x07) << 3) | (lo >> 5));
+                const uint8_t y8 = static_cast<uint8_t>((g6 << 2) | (g6 >> 4));
                 ++hist[row_tile_base + tile_idx_tab[x]][y8];
             }
         }
@@ -736,11 +751,12 @@ namespace
             uint32_t total_sum = 0;
             for (int t = 0; t < CLAHE_N * CLAHE_N; ++t) {
                 for (int v = 0; v < 256; ++v) {
-                    total_sum += (uint32_t)hist[t][v] * (uint32_t)v;
+                    total_sum += static_cast<uint32_t>(hist[t][v]) * static_cast<uint32_t>(v);
                 }
             }
             g_last_mean_luma.store(
-                (int)(total_sum / ((uint32_t)FRAME_DIM * FRAME_DIM)),
+                static_cast<int>(total_sum /
+                                 (static_cast<uint32_t>(FRAME_DIM) * FRAME_DIM)),
                 std::memory_order_relaxed);
         }
 
@@ -765,13 +781,13 @@ namespace
             const uint32_t bonus    = excess >> 8;
             const uint32_t leftover = excess & 0xFF;
             for (int v = 0; v < 256; ++v) {
-                hist[t][v] += bonus + (v < (int)leftover ? 1 : 0);
+                hist[t][v] += bonus + (v < static_cast<int>(leftover) ? 1 : 0);
             }
             // CDF, scaled into the LUT's 0..255 output range.
             uint32_t cdf = 0;
             for (int v = 0; v < 256; ++v) {
                 cdf += hist[t][v];
-                lut[t][v] = (uint8_t)((cdf * 255) / CLAHE_TILE_PX);
+                lut[t][v] = static_cast<uint8_t>((cdf * 255) / CLAHE_TILE_PX);
             }
         }
 
@@ -841,12 +857,12 @@ namespace
                 const int idx = (row_base + x) * 2;
                 const uint8_t hi = w8[idx];
                 const uint8_t lo = w8[idx + 1];
-                const uint8_t r5 = (uint8_t)(hi >> 3);
-                const uint8_t g6 = (uint8_t)(((hi & 0x07) << 3) | (lo >> 5));
-                const uint8_t b5 = (uint8_t)(lo & 0x1F);
-                const int r8e = (int)((r5 << 3) | (r5 >> 2));
-                const int g8e = (int)((g6 << 2) | (g6 >> 4));
-                const int b8e = (int)((b5 << 3) | (b5 >> 2));
+                const uint8_t r5 = static_cast<uint8_t>(hi >> 3);
+                const uint8_t g6 = static_cast<uint8_t>(((hi & 0x07) << 3) | (lo >> 5));
+                const uint8_t b5 = static_cast<uint8_t>(lo & 0x1F);
+                const int r8e = static_cast<int>((r5 << 3) | (r5 >> 2));
+                const int g8e = static_cast<int>((g6 << 2) | (g6 >> 4));
+                const int b8e = static_cast<int>((b5 << 3) | (b5 >> 2));
 
                 // Luma proxy: 0.25R + 0.5G + 0.25B via shifts.
                 const int y_in = (r8e + g8e * 2 + b8e) >> 2;
@@ -869,11 +885,11 @@ namespace
                 const int ng = std::clamp(g8e + dy, 0, 255);
                 const int nb = std::clamp(b8e + dy, 0, 255);
 
-                const uint8_t nr5 = (uint8_t)(nr >> 3);
-                const uint8_t ng6 = (uint8_t)(ng >> 2);
-                const uint8_t nb5 = (uint8_t)(nb >> 3);
-                w8[idx]     = (uint8_t)((nr5 << 3) | (ng6 >> 3));
-                w8[idx + 1] = (uint8_t)((ng6 << 5) | nb5);
+                const uint8_t nr5 = static_cast<uint8_t>(nr >> 3);
+                const uint8_t ng6 = static_cast<uint8_t>(ng >> 2);
+                const uint8_t nb5 = static_cast<uint8_t>(nb >> 3);
+                w8[idx]     = static_cast<uint8_t>((nr5 << 3) | (ng6 >> 3));
+                w8[idx + 1] = static_cast<uint8_t>((ng6 << 5) | nb5);
             }
         }
     }
@@ -886,22 +902,22 @@ namespace
     // us on the S3.
     int sample_mean_luma(const uint16_t *pixels) noexcept
     {
-        const uint8_t *p8 = (const uint8_t *)pixels;
+        const uint8_t *p8 = reinterpret_cast<const uint8_t *>(pixels);
         uint32_t sum = 0;
         uint32_t cnt = 0;
         for (int y = 0; y < FRAME_DIM; y += 4) {
-            const uint8_t *row = p8 + (size_t)y * FRAME_DIM * 2;
+            const uint8_t *row = p8 + static_cast<size_t>(y) * FRAME_DIM * 2;
             for (int x = 0; x < FRAME_DIM; x += 4) {
                 const int idx = x * 2;
                 const uint8_t hi = row[idx];
                 const uint8_t lo = row[idx + 1];
                 const uint8_t g6 =
-                    (uint8_t)(((hi & 0x07) << 3) | (lo >> 5));
-                sum += (uint32_t)((g6 << 2) | (g6 >> 4));
+                    static_cast<uint8_t>(((hi & 0x07) << 3) | (lo >> 5));
+                sum += static_cast<uint32_t>((g6 << 2) | (g6 >> 4));
                 ++cnt;
             }
         }
-        return cnt ? (int)(sum / cnt) : 128;
+        return cnt ? static_cast<int>(sum / cnt) : 128;
     }
 
     // Prepare the buffer the detector will read this frame. Returns
@@ -1024,7 +1040,7 @@ namespace
     float banner_angle_for(Orient o)
     {
         constexpr float quarter = 3.14159265358979323846f * 0.5f;
-        return -(float)((int)o) * quarter;
+        return -static_cast<float>(static_cast<int>(o)) * quarter;
     }
 
     // Refines banner_angle_for() using the actual head tilt measured from
@@ -1216,11 +1232,11 @@ namespace
             return;
         }
 
-        out_thumb->resize((size_t)FACE_THUMB_DIM * FACE_THUMB_DIM);
+        out_thumb->resize(static_cast<size_t>(FACE_THUMB_DIM) * FACE_THUMB_DIM);
         uint16_t *dst = out_thumb->data();
         for (int ty = 0; ty < FACE_THUMB_DIM; ++ty) {
-            const int sy = cy0 + (ty * s) / FACE_THUMB_DIM;
-            const uint16_t *srow = fb_pixels + (size_t)sy * FRAME_DIM;
+            const int       sy   = cy0 + (ty * s) / FACE_THUMB_DIM;
+            const uint16_t *srow = fb_pixels + static_cast<size_t>(sy) * FRAME_DIM;
             for (int tx = 0; tx < FACE_THUMB_DIM; ++tx) {
                 const int sx = cx0 + (tx * s) / FACE_THUMB_DIM;
                 dst[ty * FACE_THUMB_DIM + tx] = srow[sx];
@@ -1246,8 +1262,8 @@ namespace
 
         // Head-local "down" direction in display-frame coords. For an upright
         // forward-facing face this is (0, +1) (nose below eye midpoint).
-        const float dx = (float)(nx - (e0x + e1x) / 2);
-        const float dy = (float)(ny - (e0y + e1y) / 2);
+        const float dx = static_cast<float>(nx - (e0x + e1x) / 2);
+        const float dy = static_cast<float>(ny - (e0y + e1y) / 2);
         if (dx == 0.0f && dy == 0.0f)
         {
             return banner_angle_for(o);
@@ -1275,8 +1291,10 @@ namespace
                  xPortGetCoreID(), (int)TASK_PRIO);
 
         // Construction loads the .espdl files out of the model partitions.
-        // Costs ~1 second up-front.
-        auto *detect = new HumanFaceDetect();
+        // Costs ~1 second up-front. unique_ptr so the destructors run
+        // automatically if the task ever exits (today it doesn't, but
+        // the leak-free shape costs nothing).
+        auto detect = std::make_unique<HumanFaceDetect>();
         // We previously bumped the MSR (proposal) stage's score floor to
         // 0.65 to speed up MNP refinement. That helped throughput at
         // mid range but starved real close-range detections whose MSR
@@ -1284,7 +1302,7 @@ namespace
         // distribution). The default 0.5 was the right tradeoff; we now
         // get the same false-positive resistance from MIN_DETECT_SCORE
         // + keypoints_look_upright at the app level.
-        auto *feat = new HumanFaceFeat();
+        auto      feat     = std::make_unique<HumanFaceFeat>();
         const int feat_len = feat->get_feat_len();
 
         // Scratch buffer for orientation-rotated frames. Prefer
@@ -1294,15 +1312,16 @@ namespace
         // it fits comfortably alongside the existing IDF + camera
         // stacks; if for some reason it doesn't, we transparently
         // fall back to PSRAM and lose only the bandwidth bonus.
-        const size_t scratch_bytes = (size_t)FRAME_DIM * FRAME_DIM * sizeof(uint16_t);
-        auto *scratch = (uint16_t *)heap_caps_aligned_alloc(
-            16, scratch_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        const size_t scratch_bytes =
+            static_cast<size_t>(FRAME_DIM) * FRAME_DIM * sizeof(uint16_t);
+        auto *scratch = static_cast<uint16_t *>(heap_caps_aligned_alloc(
+            16, scratch_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
         if (scratch) {
             ESP_LOGI(TAG, "orientation scratch in internal SRAM (%u B)",
                      (unsigned)scratch_bytes);
         } else {
-            scratch = (uint16_t *)heap_caps_aligned_alloc(
-                16, scratch_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            scratch = static_cast<uint16_t *>(heap_caps_aligned_alloc(
+                16, scratch_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
             if (scratch) {
                 ESP_LOGW(TAG,
                          "internal SRAM full; orientation scratch in PSRAM (%u B)",
@@ -1322,8 +1341,8 @@ namespace
         // window, so PSRAM (slower than internal SRAM but plentiful)
         // is fine -- the bandwidth cost is only paid on the
         // exception path.
-        auto *padded_scratch = (uint16_t *)heap_caps_aligned_alloc(
-            16, scratch_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        auto *padded_scratch = static_cast<uint16_t *>(heap_caps_aligned_alloc(
+            16, scratch_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
         if (!padded_scratch) {
             ESP_LOGW(TAG,
                      "no PSRAM for padded fallback (%u B); close-range "
@@ -1337,11 +1356,10 @@ namespace
         // Pre-reserve so the matcher's pointer to the embedding stays
         // valid for the lifetime of the entry.
         {
-            xSemaphoreTake(g_db_mux, portMAX_DELAY);
+            FaceDbLock lock;
             if (g_known_faces.capacity() < MAX_KNOWN_FACES) {
                 g_known_faces.reserve(MAX_KNOWN_FACES);
             }
-            xSemaphoreGive(g_db_mux);
         }
 
         // Counters for the per-second heartbeat.
@@ -1519,7 +1537,7 @@ namespace
             // motion check itself.
             if (consecutive_misses >= OVERLAY_CLEAR_MISSES &&
                 fb->width == FRAME_DIM && fb->height == FRAME_DIM &&
-                scene_is_static((const uint16_t *)fb->buf, motion))
+                scene_is_static(reinterpret_cast<const uint16_t *>(fb->buf), motion))
             {
                 ++s_motion_skip;
                 esp_camera_fb_return(fb);
@@ -1540,7 +1558,7 @@ namespace
             // is reading it on the other core for the live preview,
             // and the user expects the preview to look like the raw
             // sensor output, not the contrast-stretched detector view.
-            const uint16_t *src = (const uint16_t *)fb->buf;
+            const uint16_t *src       = reinterpret_cast<const uint16_t *>(fb->buf);
             const uint16_t *to_detect = src;
             if (fb->width == FRAME_DIM && fb->height == FRAME_DIM)
             {
@@ -1821,19 +1839,20 @@ namespace
             // SIMD), well under a millisecond of critical section.
             float best_sim = -2.f;
             int best_id = -1;
-            xSemaphoreTake(g_db_mux, portMAX_DELAY);
-            for (size_t i = 0; i < g_known_faces.size(); ++i)
             {
-                const float s = cosine_sim(raw_feat,
-                                           g_known_faces[i].feat.data(),
-                                           feat_len);
-                if (s > best_sim)
+                FaceDbLock lock;
+                for (size_t i = 0; i < g_known_faces.size(); ++i)
                 {
-                    best_sim = s;
-                    best_id = (int)i + 1; // 1-based for logging niceness
+                    const float s = cosine_sim(raw_feat,
+                                               g_known_faces[i].feat.data(),
+                                               feat_len);
+                    if (s > best_sim)
+                    {
+                        best_sim = s;
+                        best_id = (int)i + 1; // 1-based for logging niceness
+                    }
                 }
             }
-            xSemaphoreGive(g_db_mux);
 
             if (best_id > 0 && best_sim >= g_tuning.match_thr)
             {
@@ -1883,19 +1902,20 @@ namespace
             // face pose.
             bool hit_cap = false;
             size_t new_count = 0;
-            xSemaphoreTake(g_db_mux, portMAX_DELAY);
-            if (g_known_faces.size() >= MAX_KNOWN_FACES) {
-                hit_cap = true;
-            } else {
-                KnownFace entry;
-                entry.feat.assign(raw_feat, raw_feat + feat_len);
-                crop_face_thumb(src, biggest, locked_orient, &entry.thumb);
-                entry.name[0]    = '\0';
-                entry.enrolled_ms = now_ms();
-                g_known_faces.emplace_back(std::move(entry));
-                new_count = g_known_faces.size();
+            {
+                FaceDbLock lock;
+                if (g_known_faces.size() >= MAX_KNOWN_FACES) {
+                    hit_cap = true;
+                } else {
+                    KnownFace entry;
+                    entry.feat.assign(raw_feat, raw_feat + feat_len);
+                    crop_face_thumb(src, biggest, locked_orient, &entry.thumb);
+                    entry.name[0]    = '\0';
+                    entry.enrolled_ms = now_ms();
+                    g_known_faces.emplace_back(std::move(entry));
+                    new_count = g_known_faces.size();
+                }
             }
-            xSemaphoreGive(g_db_mux);
 
             if (hit_cap)
             {
@@ -1999,10 +2019,8 @@ int face_db_count(void)
     if (!g_db_mux) {
         return 0;
     }
-    xSemaphoreTake(g_db_mux, portMAX_DELAY);
-    const int n = (int)g_known_faces.size();
-    xSemaphoreGive(g_db_mux);
-    return n;
+    FaceDbLock lock;
+    return static_cast<int>(g_known_faces.size());
 }
 
 bool face_db_get_entry(int idx, face_db_entry_t *out)
@@ -2010,39 +2028,35 @@ bool face_db_get_entry(int idx, face_db_entry_t *out)
     if (!out || !g_db_mux) {
         return false;
     }
-    bool ok = false;
-    xSemaphoreTake(g_db_mux, portMAX_DELAY);
-    if (idx >= 0 && idx < (int)g_known_faces.size()) {
-        const auto &kf  = g_known_faces[idx];
-        out->idx         = idx;
-        out->enrolled_ms = kf.enrolled_ms;
-        out->thumb_w     = FACE_THUMB_DIM;
-        out->thumb_h     = FACE_THUMB_DIM;
-        std::memcpy(out->name, kf.name, FACE_NAME_MAX);
-        ok = true;
+    FaceDbLock lock;
+    if (idx < 0 || idx >= static_cast<int>(g_known_faces.size())) {
+        return false;
     }
-    xSemaphoreGive(g_db_mux);
-    return ok;
+    const auto &kf   = g_known_faces[idx];
+    out->idx         = idx;
+    out->enrolled_ms = kf.enrolled_ms;
+    out->thumb_w     = FACE_THUMB_DIM;
+    out->thumb_h     = FACE_THUMB_DIM;
+    std::memcpy(out->name, kf.name, FACE_NAME_MAX);
+    return true;
 }
 
 bool face_db_copy_thumb(int idx, uint16_t *dst, size_t dst_capacity_pixels)
 {
     if (!dst || !g_db_mux ||
-        dst_capacity_pixels < (size_t)FACE_THUMB_DIM * FACE_THUMB_DIM) {
+        dst_capacity_pixels < static_cast<size_t>(FACE_THUMB_DIM) * FACE_THUMB_DIM) {
         return false;
     }
-    bool ok = false;
-    xSemaphoreTake(g_db_mux, portMAX_DELAY);
-    if (idx >= 0 && idx < (int)g_known_faces.size()) {
-        const auto &kf = g_known_faces[idx];
-        if (kf.thumb.size() == (size_t)FACE_THUMB_DIM * FACE_THUMB_DIM) {
-            std::memcpy(dst, kf.thumb.data(),
-                        kf.thumb.size() * sizeof(uint16_t));
-            ok = true;
-        }
+    FaceDbLock lock;
+    if (idx < 0 || idx >= static_cast<int>(g_known_faces.size())) {
+        return false;
     }
-    xSemaphoreGive(g_db_mux);
-    return ok;
+    const auto &kf = g_known_faces[idx];
+    if (kf.thumb.size() != static_cast<size_t>(FACE_THUMB_DIM) * FACE_THUMB_DIM) {
+        return false;
+    }
+    std::memcpy(dst, kf.thumb.data(), kf.thumb.size() * sizeof(uint16_t));
+    return true;
 }
 
 bool face_db_set_name(int idx, const char *name)
@@ -2050,14 +2064,12 @@ bool face_db_set_name(int idx, const char *name)
     if (!name || !g_db_mux) {
         return false;
     }
-    bool ok = false;
-    xSemaphoreTake(g_db_mux, portMAX_DELAY);
-    if (idx >= 0 && idx < (int)g_known_faces.size()) {
-        auto &kf = g_known_faces[idx];
-        std::strncpy(kf.name, name, FACE_NAME_MAX - 1);
-        kf.name[FACE_NAME_MAX - 1] = '\0';
-        ok = true;
+    FaceDbLock lock;
+    if (idx < 0 || idx >= static_cast<int>(g_known_faces.size())) {
+        return false;
     }
-    xSemaphoreGive(g_db_mux);
-    return ok;
+    auto &kf = g_known_faces[idx];
+    std::strncpy(kf.name, name, FACE_NAME_MAX - 1);
+    kf.name[FACE_NAME_MAX - 1] = '\0';
+    return true;
 }
