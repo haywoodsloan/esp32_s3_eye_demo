@@ -50,7 +50,7 @@ Xtensa LX7 cores — no cloud, no companion app, no off-device inference.
 - **Enrolment banner** — "NEW FACE / DETECTED" composited onto the live
   preview in dark green with a black outline, text orientation locked at
   enrolment to whichever way the face was actually facing. Rendered
-  from a real bitmap font (FreeSansBold 18pt) via Adafruit GFXfont
+  from a real bitmap font (FreeSans 18pt) via Adafruit GFXfont
   format — see [`src/fonts/`](src/fonts/).
 - **Recognition banner** — navy-blue name overlay along the bottom edge
   of the live preview whenever the matcher returns a known face that
@@ -407,7 +407,7 @@ re-embed the same face.
 Two independent on-screen overlays driven by the AI task and composited
 by the render task in [`src/main.cpp`](src/main.cpp). Both share the
 same rendering pipeline in [`src/banner.cpp`](src/banner.cpp): a 1bpp
-glyph stream (FreeSansBold 18pt in Adafruit GFXfont format, shipped
+glyph stream (FreeSans 18pt in Adafruit GFXfont format, shipped
 verbatim in [`src/fonts/`](src/fonts/)) is splatted into an 8-bit
 alpha mask, the mask is dilated by 2 px into a black-outline mask, and
 both masks are composited onto the live camera buffer with per-pixel
@@ -479,7 +479,7 @@ ones, with the values used at HEAD:
 
 | Knob | Value | Effect |
 |---|---|---|
-| `kFont` | `FreeSansBold18pt7b` | Pre-converted Adafruit-GFXfont bitmap font; swap the include + this reference to change face / size |
+| `kFont` | `FreeSans18pt7b` | Pre-converted Adafruit-GFXfont bitmap font; swap the include + this reference to change face / size / weight |
 | `LINE_OFFSET_PX` | 88 | Distance from buffer centre to each line's visual centre |
 | `BASELINE_OFFSET_PX` | 12 | Offset from line-centre to glyph baseline (~half the cap height) |
 | `LETTER_GAP_PX` | 1 | Extra inter-letter tracking on top of each glyph's `xAdvance` |
@@ -504,7 +504,7 @@ src/
 ├── webserver.cpp / .h          esp_http_server endpoints + mDNS, serves the embedded UI
 ├── board_pins.h                pin map for the S3-EYE
 ├── fonts/
-│   ├── FreeSansBold18pt7b.h    pre-converted bitmap font (Adafruit GFXfont format)
+│   ├── FreeSans18pt7b.h        pre-converted bitmap font (Adafruit GFXfont format)
 │   └── gfx_font.h              minimal GFXglyph / GFXfont struct shim (no Adafruit_GFX dep)
 ├── web/
 │   ├── index.html              single-file UI (vanilla JS, gitignored generated header)

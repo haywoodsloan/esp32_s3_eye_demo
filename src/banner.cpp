@@ -1,6 +1,6 @@
 #include "banner.h"
 #include "board_pins.h"
-#include "fonts/FreeSansBold18pt7b.h"
+#include "fonts/FreeSans18pt7b.h"
 
 #include "esp_check.h"
 #include "esp_heap_caps.h"
@@ -16,13 +16,13 @@ static const char *TAG = "banner";
 #define BANNER_W            BOARD_LCD_H_RES   /* 240 */
 #define BANNER_H            BOARD_LCD_V_RES   /* 240 */
 
-/* Text is rendered from a real bitmap font (FreeSansBold 18pt) that
-   was pre-converted from a GNU FreeFont TTF using Adafruit's
+/* Text is rendered from a real bitmap font (FreeSans 18pt regular)
+   that was pre-converted from a GNU FreeFont TTF using Adafruit's
    `fontconvert` tool and shipped verbatim in src/fonts/. The format
    is 1 bit per pixel, packed MSB-first into a shared byte array, with
    a per-glyph metadata table giving width / height / pen-advance /
-   baseline-relative xOffset / yOffset. yAdvance (42 px) gives the
-   line height; cap height is ~25 px.
+   baseline-relative xOffset / yOffset. yAdvance gives the line
+   height; cap height is ~25 px.
 
    Each lit glyph bit is splatted into the alpha buffer as a small
    soft circular dot. The dot's only job here is to add 1 px of soft
@@ -33,7 +33,7 @@ static const char *TAG = "banner";
    overlapping dots for the stroke body); the FreeSans glyph shapes
    already carry the typographic weight. */
 
-static const GFXfont &kFont = FreeSansBold18pt7b;
+static const GFXfont &kFont = FreeSans18pt7b;
 
 #define LETTER_GAP_PX       1                   /* extra inter-letter tracking */
 #define LINE_OFFSET_PX      88                  /* centre -> line-centre, in local coords */
@@ -374,7 +374,7 @@ void banner_render(float angle_rad)
 }
 
 /* Map an arbitrary input character to a glyph we know how to render.
-   FreeSansBold18pt7b covers ASCII 0x20..0x7E (printable 7-bit). We
+   FreeSans18pt7b covers ASCII 0x20..0x7E (printable 7-bit). We
    fold lowercase to uppercase on the way through so the name banner
    stays visually consistent with the all-caps "NEW FACE DETECTED"
    enrollment banner -- mixed-case bodies on a screen this small read

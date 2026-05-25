@@ -1,6 +1,6 @@
 // Minimal shim for the Adafruit GFXfont bitmap-font format. We ship
 // fonts pre-converted from TTF using Adafruit's `fontconvert` tool
-// (output lives next to this header, e.g. FreeSansBold18pt7b.h). Those
+// (output lives next to this header, e.g. FreeSans18pt7b.h). Those
 // headers reference these two struct types and a PROGMEM macro. We
 // don't want to drag in the full Adafruit_GFX dependency just for the
 // type names, so this header provides:
