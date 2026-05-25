@@ -84,18 +84,6 @@ namespace
     constexpr int MIN_FACE_PX = 83;
 
     // Minimum detector confidence for a result to be acted on at all.
-    // MSR+MNP's internal threshold is low enough that the detector
-    // occasionally fires on rough face-like blobs (upside-down faces,
-    // textured fabric, hand silhouettes), and once the orient-cycle
-    // locks onto one of those false positives the HUD and the banner
-    // start chasing the wrong target. Anything below this score is
-    // treated as a miss and the orient cycle resumes.
-    //
-    // 0.60 was picked empirically: lower lets noisy faces through and
-    // re-introduces the upside-down false-positive class; higher
-    // starts costing real detections on far-from-camera or partially
-    // occluded faces.
-    // Minimum detector confidence for a result to be acted on at all.
     // The detector occasionally fires on rough face-like blobs and on
     // upside-down faces; the upside-down case is already caught much
     // more reliably by keypoints_look_upright(), so we can afford to
@@ -308,92 +296,47 @@ namespace
     // path (well exposed, ROT_0 locked) drops to a single subsampled
     // pass.
 
-    // Per-pixel kernel: read one RGB565BE word from `sp`, optionally
-    // run its three channels through `lut`, and write the result to
-    // `dp`. With WithLut=false this collapses to a single uint16_t
-    // copy; with WithLut=true it's load-byte / unpack / 3x LUT /
-    // repack / store-byte.
-    template <bool WithLut>
-    inline void copy_pixel(const uint16_t *__restrict__ sp,
-                           uint16_t *__restrict__ dp,
-                           const uint8_t *lut) noexcept
-    {
-        if constexpr (!WithLut) {
-            *dp = *sp;
-        } else {
-            const uint8_t *sb = (const uint8_t *)sp;
-            uint8_t       *db = (uint8_t *)dp;
-            const uint8_t hi = sb[0];
-            const uint8_t lo = sb[1];
-            const uint8_t r5 = (uint8_t)(hi >> 3);
-            const uint8_t g6 = (uint8_t)(((hi & 0x07) << 3) | (lo >> 5));
-            const uint8_t b5 = (uint8_t)(lo & 0x1F);
-            const uint8_t r8 = (uint8_t)((r5 << 3) | (r5 >> 2));
-            const uint8_t g8 = (uint8_t)((g6 << 2) | (g6 >> 4));
-            const uint8_t b8 = (uint8_t)((b5 << 3) | (b5 >> 2));
-            const uint8_t nr5 = (uint8_t)(lut[r8] >> 3);
-            const uint8_t ng6 = (uint8_t)(lut[g8] >> 2);
-            const uint8_t nb5 = (uint8_t)(lut[b8] >> 3);
-            db[0] = (uint8_t)((nr5 << 3) | (ng6 >> 3));
-            db[1] = (uint8_t)((ng6 << 5) | nb5);
-        }
-    }
-
-    // Fused rotate + optional stretch. Each orient gets a dedicated
-    // double-loop with branch-free indexing; WithLut is a template
-    // parameter so the inner kernel is straight-line in either mode.
-    template <bool WithLut>
+    // Pure rotate -- the CLAHE pass that follows handles all the
+    // contrast work, so this function's only job is to land the
+    // upright copy into `dst`. ROT_0 fast-paths to the S3 SIMD
+    // memcpy; the rotated cases are scalar by necessity (non-
+    // sequential stores break SIMD).
+    __attribute__((hot))
     void rotate_to_scratch(Orient o,
                            const uint16_t *__restrict__ src,
                            uint16_t *__restrict__ dst,
-                           int n, const uint8_t *lut) noexcept
+                           int n) noexcept
     {
         switch (o) {
-        case Orient::ROT_0: {
-            if constexpr (!WithLut) {
-                // dsps_memcpy_aes3 is the S3 SIMD memcpy. On a
-                // 16-byte-aligned buffer the SCRATCH<-fb copy of
-                // 115 KB drops to roughly 2/3 the wall time of
-                // libc memcpy because the inner loop pumps 16
-                // bytes per iteration via the AES3 store-pair
-                // extension instead of 4.
-                dsps_memcpy_aes3(dst, src,
-                                 (size_t)n * n * sizeof(uint16_t));
-            } else {
-                const int total = n * n;
-                for (int i = 0; i < total; ++i) {
-                    copy_pixel<true>(src + i, dst + i, lut);
-                }
-            }
+        case Orient::ROT_0:
+            // dsps_memcpy_aes3 is the S3 SIMD memcpy. On a
+            // 16-byte-aligned buffer the SCRATCH<-fb copy of
+            // 115 KB drops to roughly 2/3 the wall time of libc
+            // memcpy because the inner loop pumps 16 bytes per
+            // iteration via the AES3 store-pair extension.
+            dsps_memcpy_aes3(dst, src, (size_t)n * n * sizeof(uint16_t));
             break;
-        }
-        case Orient::ROT_90_CW: {
+        case Orient::ROT_90_CW:
             for (int y = 0; y < n; ++y) {
                 for (int x = 0; x < n; ++x) {
-                    copy_pixel<WithLut>(src + y * n + x,
-                                        dst + x * n + (n - 1 - y),
-                                        lut);
+                    dst[x * n + (n - 1 - y)] = src[y * n + x];
                 }
             }
             break;
-        }
         case Orient::ROT_180: {
             const int total = n * n;
             for (int i = 0; i < total; ++i) {
-                copy_pixel<WithLut>(src + total - 1 - i, dst + i, lut);
+                dst[i] = src[total - 1 - i];
             }
             break;
         }
-        case Orient::ROT_270_CW: {
+        case Orient::ROT_270_CW:
             for (int y = 0; y < n; ++y) {
                 for (int x = 0; x < n; ++x) {
-                    copy_pixel<WithLut>(src + y * n + x,
-                                        dst + (n - 1 - x) * n + y,
-                                        lut);
+                    dst[(n - 1 - x) * n + y] = src[y * n + x];
                 }
             }
             break;
-        }
         }
     }
 
@@ -909,7 +852,7 @@ namespace
         // signal under the noise stays unrecoverable. Paying ~5 ms
         // of CLAHE on every detection frame is a fair price for
         // detection working at all in dim scenes.
-        rotate_to_scratch<false>(o, src, scratch, n, nullptr);
+        rotate_to_scratch(o, src, scratch, n);
         apply_clahe(scratch);
         return scratch;
     }
@@ -1374,35 +1317,35 @@ namespace
         } recog_cache;
 
         // Orientation to TRY on this frame. After a successful detection we
-    // leave this alone so the next frame uses the same orientation; on a
-    // failed detection we may stick on it for a couple more attempts
-    // (orient-sticky retry, see ORIENT_STICKY_MISSES below) before
-    // advancing to the next of the four.
-    Orient try_orient = Orient::ROT_0;
+        // leave this alone so the next frame uses the same orientation; on a
+        // failed detection we may stick on it for a couple more attempts
+        // (orient-sticky retry, see ORIENT_STICKY_MISSES below) before
+        // advancing to the next of the four.
+        Orient try_orient = Orient::ROT_0;
 
-    // Consecutive miss frames in the current detection-loss streak. Used
-    // by the orient-sticky retry: a quick blink / occlusion / motion blur
-    // is FAR more likely than the user actually rotating the device
-    // between frames, so we retry the last-known-good orient before
-    // burning frames on the other three buckets. Reset on each success.
-    int consecutive_misses = 0;
-    // Number of misses we'll stay on the known-good orient before
-    // cycling. ORIENT_STICKY_MISSES=2 keeps us responsive to genuine
-    // rotation (worst case ~3-4 detection frames to discover the new
-    // orient) while making transient blinks effectively free.
-    constexpr int ORIENT_STICKY_MISSES = 4;
+        // Consecutive miss frames in the current detection-loss streak. Used
+        // by the orient-sticky retry: a quick blink / occlusion / motion blur
+        // is FAR more likely than the user actually rotating the device
+        // between frames, so we retry the last-known-good orient before
+        // burning frames on the other three buckets. Reset on each success.
+        int consecutive_misses = 0;
+        // Number of misses we'll stay on the known-good orient before
+        // cycling. Keeps us responsive to genuine rotation (worst case
+        // ~3-4 detection frames to discover the new orient) while making
+        // transient blinks effectively free.
+        constexpr int ORIENT_STICKY_MISSES = 4;
 
-    // Number of consecutive misses we'll tolerate before treating the
-    // face as actually gone and hiding the on-screen overlay.
-    // Decoupled from ORIENT_STICKY_MISSES on purpose: we want
-    // orientation cycling to react quickly (after just a couple of
-    // misses) but we DON'T want the overlay to blink off and back on
-    // every time the detector skips a frame on a blink, motion blur,
-    // or pose change. At ~10 detections/sec this gives the user about
-    // 0.8 s of grace before the box disappears, which matches the
-    // perceived "they're still here" window without leaving stale
-    // boxes around after they actually walk away.
-    constexpr int OVERLAY_CLEAR_MISSES = 12;
+        // Number of consecutive misses we'll tolerate before treating the
+        // face as actually gone and hiding the on-screen overlay.
+        // Decoupled from ORIENT_STICKY_MISSES on purpose: we want
+        // orientation cycling to react quickly (after just a couple of
+        // misses) but we DON'T want the overlay to blink off and back on
+        // every time the detector skips a frame on a blink, motion blur,
+        // or pose change. At ~10 detections/sec this gives the user about
+        // 0.8 s of grace before the box disappears, which matches the
+        // perceived "they're still here" window without leaving stale
+        // boxes around after they actually walk away.
+        constexpr int OVERLAY_CLEAR_MISSES = 12;
 
         ESP_LOGI(TAG, "ESP-WHO ready, feat_len=%d, entering scan loop", feat_len);
 
