@@ -762,6 +762,17 @@ namespace
         }
 
         // ----- Pass 3: apply with bilinear interpolation ----------
+        //
+        // OpenMV's CLAHE (which is Zuiderveld's textbook
+        // implementation) equalizes the LUMA channel only and
+        // reconstructs RGB from the equalized Y + the original U/V.
+        // We do the same idea more cheaply: compute Y for each pixel,
+        // bilinear-interp the LUT to get Y', then add `dY = Y' - Y`
+        // to each of R/G/B. Same luma shift on every channel keeps
+        // the chroma differences (R-G, G-B, R-B) identical to the
+        // input, so face skin tones don't drift the way they did
+        // under the previous per-channel CLAHE. Bonus: one bilinear
+        // interpolation per pixel instead of three.
         uint8_t *w8 = (uint8_t *)pixels;
         for (int y = 0; y < FRAME_DIM; ++y) {
             // Per-row vertical tile indices and Q8 fraction.
@@ -787,38 +798,50 @@ namespace
                 const uint8_t r5 = (uint8_t)(hi >> 3);
                 const uint8_t g6 = (uint8_t)(((hi & 0x07) << 3) | (lo >> 5));
                 const uint8_t b5 = (uint8_t)(lo & 0x1F);
-                const uint8_t r8e = (uint8_t)((r5 << 3) | (r5 >> 2));
-                const uint8_t g8e = (uint8_t)((g6 << 2) | (g6 >> 4));
-                const uint8_t b8e = (uint8_t)((b5 << 3) | (b5 >> 2));
+                const int r8e = (int)((r5 << 3) | (r5 >> 2));
+                const int g8e = (int)((g6 << 2) | (g6 >> 4));
+                const int b8e = (int)((b5 << 3) | (b5 >> 2));
 
-                // Cache the four neighbouring LUT bases for this
-                // pixel. The compiler should hoist these, but
-                // spelling them out keeps the per-channel `interp`
-                // below readable.
+                // Luma proxy: simple average. Faster than BT.601-
+                // weighted Y on this CPU (no multiplies) and the
+                // approximation costs nothing the detector cares
+                // about. The luma proxy used to BUILD the histogram
+                // (apply_clahe pass 1, line above) was G6 expanded
+                // to 8 bits, which is also approximate; the only
+                // requirement is that the proxy used to LOOK UP the
+                // LUT is consistent across this function.
+                const int y_in = (r8e + g8e + b8e + 1) / 3;
+
+                // Bilinear-interp the LUT for Y across the four
+                // surrounding tiles.
                 const uint8_t *l00 = lut[ty0 * CLAHE_N + tx0];
                 const uint8_t *l01 = lut[ty0 * CLAHE_N + tx1];
                 const uint8_t *l10 = lut[ty1 * CLAHE_N + tx0];
                 const uint8_t *l11 = lut[ty1 * CLAHE_N + tx1];
+                const int v00 = l00[y_in];
+                const int v01 = l01[y_in];
+                const int v10 = l10[y_in];
+                const int v11 = l11[y_in];
+                const int top = v00 * fx_inv + v01 * fx;
+                const int bot = v10 * fx_inv + v11 * fx;
+                const int y_out = (top * fy_inv + bot * fy) >> 16;
 
-                auto interp = [&](uint8_t v) -> uint8_t {
-                    const int v00 = l00[v];
-                    const int v01 = l01[v];
-                    const int v10 = l10[v];
-                    const int v11 = l11[v];
-                    // Q8 horizontal blend per row, then Q16 vertical
-                    // blend; final shift >> 16 takes us back to 8-bit.
-                    const int top = v00 * fx_inv + v01 * fx;
-                    const int bot = v10 * fx_inv + v11 * fx;
-                    const int tot = top * fy_inv + bot * fy;
-                    return (uint8_t)(tot >> 16);
-                };
-                const uint8_t nr8 = interp(r8e);
-                const uint8_t ng8 = interp(g8e);
-                const uint8_t nb8 = interp(b8e);
+                // Apply the luma delta to each channel; clip to
+                // 0..255. Same delta on every channel preserves
+                // chroma. Negative deltas are common in CLAHE (the
+                // brightest tile drags the bright end of its range
+                // down), so we genuinely need both saturation arms.
+                const int dy = y_out - y_in;
+                int nr = r8e + dy;
+                int ng = g8e + dy;
+                int nb = b8e + dy;
+                if (nr < 0) nr = 0; else if (nr > 255) nr = 255;
+                if (ng < 0) ng = 0; else if (ng > 255) ng = 255;
+                if (nb < 0) nb = 0; else if (nb > 255) nb = 255;
 
-                const uint8_t nr5 = (uint8_t)(nr8 >> 3);
-                const uint8_t ng6 = (uint8_t)(ng8 >> 2);
-                const uint8_t nb5 = (uint8_t)(nb8 >> 3);
+                const uint8_t nr5 = (uint8_t)(nr >> 3);
+                const uint8_t ng6 = (uint8_t)(ng >> 2);
+                const uint8_t nb5 = (uint8_t)(nb >> 3);
                 w8[idx]     = (uint8_t)((nr5 << 3) | (ng6 >> 3));
                 w8[idx + 1] = (uint8_t)((ng6 << 5) | nb5);
             }
