@@ -202,17 +202,35 @@ namespace
     portMUX_TYPE          g_overlay_mux = portMUX_INITIALIZER_UNLOCKED;
     face_overlay_t        g_overlay     = {};
 
-    // Known-face database. Each entry packages the L2-normalised
-    // embedding (used by the matcher), a downsampled RGB565 thumbnail
-    // cropped from the enrolment frame (served by the web UI), and a
-    // user-set name (likewise mutated through the web UI). The mutex
-    // gates every reader/writer; contention is rare (writers fire on
-    // enrolment, the matcher reads inside one critical section per
-    // detection, the HTTP handlers read on user demand) so a plain
-    // FreeRTOS mutex is plenty.
+    // Known-face database. Each entry packages a small *gallery* of
+    // L2-normalised embeddings (used by the matcher), a downsampled
+    // RGB565 thumbnail cropped from the enrolment frame (served by
+    // the web UI), and a user-set name (likewise mutated through the
+    // web UI). The mutex gates every reader/writer; contention is
+    // rare (writers fire on enrolment, the matcher reads inside one
+    // critical section per detection, the HTTP handlers read on user
+    // demand) so a plain FreeRTOS mutex is plenty.
+    //
+    // The embedding gallery (`feats`) starts with a single template
+    // captured at enrolment. Each subsequent confidently-matched
+    // detection that's pose-different from the existing templates
+    // gets appended (up to FACE_MAX_TEMPLATES), so a person enrolled
+    // looking straight at the camera gradually picks up off-angle /
+    // profile views without the user having to re-enrol. The auto-
+    // augment gate is tighter than the match gate by FACE_AUGMENT_MARGIN,
+    // so a marginal match never seeds the gallery -- the gallery only
+    // grows from matches that are unambiguous on the front-on
+    // template, which keeps false-match rate from creeping up.
+    constexpr size_t FACE_MAX_TEMPLATES   = 4;
+    constexpr float  FACE_AUGMENT_MARGIN  = 0.10f;  // above match_thr
+    constexpr float  FACE_AUGMENT_NOVEL   = 0.90f;  // template counts as new if best-existing-sim < this
     struct KnownFace
     {
-        std::vector<float>    feat;
+        // Gallery of L2-normalised embeddings. feats[0] is the
+        // enrolment template; feats[1..] are auto-augmented templates
+        // captured from high-confidence matches at different head
+        // poses. feat_len is invariant across the gallery.
+        std::vector<std::vector<float>> feats;
         std::vector<uint16_t> thumb;        // FACE_THUMB_DIM^2 RGB565BE pixels
         char                  name[FACE_NAME_MAX] = {0};
         uint32_t              enrolled_ms = 0;
@@ -2021,24 +2039,47 @@ namespace
             }
             const float *raw_feat = t->get_element_ptr<float>();
 
-            // Compare against every stored embedding. We hold the
-            // DB mutex for the duration so a concurrent rename from
-            // the web server can't tear the read; the loop is at most
-            // MAX_KNOWN_FACES * feat_len floats (~16 K FLOPs after
-            // SIMD), well under a millisecond of critical section.
+            // Compare against every stored embedding. Per face we
+            // take the MAX cosine similarity across its template
+            // gallery, so off-angle / profile templates can rescue a
+            // match that the front-on template alone would miss. We
+            // hold the DB mutex for the duration so a concurrent
+            // rename from the web server can't tear the read; the
+            // loop is at most MAX_KNOWN_FACES * FACE_MAX_TEMPLATES *
+            // feat_len floats (~64 K FLOPs after SIMD), well under a
+            // millisecond of critical section.
             float best_sim = -2.f;
-            int best_id = -1;
+            float best_template_sim = -2.f;  // best sim against the winning face's gallery
+            int   best_id = -1;
+            int   best_template_idx = -1;
+            float second_best_sim = -2.f;    // best sim against any OTHER face
             {
                 FaceDbLock lock;
                 for (size_t i = 0; i < g_known_faces.size(); ++i)
                 {
-                    const float s = cosine_sim(raw_feat,
-                                               g_known_faces[i].feat.data(),
-                                               feat_len);
-                    if (s > best_sim)
+                    float face_best = -2.f;
+                    int   face_best_t = -1;
+                    for (size_t t = 0; t < g_known_faces[i].feats.size(); ++t) {
+                        const float s = cosine_sim(raw_feat,
+                                                   g_known_faces[i].feats[t].data(),
+                                                   feat_len);
+                        if (s > face_best) {
+                            face_best   = s;
+                            face_best_t = (int)t;
+                        }
+                    }
+                    if (face_best > best_sim)
                     {
-                        best_sim = s;
-                        best_id = (int)i + 1; // 1-based for logging niceness
+                        // The previous winner becomes the runner-up.
+                        if (best_id > 0 && best_sim > second_best_sim) {
+                            second_best_sim = best_sim;
+                        }
+                        best_sim          = face_best;
+                        best_template_sim = face_best;
+                        best_template_idx = face_best_t;
+                        best_id           = (int)i + 1; // 1-based for logging niceness
+                    } else if (face_best > second_best_sim) {
+                        second_best_sim = face_best;
                     }
                 }
             }
@@ -2050,8 +2091,49 @@ namespace
                 // the only on-screen event is a brand-new face.
                 ++s_recognised;
                 unknown_streak = 0;
-                ESP_LOGI(TAG, "known face: id=%d sim=%.3f focus=%d orient=%d",
-                         best_id, (double)best_sim, focus, (int)locked_orient);
+                ESP_LOGI(TAG,
+                         "known face: id=%d sim=%.3f (t=%d, 2nd=%.3f) focus=%d orient=%d",
+                         best_id, (double)best_sim, best_template_idx,
+                         (double)second_best_sim, focus, (int)locked_orient);
+
+                // Auto-augment the gallery for this face when the
+                // match is *comfortably* above the threshold (so we
+                // know it's the same person) AND no other enrolled
+                // face came within FACE_AUGMENT_MARGIN of the winner
+                // (so we can't be appending a template from someone
+                // who happens to look similar to two people). The
+                // new embedding must also be meaningfully different
+                // from every existing template in this face's
+                // gallery (best_template_sim < FACE_AUGMENT_NOVEL),
+                // otherwise it's a near-duplicate that just wastes
+                // gallery slots and matcher cycles. The augment gate
+                // is intentionally *tighter* than the match gate;
+                // weakening recognition for off-angle faces happens
+                // exclusively through more templates, never through
+                // a lower match floor.
+                const float augment_floor = g_tuning.match_thr +
+                                            FACE_AUGMENT_MARGIN;
+                const bool augment_ok =
+                    best_sim          >= augment_floor &&
+                    best_template_sim <  FACE_AUGMENT_NOVEL &&
+                    second_best_sim   <  best_sim - FACE_AUGMENT_MARGIN;
+                if (augment_ok)
+                {
+                    FaceDbLock lock;
+                    const size_t idx = (size_t)(best_id - 1);
+                    if (idx < g_known_faces.size() &&
+                        g_known_faces[idx].feats.size() < FACE_MAX_TEMPLATES)
+                    {
+                        g_known_faces[idx].feats.emplace_back(
+                            raw_feat, raw_feat + feat_len);
+                        ESP_LOGI(TAG,
+                                 "gallery+: id=%d now has %u templates (added sim=%.3f, novel=%.3f)",
+                                 best_id,
+                                 (unsigned)g_known_faces[idx].feats.size(),
+                                 (double)best_sim,
+                                 (double)best_template_sim);
+                    }
+                }
 
                 // Cache this hit so the next few frames at roughly
                 // the same bbox can skip the embedder pass.
@@ -2103,7 +2185,7 @@ namespace
                     hit_cap = true;
                 } else {
                     KnownFace entry;
-                    entry.feat.assign(raw_feat, raw_feat + feat_len);
+                    entry.feats.emplace_back(raw_feat, raw_feat + feat_len);
                     crop_face_thumb(src, biggest, locked_orient, &entry.thumb);
                     entry.name[0]    = '\0';
                     entry.enrolled_ms = now_ms();
