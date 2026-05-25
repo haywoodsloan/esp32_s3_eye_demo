@@ -621,37 +621,88 @@ namespace
         }
     }
 
-    // Faces are roughly symmetric top-to-bottom (forehead/chin both
-    // rounded; eyes can be confused for nostrils under motion blur or
-    // poor lighting), and ESP-WHO's detector occasionally fires on an
-    // upside-down face even though it's only trained on upright ones.
-    // When that false-positive happens during orientation cycling we
-    // lock onto the wrong Orient, head_roll_for() un-rotates the
-    // keypoints under the wrong assumption, and the banner ends up
-    // rendered 180 deg flipped.
+    // Reject detections whose keypoint geometry doesn't match an
+    // upright face in the DETECTOR INPUT frame. The primary failure
+    // mode this guards against is the detector firing on an upside-
+    // down face (faces have rough top/bottom symmetry: forehead vs
+    // chin, eye sockets vs nostrils). The previous "nose below
+    // eye-midline" check wasn't enough because when the detector
+    // does fire on a flipped face it labels keypoints CORRECTLY for
+    // what it sees, which means the nose lands above the eye
+    // midline in detector coords and the check is supposed to fail
+    // -- but a near-coincident keypoint set can still pass it by a
+    // single pixel.
     //
-    // Reject those false positives by checking keypoint geometry IN THE
-    // DETECTOR INPUT FRAME (no un-rotation). A genuine upright detection
-    // must have the nose below the eye midpoint, with a margin that's a
-    // fraction of the inter-eye distance so noise on a near-frontal face
-    // doesn't kick us out. If the test fails the caller treats the
-    // detection as a miss and continues cycling orientations until the
-    // real upright is found.
+    // Three independent properties must all hold for an upright
+    // face. An upside-down or sideways detection can't fake all
+    // three simultaneously, even with worst-case keypoint noise.
+    //
+    //   1. Eyes must be more horizontal than vertical, with a
+    //      non-trivial separation. Rejects sideways faces and
+    //      degenerate "all keypoints at the centre" results.
+    //   2. Nose y must be at least eye_dx / 8 below the eye
+    //      midline. A flipped face has the nose-keypoint above the
+    //      eye midline (nose_drop < 0) and an ambiguous near-zero
+    //      drop is also rejected by the explicit margin.
+    //   3. When mouth keypoints are present (always, for MNP) the
+    //      mouth midline must be below the nose. Catches the rare
+    //      cases where the detector mis-labels enough points to
+    //      slip past (2) but the mouth-vs-nose ordering still
+    //      reveals the flip.
     bool keypoints_look_upright(const dl::detect::result_t *det)
     {
-        if (!det || det->keypoint.size() < 6)
-        {
+        if (!det || det->keypoint.size() < 6) {
             // No keypoints to validate — trust the bbox.
             return true;
         }
+
+        const int e0x = det->keypoint[0];
         const int e0y = det->keypoint[1];
+        const int e1x = det->keypoint[2];
         const int e1y = det->keypoint[3];
         const int ny  = det->keypoint[5];
-        // In the detector's input frame (y-down), a genuine upright face
-        // must have the nose below the eye midpoint. >0 is sufficient
-        // because the detector itself rejects sideways-by-90 faces; we
-        // only need to catch the ~180 deg false-positive case here.
-        return ny > (e0y + e1y) / 2;
+
+        const int eye_mid_y = (e0y + e1y) / 2;
+        const int eye_dx    = std::abs(e1x - e0x);
+        const int eye_dy    = std::abs(e1y - e0y);
+
+        // (1a) Inter-eye distance must be plausible. Faces below
+        // MIN_FACE_PX get rejected downstream regardless, so the
+        // minimum here is just a degenerate-keypoint guard.
+        if (eye_dx < 4) {
+            return false;
+        }
+        // (1b) Eyes more horizontal than vertical. Allows tilts up
+        // to ~45 deg from horizontal, which is what the orient cycle
+        // is designed to leave on the table.
+        if (eye_dx <= eye_dy) {
+            return false;
+        }
+
+        // (2) Nose strictly below the eye midline by a margin
+        // proportional to inter-eye distance. nose_drop < 0 is the
+        // textbook upside-down case; the >= eye_dx/8 margin also
+        // rejects near-coincident keypoint sets where a single
+        // pixel of noise would flip the sign.
+        const int nose_drop = ny - eye_mid_y;
+        if (nose_drop * 8 < eye_dx) {
+            return false;
+        }
+
+        // (3) Mouth-below-nose. Only checked when the MNP gave us
+        // the full 5-keypoint set (it always does, but stay
+        // defensive). Catches detector mis-labels that happen to
+        // satisfy (2) but get the mouth wrong.
+        if (det->keypoint.size() >= 10) {
+            const int lmy        = det->keypoint[7];
+            const int rmy        = det->keypoint[9];
+            const int mouth_mid_y = (lmy + rmy) / 2;
+            if (mouth_mid_y <= ny) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     // IoU between two integer axis-aligned bboxes, returned as a
