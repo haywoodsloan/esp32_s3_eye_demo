@@ -1705,10 +1705,25 @@ namespace
             // window we accept that the face has actually left and
             // cycle orients at the cheap primary-pass rate until
             // someone re-appears.
+            // Two windows the padded retry is allowed in:
+            //   * "sticky lock" -- consecutive_misses < OVERLAY_CLEAR_MISSES,
+            //     i.e. the HUD still shows the face as present and we
+            //     want to recover the frame the primary skipped.
+            //   * "ROT_0 cold start" -- there's no prior lock at all
+            //     but we're on the upright orient. This is the case a
+            //     user who walks up to the device already in close
+            //     range hits: the orient cycle would otherwise spin
+            //     forever because the primary pass can never lock on
+            //     a face-fills-frame close-up at any of the four
+            //     orients, and without a lock the sticky window stays
+            //     closed. Adding the ROT_0 retry costs ~80 ms once
+            //     per orient cycle (~every fourth idle frame) and
+            //     gives close-range first-contact a way in.
             const bool padded_eligible =
                 padded_scratch &&
                 fb->width == FRAME_DIM && fb->height == FRAME_DIM &&
-                consecutive_misses < OVERLAY_CLEAR_MISSES;
+                (consecutive_misses < OVERLAY_CLEAR_MISSES ||
+                 try_orient == Orient::ROT_0);
             if (!biggest && padded_eligible)
             {
                 shrink_into_padded(to_detect, padded_scratch);
