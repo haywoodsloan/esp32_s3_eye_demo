@@ -200,26 +200,21 @@ namespace
     int focus_metric(const uint16_t *__restrict__ rgb565, int img_w, int img_h,
                      int x0, int y0, int x1, int y1) noexcept
     {
-        if (x0 < 1)
-            x0 = 1;
-        if (y0 < 1)
-            y0 = 1;
-        if (x1 > img_w - 2)
-            x1 = img_w - 2;
-        if (y1 > img_h - 2)
-            y1 = img_h - 2;
-        if (x1 - x0 < 8 || y1 - y0 < 8)
+        x0 = std::clamp(x0, 1, img_w - 2);
+        y0 = std::clamp(y0, 1, img_h - 2);
+        x1 = std::clamp(x1, 1, img_w - 2);
+        y1 = std::clamp(y1, 1, img_h - 2);
+        if (x1 - x0 < 8 || y1 - y0 < 8) {
             return 0;
+        }
 
-        int n = 0;
+        int n   = 0;
         int sum = 0;
-        for (int y = y0; y < y1; y += 3)
-        {
+        for (int y = y0; y < y1; y += 3) {
             const uint16_t *row = rgb565 + y * img_w;
-            for (int x = x0; x < x1 - 1; x += 3)
-            {
-                const int g = (row[x] >> 8) & 0xFF;
-                const int gx = (row[x + 1] >> 8) & 0xFF;
+            for (int x = x0; x < x1 - 1; x += 3) {
+                const int g  = (row[x]         >> 8) & 0xFF;
+                const int gx = (row[x + 1]     >> 8) & 0xFF;
                 const int gy = (row[x + img_w] >> 8) & 0xFF;
                 sum += std::abs(g - gx) + std::abs(g - gy);
                 ++n;
@@ -870,12 +865,9 @@ namespace
                 // 0..255. Same delta on every channel preserves
                 // chroma.
                 const int dy = y_out - y_in;
-                int nr = r8e + dy;
-                int ng = g8e + dy;
-                int nb = b8e + dy;
-                if (nr < 0) nr = 0; else if (nr > 255) nr = 255;
-                if (ng < 0) ng = 0; else if (ng > 255) ng = 255;
-                if (nb < 0) nb = 0; else if (nb > 255) nb = 255;
+                const int nr = std::clamp(r8e + dy, 0, 255);
+                const int ng = std::clamp(g8e + dy, 0, 255);
+                const int nb = std::clamp(b8e + dy, 0, 255);
 
                 const uint8_t nr5 = (uint8_t)(nr >> 3);
                 const uint8_t ng6 = (uint8_t)(ng >> 2);
@@ -968,27 +960,28 @@ namespace
 
     void shrink_into_padded(const uint16_t *src, uint16_t *dst) noexcept
     {
-        // RGB565BE for mid-grey: R5=15, G6=31, B5=15 -> 0x7BEF native,
-        // bytes swap to 0xEF7B. Fill 32 bits at a time (two pixels per
-        // write) -- on a word-aligned PSRAM buffer this is roughly
-        // 2x the throughput of the per-pixel store. FRAME_DIM*FRAME_DIM
-        // is 57600 which is even, so we never write past the end.
-        const uint16_t grey_be = (uint16_t)(((0x7BEFu >> 8) & 0xFF) |
-                                            ((0x7BEFu & 0xFF) << 8));
-        const uint32_t grey_be_pair =
-            ((uint32_t)grey_be << 16) | (uint32_t)grey_be;
-        const size_t total_pairs = (size_t)FRAME_DIM * FRAME_DIM / 2;
+        // RGB565 mid-grey (R5=15, G6=31, B5=15 -> 0x7BEF) byte-swapped
+        // for BE storage. Fill 32 bits at a time (two pixels per write)
+        // -- on a word-aligned PSRAM buffer this is meaningfully
+        // faster than a per-pixel store. FRAME_DIM * FRAME_DIM = 57600
+        // is even, so we never write past the end.
+        constexpr uint16_t grey_native   = 0x7BEFu;
+        constexpr uint16_t grey_be       = __builtin_bswap16(grey_native);
+        constexpr uint32_t grey_be_pair  = (uint32_t{grey_be} << 16) | grey_be;
+        constexpr size_t   total_pairs   = size_t{FRAME_DIM} * FRAME_DIM / 2;
+
         uint32_t *dst32 = reinterpret_cast<uint32_t *>(dst);
         for (size_t i = 0; i < total_pairs; ++i) {
             dst32[i] = grey_be_pair;
         }
+
         // Nearest-neighbour resample src (FRAME_DIM x FRAME_DIM) into
         // the centred INNER x INNER region.
         for (int y = 0; y < PADDED_INNER; ++y) {
-            const int sy = (y * FRAME_DIM) / PADDED_INNER;
-            const uint16_t *srow = src + (size_t)sy * FRAME_DIM;
+            const int       sy   = (y * FRAME_DIM) / PADDED_INNER;
+            const uint16_t *srow = src + static_cast<size_t>(sy) * FRAME_DIM;
             uint16_t       *drow = dst +
-                (size_t)(PADDED_BORDER + y) * FRAME_DIM + PADDED_BORDER;
+                static_cast<size_t>(PADDED_BORDER + y) * FRAME_DIM + PADDED_BORDER;
             for (int x = 0; x < PADDED_INNER; ++x) {
                 const int sx = (x * FRAME_DIM) / PADDED_INNER;
                 drow[x] = srow[sx];
@@ -1004,10 +997,7 @@ namespace
         // Clip to inner box (gray border can't legitimately host
         // detections, but the postprocessor's NMS sometimes spits out
         // boxes that slightly overhang the grey).
-        if (v < PADDED_BORDER) v = PADDED_BORDER;
-        if (v > PADDED_BORDER + PADDED_INNER - 1) {
-            v = PADDED_BORDER + PADDED_INNER - 1;
-        }
+        v = std::clamp(v, PADDED_BORDER, PADDED_BORDER + PADDED_INNER - 1);
         return ((v - PADDED_BORDER) * FRAME_DIM) / PADDED_INNER;
     }
 
