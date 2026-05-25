@@ -205,6 +205,16 @@ namespace
     std::vector<KnownFace> g_known_faces;
     SemaphoreHandle_t      g_db_mux = nullptr;
 
+    // Cross-task signal: when set, the face_ai task clears its local
+    // recognition cache on the next loop iteration. Raised by
+    // face_db_delete() so a freshly-deleted face can't keep
+    // "matching" via the AI task's cached bbox/id pair (whose
+    // matched_id is now either dangling or, after the vector erase,
+    // pointing at a different face). Single-writer / single-reader
+    // (web-server task writes, AI task reads-and-clears) so a plain
+    // bool atomic is fine.
+    std::atomic<bool> g_recog_cache_invalidate{false};
+
     // RAII scope guard for g_db_mux. Acquires on construction, releases
     // on destruction; non-copyable / non-movable so we can't accidentally
     // hand out a lock. Every critical section against the face DB --
@@ -1619,6 +1629,20 @@ namespace
             // enrolment will simply refresh the overlay's deadline /
             // angle.
 
+            // Cross-task cache invalidation: if face_db_delete() ran
+            // since our last iteration, our recog_cache (and the
+            // name-banner cache) may be pointing at the wrong row in
+            // g_known_faces. Clear them; the next successful match
+            // will rebuild both from scratch. acquire-ordered exchange
+            // pairs with the release store in face_db_delete().
+            if (g_recog_cache_invalidate.exchange(false,
+                    std::memory_order_acquire)) {
+                recog_cache.valid        = false;
+                recog_cache.matched_id   = 0;
+                name_banner_cache.name[0] = '\0';
+                name_banner_cache.angle_bucket = -999;
+            }
+
             camera_fb_t *fb = esp_camera_fb_get();
             if (!fb)
             {
@@ -2192,5 +2216,24 @@ bool face_db_set_name(int idx, const char *name)
     auto &kf = g_known_faces[idx];
     std::strncpy(kf.name, name, FACE_NAME_MAX - 1);
     kf.name[FACE_NAME_MAX - 1] = '\0';
+    return true;
+}
+
+bool face_db_delete(int idx)
+{
+    if (!g_db_mux) {
+        return false;
+    }
+    {
+        FaceDbLock lock;
+        if (idx < 0 || idx >= static_cast<int>(g_known_faces.size())) {
+            return false;
+        }
+        g_known_faces.erase(g_known_faces.begin() + idx);
+    }
+    // Released the DB lock before raising the cache-invalidation flag;
+    // the AI task picks it up on its next loop iteration. release
+    // ordering pairs with the acquire exchange on the reader side.
+    g_recog_cache_invalidate.store(true, std::memory_order_release);
     return true;
 }

@@ -43,6 +43,13 @@
     font: inherit;
   }
   button:hover { background: #3a88ff; }
+  button.delete {
+    background: #b03030; flex: 1; margin-top: 6px;
+  }
+  button.delete:hover { background: #d04040; }
+  button:disabled {
+    background: #444; color: #999; cursor: default;
+  }
   .empty { color: #888; padding: 32px; text-align: center; }
 </style>
 </head>
@@ -90,11 +97,16 @@ async function load() {
         + '<div class="row">'
         +   '<input type="text" placeholder="name" value="'
         +     (f.name || '').replace(/"/g, '&quot;') + '">'
-        +   '<button>Save</button>'
+        +   '<button class="save">Save</button>'
+        + '</div>'
+        + '<div class="row">'
+        +   '<button class="delete">Delete</button>'
         + '</div>';
-      const input = card.querySelector('input');
-      const meta  = card.querySelector('.meta');
-      card.querySelector('button').onclick = async () => {
+      const input    = card.querySelector('input');
+      const meta     = card.querySelector('.meta');
+      const saveBtn  = card.querySelector('button.save');
+      const deleteBtn = card.querySelector('button.delete');
+      saveBtn.onclick = async () => {
         await fetch('/api/face/' + f.id + '/name', {
           method: 'POST',
           headers: { 'Content-Type': 'text/plain' },
@@ -106,8 +118,28 @@ async function load() {
         meta.textContent = displayName(f);
         load();
       };
+      deleteBtn.onclick = async () => {
+        const label = displayName(f);
+        if (!confirm('Delete ' + label + '? This cannot be undone.')) return;
+        // Disable the buttons so a slow network can't fire double-deletes.
+        saveBtn.disabled = true;
+        deleteBtn.disabled = true;
+        try {
+          const r = await fetch('/api/face/' + f.id, { method: 'DELETE' });
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          // Force a fresh card layout on the next poll -- after delete
+          // every subsequent face's id has shifted down, so we can't
+          // safely reuse any of the existing DOM cards.
+          lastCount = -1;
+          load();
+        } catch (err) {
+          alert('Delete failed: ' + err);
+          saveBtn.disabled = false;
+          deleteBtn.disabled = false;
+        }
+      };
       input.addEventListener('keydown', e => {
-        if (e.key === 'Enter') card.querySelector('button').click();
+        if (e.key === 'Enter') saveBtn.click();
       });
       grid.appendChild(card);
     }

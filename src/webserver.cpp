@@ -273,6 +273,23 @@ static esp_err_t handle_face_name(httpd_req_t *req)
     return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
 }
 
+// DELETE /api/face/<id> -- remove a face from the in-memory DB.
+// face_db_delete() shifts subsequent entries down by one, so any
+// browser cards holding the old index need to refresh via /api/faces
+// after this returns. The web UI does that via load() on success.
+static esp_err_t handle_face_delete(httpd_req_t *req)
+{
+    const int id = parse_face_id(req->uri);
+    if (id < 0) {
+        return httpd_resp_send_404(req);
+    }
+    if (!face_db_delete(id)) {
+        return httpd_resp_send_404(req);
+    }
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
 // --- public entrypoint ----------------------------------------------
 
 esp_err_t webserver_init(void)
@@ -318,8 +335,9 @@ esp_err_t webserver_init(void)
         .user_ctx = nullptr,
     };
     // Both /thumb and /name share the /api/face/* prefix. We register
-    // a GET handler that serves the thumbnail and a POST handler that
-    // updates the name; the wildcard matcher dispatches by method.
+    // a GET handler that serves the thumbnail, a POST handler that
+    // updates the name, and a DELETE handler that removes the entry;
+    // the wildcard matcher dispatches by method.
     const httpd_uri_t uri_face_get = {
         .uri      = "/api/face/*",
         .method   = HTTP_GET,
@@ -332,6 +350,12 @@ esp_err_t webserver_init(void)
         .handler  = handle_face_name,
         .user_ctx = nullptr,
     };
+    const httpd_uri_t uri_face_delete = {
+        .uri      = "/api/face/*",
+        .method   = HTTP_DELETE,
+        .handler  = handle_face_delete,
+        .user_ctx = nullptr,
+    };
 
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_server, &uri_root),
                         TAG, "register /");
@@ -341,6 +365,8 @@ esp_err_t webserver_init(void)
                         TAG, "register GET /api/face/*");
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_server, &uri_face_post),
                         TAG, "register POST /api/face/*");
+    ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_server, &uri_face_delete),
+                        TAG, "register DELETE /api/face/*");
 
     ESP_LOGI(TAG, "HTTP server up on port %u", (unsigned)cfg.server_port);
     return ESP_OK;

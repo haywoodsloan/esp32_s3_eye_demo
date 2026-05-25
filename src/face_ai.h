@@ -80,3 +80,11 @@ bool face_db_copy_thumb(int idx, uint16_t *dst,
 // at most FACE_NAME_MAX-1 chars are stored (truncated, NUL-terminated).
 // Returns false if `idx` is out of range. Thread-safe.
 bool face_db_set_name(int idx, const char *name);
+
+// Remove face `idx` from the in-memory database. Subsequent entries
+// shift down by one position, so any externally-held index past this
+// one is now stale. Returns false if `idx` is out of range. Also
+// invalidates the AI task's internal recognition cache so a freshly-
+// deleted face can't continue to "match" via stale bbox-IoU. Thread-
+// safe.
+bool face_db_delete(int idx);
