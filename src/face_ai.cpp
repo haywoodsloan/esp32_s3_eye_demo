@@ -852,6 +852,94 @@ namespace
             lut_initialised = true;
         }
 
+        // ---------------------------------------------------------------
+        // Adaptive gamma (auto-tone) -- fused into the RGB565->RGB888
+        // byte expansion below as three tiny LUTs (32 + 64 + 32 entries
+        // = 128 bytes), so it costs nothing extra in the hot loop and
+        // composes cleanly in front of the existing per-tile CLAHE.
+        //
+        // Rationale -- why a global tone curve in addition to CLAHE:
+        //
+        // CLAHE is a *local* contrast equaliser; it does nothing to the
+        // *global* midpoint of the image. When the sensor's AE under-
+        // exposes (lamp-lit room, mean luma drifting to ~70) or over-
+        // exposes (subject in front of a window, mean ~200) CLAHE
+        // still has to work against a midtone that's far from the
+        // detector's training distribution.
+        //
+        // A power-law gamma curve is the cheapest way to retarget the
+        // global midpoint to 128. We solve gamma so that
+        //
+        //     255 * (prev_mean/255)^gamma == 128
+        //
+        // which gives gamma = log(128/255) / log(prev_mean/255).
+        // For prev_mean = 70 this is gamma ~= 0.53 (brightens shadows);
+        // for prev_mean = 200 it's gamma ~= 2.86 (compresses highlights).
+        // We clamp to [0.55, 1.7] so we never apply a transform so
+        // extreme that the sensor's noise gets amplified beyond what
+        // the detector tolerates -- this clamp range is empirically
+        // similar to what's used in Tan & Triggs' face-recognition
+        // preprocessing (2007), where gamma=0.5 is recommended as the
+        // first stage of their illumination-normalisation pipeline.
+        //
+        // The LUT is folded INTO the RGB565->RGB888 byte expansion the
+        // CLAHE loop already does for each pixel, so the inner-loop
+        // cost change is "three LUT loads vs three shift+OR pairs":
+        // a wash on the S3, and the LUTs are small enough to stay hot
+        // in I/D cache for the full frame.
+        //
+        // Refs:
+        //  - Tan, X. & Triggs, B., "Enhanced Local Texture Feature Sets
+        //    for Face Recognition Under Difficult Lighting Conditions",
+        //    IEEE TIP 2010 (gamma -> DoG -> contrast eq.).
+        //  - Huang, S.-C. et al., "Efficient Contrast Enhancement Using
+        //    Adaptive Gamma Correction With Weighting Distribution",
+        //    IEEE TIP 2013 (auto-gamma from histogram CDF).
+        //  - Pizer, S. et al., "Adaptive Histogram Equalization and Its
+        //    Variations", CVGIP 1987 (CLAHE itself).
+        static uint8_t gamma_r5[32];
+        static uint8_t gamma_g6[64];
+        static uint8_t gamma_b5[32];
+        static float   last_gamma = 0.f;
+        {
+            const int prev_mean = g_last_mean_luma.load(std::memory_order_relaxed);
+            constexpr int   GAMMA_TARGET = 128;
+            constexpr float GAMMA_MIN    = 0.55f;
+            constexpr float GAMMA_MAX    = 1.70f;
+            float target_gamma = 1.0f;
+            if (prev_mean >= 10 && prev_mean <= 245 &&
+                prev_mean != GAMMA_TARGET)
+            {
+                const float num = std::log(GAMMA_TARGET / 255.0f);
+                const float den = std::log(prev_mean / 255.0f);
+                target_gamma = std::clamp(num / den, GAMMA_MIN, GAMMA_MAX);
+            }
+            // Rebuild only on meaningful drift -- powf is ~ 100 ns per
+            // call on the S3 FPU, and rebuilding 128 entries every
+            // frame would burn ~ 13 us per frame for no visible benefit.
+            if (last_gamma == 0.f ||
+                std::fabs(target_gamma - last_gamma) > 0.04f)
+            {
+                last_gamma = target_gamma;
+                const float inv_255 = 1.0f / 255.0f;
+                for (int i = 0; i < 32; ++i) {
+                    const int   v8 = (i << 3) | (i >> 2);
+                    const float g  = std::pow(v8 * inv_255, target_gamma);
+                    const int   out = std::clamp(
+                        static_cast<int>(g * 255.0f + 0.5f), 0, 255);
+                    gamma_r5[i] = static_cast<uint8_t>(out);
+                    gamma_b5[i] = static_cast<uint8_t>(out);
+                }
+                for (int i = 0; i < 64; ++i) {
+                    const int   v8 = (i << 2) | (i >> 4);
+                    const float g  = std::pow(v8 * inv_255, target_gamma);
+                    const int   out = std::clamp(
+                        static_cast<int>(g * 255.0f + 0.5f), 0, 255);
+                    gamma_g6[i] = static_cast<uint8_t>(out);
+                }
+            }
+        }
+
         dsps_memset_aes3(hist, 0, sizeof(hist));
 
         // ----- Fused pass: apply prev-frame LUT + build this-frame hist -----
@@ -917,9 +1005,12 @@ namespace
                 const uint8_t r5 = static_cast<uint8_t>(hi >> 3);
                 const uint8_t g6 = static_cast<uint8_t>(((hi & 0x07) << 3) | (lo >> 5));
                 const uint8_t b5 = static_cast<uint8_t>(lo & 0x1F);
-                const int r8e = static_cast<int>((r5 << 3) | (r5 >> 2));
-                const int g8e = static_cast<int>((g6 << 2) | (g6 >> 4));
-                const int b8e = static_cast<int>((b5 << 3) | (b5 >> 2));
+                // RGB565 -> RGB888 expansion *with* the adaptive
+                // gamma curve folded in (gamma=1 collapses to the
+                // canonical (v<<3)|(v>>2) / (v<<2)|(v>>4) bit-spread).
+                const int r8e = gamma_r5[r5];
+                const int g8e = gamma_g6[g6];
+                const int b8e = gamma_b5[b5];
 
                 // Luma proxy: G6 expanded to 8 bits. Used both as the
                 // histogram bin index (this-frame stats) and the LUT
