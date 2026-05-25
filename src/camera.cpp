@@ -52,50 +52,18 @@ esp_err_t camera_init(void)
         s->set_hmirror(s, 0);
         s->set_vflip(s, 1);
 
-        // Low-light tuning for the OV2640. The defaults are tuned for
-        // outdoor / well-lit scenes and produce dim, low-contrast
-        // frames indoors that defeat the face detector. Every knob
-        // below either widens the AE / AGC range the sensor can use,
-        // or biases what's left for the detector's benefit. We
-        // deliberately do not touch any of the app-level "is this a
-        // real face" gates (MIN_DETECT_SCORE, keypoints_look_upright,
-        // MIN_SHARPNESS); the goal here is better INPUT, not a more
-        // permissive classifier, so the false-positive surface
-        // doesn't grow.
-        //
-        //   gainceiling 128x ceiling-the-stack analogue gain. CLAHE +
-        //                    the keypoint-geometry check downstream
-        //                    will clean up the noise; we'd rather
-        //                    have a noisy face the detector can find
-        //                    than a quiet black frame it can't.
-        //   aec2 off         the OV2640's alternate AE algorithm
-        //                    biases for highlight retention, which
-        //                    leaves faces under-exposed in dim
-        //                    rooms. The default AEC1 exposes a stop
-        //                    or so brighter in those conditions,
-        //                    which is what we actually want for
-        //                    face detection.
-        //   ae_level +2      maximum AE-target bias. Daytime scenes
-        //                    clip a bit; indoor / dim scenes get
-        //                    the boost they need.
-        //   brightness +2    maximum post-AE additive offset; opens
-        //                    the shadows that AE alone leaves crushed.
-        //   contrast +1      slight S-curve so CLAHE downstream has
-        //                    wider material to work with on truly
-        //                    flat low-light frames.
-        //   lenc on          lens shading correction. The OV2640 +
-        //                    S3-EYE lens darkens noticeably near
-        //                    the corners, exactly where the user's
-        //                    face often ends up at close range.
-        //   whitebal on +    explicit AWB-on. Defensive: a recent
-        //   awb_gain on      sensor firmware bug had AWB off after
-        //                    boot on some boards, which gave faces
-        //                    a strong colour cast that hurt the
-        //                    detector.
-        s->set_gainceiling(s, GAINCEILING_128X);
+        // Initial tuning is the MID preset of the adaptive AE bias
+        // that face_ai.cpp drives at runtime. We start conservative
+        // so the first second after boot can't over-expose a bright
+        // scene before adaptation has any data; the face_ai task
+        // then moves us toward DIM or BRIGHT once it has measured
+        // the actual scene luma over a few frames. See the comment
+        // block over apply_ae_preset() in face_ai.cpp for which
+        // sensor knobs each preset controls.
+        s->set_gainceiling(s, GAINCEILING_32X);
         s->set_aec2(s, 0);
-        s->set_ae_level(s, 2);
-        s->set_brightness(s, 2);
+        s->set_ae_level(s, 1);
+        s->set_brightness(s, 1);
         s->set_contrast(s, 1);
         s->set_lenc(s, 1);
         s->set_whitebal(s, 1);

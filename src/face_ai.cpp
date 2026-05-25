@@ -437,6 +437,81 @@ namespace
     constexpr int CLAHE_TILE_PX  = CLAHE_TILE_SZ * CLAHE_TILE_SZ;  // 3600
     constexpr int CLAHE_CLIP_LIM = CLAHE_TILE_PX * 5 / 100;    // 180
 
+    // Latest 0..255 mean luma of the detector input, written by
+    // apply_clahe() (the histogram pass it does covers every pixel,
+    // so the mean is essentially free to compute). Read by the AI
+    // loop's adaptive-AE check; relaxed ordering is fine because
+    // both writer and reader are on the same task, and the only
+    // cross-task reader (web UI heartbeat in the future) tolerates
+    // a stale value.
+    std::atomic<int> g_last_mean_luma{128};
+
+    // ---------------------------------------------------------------
+    // Adaptive AE bias
+    // ---------------------------------------------------------------
+    //
+    // The sensor settings we apply at boot are tuned MID -- moderate
+    // bias toward brightness, suitable for typical indoor light.
+    // From there the AI loop measures the scene's mean luma once
+    // every AE_CHECK_INTERVAL_MS and shifts the sensor toward DIM
+    // (more boost) or BRIGHT (less boost) as needed. Three discrete
+    // presets instead of a continuous mapping because each preset
+    // change costs a few SCCB writes plus 100-200 ms of AE settle,
+    // so we'd rather pick one of three good answers than chase a
+    // moving target.
+    //
+    // Hysteresis bands are intentionally asymmetric: the threshold
+    // to MOVE INTO a preset is further from the centre than the
+    // threshold to LEAVE it, so a scene hovering at a boundary
+    // doesn't flap between presets every AE check.
+
+    enum class AEPreset { DIM, MID, BRIGHT };
+
+    constexpr int      AE_CHECK_INTERVAL_MS = 3000;   // min seconds between transitions
+    // Up-transitions (scene got brighter than current preset assumes):
+    constexpr int      AE_DIM_TO_MID_LUMA   = 120;
+    constexpr int      AE_MID_TO_BRIGHT_LUMA = 185;
+    // Down-transitions (scene got dimmer than current preset assumes):
+    constexpr int      AE_BRIGHT_TO_MID_LUMA = 150;
+    constexpr int      AE_MID_TO_DIM_LUMA    = 85;
+
+    // Push the named preset to the OV2640. Idempotent at the SCCB
+    // level: re-applying the same preset is a no-op as far as the
+    // sensor is concerned, so the caller doesn't need to track
+    // whether anything actually changed.
+    void apply_ae_preset(AEPreset p)
+    {
+        sensor_t *s = esp_camera_sensor_get();
+        if (!s) {
+            return;
+        }
+        switch (p) {
+        case AEPreset::DIM:
+            // Maximum bias toward brightness for genuinely dim
+            // indoor scenes / night-time. Highlights may clip; we
+            // pay that cost for the face being detectable at all.
+            s->set_gainceiling(s, GAINCEILING_128X);
+            s->set_ae_level(s, 2);
+            s->set_brightness(s, 2);
+            break;
+        case AEPreset::MID:
+            // Moderate bias -- the boot default. Typical indoor
+            // lighting with room ambient ~200-500 lux.
+            s->set_gainceiling(s, GAINCEILING_32X);
+            s->set_ae_level(s, 1);
+            s->set_brightness(s, 1);
+            break;
+        case AEPreset::BRIGHT:
+            // Neutral exposure with low gain headroom. Daylight /
+            // strongly-lit indoor. Highlight retention matters more
+            // here than shadow lift.
+            s->set_gainceiling(s, GAINCEILING_4X);
+            s->set_ae_level(s, 0);
+            s->set_brightness(s, 0);
+            break;
+        }
+    }
+
     void apply_clahe(uint16_t *pixels) noexcept
     {
         // hist[t] : per-tile 256-bin luma histogram (uint16 is plenty
@@ -493,6 +568,24 @@ namespace
                 const uint8_t y8 = (uint8_t)((g6 << 2) | (g6 >> 4));
                 ++hist[ty * CLAHE_N + tx][y8];
             }
+        }
+
+        // Frame-mean luma, derived for free from the histograms we
+        // just built. The face_ai loop reads it to drive the
+        // adaptive AE preset switch -- see apply_ae_preset() below.
+        // Computed BEFORE the clip-limit pass scrambles the bin
+        // counts; the redistributed histogram is no longer the
+        // scene's actual luma distribution.
+        {
+            uint32_t total_sum = 0;
+            for (int t = 0; t < CLAHE_N * CLAHE_N; ++t) {
+                for (int v = 0; v < 256; ++v) {
+                    total_sum += (uint32_t)hist[t][v] * (uint32_t)v;
+                }
+            }
+            g_last_mean_luma.store(
+                (int)(total_sum / ((uint32_t)FRAME_DIM * FRAME_DIM)),
+                std::memory_order_relaxed);
         }
 
         // ----- Pass 2: per-tile clip-limit -> CDF -> LUT -----------
@@ -1022,6 +1115,14 @@ namespace
 
         // Counters for the per-second heartbeat.
         int64_t stats_next_us = esp_timer_get_time() + STATS_PERIOD_US;
+
+        // Adaptive AE state. Initialised to MID because camera.cpp
+        // applied the MID preset at boot. The face_ai loop checks
+        // mean luma every AE_CHECK_INTERVAL_MS and shifts presets
+        // up or down with hysteresis (see apply_ae_preset()).
+        AEPreset  ae_preset       = AEPreset::MID;
+        int64_t   ae_next_check_us =
+            esp_timer_get_time() + (int64_t)AE_CHECK_INTERVAL_MS * 1000;
         uint32_t s_frames = 0;        // frames pulled from camera
         uint32_t s_raw_dets = 0;      // detector returned >=1 result (any score, any orient)
         uint32_t s_pad_hits = 0;      // padded-fallback rescued a frame
@@ -1091,6 +1192,44 @@ namespace
             // timing out, banner pinning us, model errors). Silence here
             // means the task is wedged, not just unlucky.
             const int64_t now_us = esp_timer_get_time();
+
+            // Adaptive AE bias. Run on the same coarse cadence as the
+            // stats heartbeat; the mean-luma value driving the decision
+            // is refreshed every detection frame inside apply_clahe(),
+            // so this check is cheap (one atomic load + a few
+            // comparisons). The asymmetric hysteresis bands stop us
+            // from oscillating between presets when a scene's luma
+            // sits near a boundary.
+            if (now_us >= ae_next_check_us)
+            {
+                const int luma = g_last_mean_luma.load(
+                    std::memory_order_relaxed);
+                AEPreset next = ae_preset;
+                switch (ae_preset) {
+                case AEPreset::DIM:
+                    if (luma > AE_DIM_TO_MID_LUMA)    next = AEPreset::MID;
+                    break;
+                case AEPreset::MID:
+                    if      (luma > AE_MID_TO_BRIGHT_LUMA) next = AEPreset::BRIGHT;
+                    else if (luma < AE_MID_TO_DIM_LUMA)    next = AEPreset::DIM;
+                    break;
+                case AEPreset::BRIGHT:
+                    if (luma < AE_BRIGHT_TO_MID_LUMA) next = AEPreset::MID;
+                    break;
+                }
+                if (next != ae_preset) {
+                    const char *names[] = { "DIM", "MID", "BRIGHT" };
+                    ESP_LOGI(TAG,
+                             "AE preset %s -> %s (mean luma %d)",
+                             names[(int)ae_preset], names[(int)next],
+                             luma);
+                    apply_ae_preset(next);
+                    ae_preset = next;
+                }
+                ae_next_check_us = now_us +
+                    (int64_t)AE_CHECK_INTERVAL_MS * 1000;
+            }
+
             if (now_us >= stats_next_us)
             {
                 const float avg_score = s_score_n ?
