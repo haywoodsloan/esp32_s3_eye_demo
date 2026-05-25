@@ -51,6 +51,47 @@ esp_err_t camera_init(void)
     if (s) {
         s->set_hmirror(s, 0);
         s->set_vflip(s, 1);
+
+        // Low-light tuning for the OV2640. The defaults are tuned for
+        // outdoor / well-lit scenes and produce dim, low-contrast
+        // frames indoors that defeat the face detector. Every knob
+        // below either widens the AE / AGC range the sensor can use,
+        // or biases what's left for the detector's benefit. We
+        // deliberately do not touch any of the app-level "is this a
+        // real face" gates (MIN_DETECT_SCORE, keypoints_look_upright,
+        // MIN_SHARPNESS); the goal here is better INPUT, not a more
+        // permissive classifier, so the false-positive surface
+        // doesn't grow.
+        //
+        //   gainceiling 16x  raise analogue-gain headroom so AGC has
+        //                    room to expose dark scenes. Default is
+        //                    ~2x. Noise rises with gain but the
+        //                    detector tolerates it; the keypoint
+        //                    geometry check catches the rare noise-
+        //                    driven false positive.
+        //   aec2 on          use the OV2640's alternate auto-
+        //                    exposure algorithm. Empirically copes
+        //                    better with mixed / backlit indoor
+        //                    lighting than the default AEC1.
+        //   ae_level +1      bias the AE target one stop brighter so
+        //                    skin tones land near 50 % grey instead
+        //                    of 30 %.
+        //   brightness +1    post-AE additive offset; opens up the
+        //                    shadows that AE alone leaves crushed.
+        //   contrast +1      slight S-curve so the percentile
+        //                    stretch downstream has wider material
+        //                    to work with on truly flat low-light
+        //                    frames.
+        //   lenc on          lens shading correction. The OV2640 +
+        //                    S3-EYE lens darkens noticeably near
+        //                    the corners, exactly where the user's
+        //                    face often ends up at close range.
+        s->set_gainceiling(s, GAINCEILING_16X);
+        s->set_aec2(s, 1);
+        s->set_ae_level(s, 1);
+        s->set_brightness(s, 1);
+        s->set_contrast(s, 1);
+        s->set_lenc(s, 1);
     }
 
     ESP_LOGI(TAG, "OV2640 ready: RGB565 %dx%d, %d fb in PSRAM",
