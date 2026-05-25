@@ -542,7 +542,16 @@ namespace
     constexpr Tuning TUNING_BRIGHT = {
         0.45f,
         1,
-        TILE_PX_HELPER * 3 / 100,                       // 108 / 3600 = 3%
+        // CLAHE disabled in BRIGHT (clip_lim == 0 -> skip). Direct
+        // light on the face clips skin highlights into the top
+        // histogram bins; CLAHE then redistributes that clipped
+        // excess across the rest of the LUT and flattens the very
+        // facial-feature contrast the detector needs. The default
+        // S3-EYE example feeds raw frames in bright scenes and
+        // detects fine; we converge to that behaviour here while
+        // keeping CLAHE in DIM / MID where it actually earns its
+        // keep.
+        0,
     };
 
     // Live tuning that the rest of the loop reads. Updated alongside
@@ -593,12 +602,17 @@ namespace
             s->set_brightness(s, 1);
             break;
         case AEPreset::BRIGHT:
-            // Neutral exposure with low gain headroom. Daylight /
-            // strongly-lit indoor. Highlight retention matters more
-            // here than shadow lift.
+            // Slight under-bias for genuinely bright / direct-light
+            // scenes. ae_level=-1 + brightness=-1 nudges the OV2640
+            // toward protecting face-skin highlights instead of
+            // metering for the global average; combined with the
+            // 4X gain ceiling this keeps facial features out of
+            // the clipping bin in lamp / window-sun conditions
+            // where the previous neutral (0, 0) bias was washing
+            // them out and starving the detector.
             s->set_gainceiling(s, GAINCEILING_4X);
-            s->set_ae_level(s, 0);
-            s->set_brightness(s, 0);
+            s->set_ae_level(s, -1);
+            s->set_brightness(s, -1);
             break;
         }
     }
@@ -834,26 +848,55 @@ namespace
         }
     }
 
+    // Sub-sampled mean-luma scan over the rotated detector input.
+    // Used as a fallback for g_last_mean_luma when CLAHE is skipped
+    // (BRIGHT preset) -- without this, the adaptive-AE check sees a
+    // stale value and never transitions BRIGHT -> MID again. Touches
+    // 1/16 of the frame at stride 4 in both axes, ~3600 pixels, < 200
+    // us on the S3.
+    int sample_mean_luma(const uint16_t *pixels) noexcept
+    {
+        const uint8_t *p8 = (const uint8_t *)pixels;
+        uint32_t sum = 0;
+        uint32_t cnt = 0;
+        for (int y = 0; y < FRAME_DIM; y += 4) {
+            const uint8_t *row = p8 + (size_t)y * FRAME_DIM * 2;
+            for (int x = 0; x < FRAME_DIM; x += 4) {
+                const int idx = x * 2;
+                const uint8_t hi = row[idx];
+                const uint8_t lo = row[idx + 1];
+                const uint8_t g6 =
+                    (uint8_t)(((hi & 0x07) << 3) | (lo >> 5));
+                sum += (uint32_t)((g6 << 2) | (g6 >> 4));
+                ++cnt;
+            }
+        }
+        return cnt ? (int)(sum / cnt) : 128;
+    }
+
     // Prepare the buffer the detector will read this frame. Returns
-    // the pointer to feed into HumanFaceDetect::run(). May return
-    // `src` (zero-copy fast path) or `scratch` (after a rotate /
-    // CLAHE / both).
+    // the pointer to feed into HumanFaceDetect::run() -- always
+    // `scratch` here, since we always rotate (the rotate is required
+    // by the orient-cycle even when CLAHE itself is off).
+    //
+    // CLAHE is gated on g_tuning.clahe_clip_lim: positive => run it
+    // (DIM / MID), zero => skip the apply pass entirely (BRIGHT --
+    // raw rotated frame goes to the detector, same as the default
+    // S3-EYE example does in bright scenes). When skipping, we still
+    // need a frame-mean-luma update to drive the AE preset cycle, so
+    // a tiny subsampled scan stands in for the histogram pass.
     const uint16_t *prep_detect_input(Orient o,
                                       const uint16_t *src,
                                       uint16_t *scratch,
                                       int n) noexcept
     {
-        // Always apply CLAHE to the detector input. The previous
-        // "only when the histogram looks narrow" heuristic was wrong
-        // for the low-light case it was supposed to help: high
-        // sensor gain produces frames whose noise floor alone gives
-        // a wide histogram range, the heuristic concludes the frame
-        // is fine, CLAHE is skipped, and the real (low-contrast)
-        // signal under the noise stays unrecoverable. Paying ~5 ms
-        // of CLAHE on every detection frame is a fair price for
-        // detection working at all in dim scenes.
         rotate_to_scratch(o, src, scratch, n);
-        apply_clahe(scratch);
+        if (g_tuning.clahe_clip_lim > 0) {
+            apply_clahe(scratch);
+        } else {
+            g_last_mean_luma.store(sample_mean_luma(scratch),
+                                   std::memory_order_relaxed);
+        }
         return scratch;
     }
 
