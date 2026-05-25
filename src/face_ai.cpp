@@ -132,20 +132,16 @@ namespace
     constexpr int MIN_SHARPNESS = 15;
 
     // Cosine-similarity threshold for "this is an already-known face".
-    // Lower than HumanFaceRecognizer's hard-coded 0.5 because we observed
-    // same-face similarities as low as ~0.40 on the OV2640 + MFN combo
-    // across head-pose / lighting drift between sessions, and we want
-    // recognition to win in those cases. Cross-person similarities on the
-    // same hardware are typically <= 0.30, so 0.40 still leaves margin.
-    constexpr float MATCH_THR = 0.35f;
+    // No longer a single constant -- the value lives in g_tuning and is
+    // driven by the adaptive AE preset selected from frame mean luma.
+    // See Tuning / apply_ae_preset() / tuning_for() below for the
+    // per-preset values and the rationale.
 
-    // How many consecutive frames must (a) be sharp, (b) have a confident
-    // face detection, and (c) NOT match any known embedding before we
-    // commit to enrolling a new face. Lowered to 1 because low-light
-    // detection is intermittent enough that the previous 2-in-a-row
-    // requirement was effectively never satisfied -- the cosine
-    // similarity threshold is already a strong identity guard.
-    constexpr int ENROLL_DEBOUNCE_FRAMES = 1;
+    // Frames-in-a-row required before a fresh unknown face commits to
+    // an enrolment. Also adaptive (per-preset) -- bright scenes can
+    // safely enrol on a single frame, dim scenes want a second frame
+    // of confirmation to avoid spuriously enrolling a known person
+    // whose noisy embedding briefly dipped below match_thr.
 
     // Hard cap on the in-memory known-face list. The list resets on every
     // boot, but within a single power-on session this bounds how much
@@ -435,7 +431,9 @@ namespace
     constexpr int CLAHE_N        = 4;                          // tile grid (N x N)
     constexpr int CLAHE_TILE_SZ  = FRAME_DIM / CLAHE_N;        // 60
     constexpr int CLAHE_TILE_PX  = CLAHE_TILE_SZ * CLAHE_TILE_SZ;  // 3600
-    constexpr int CLAHE_CLIP_LIM = CLAHE_TILE_PX * 5 / 100;    // 180
+    // CLAHE clip limit is driven by the adaptive tuning (see Tuning
+    // / g_tuning further down). The compile-time CLAHE_TILE_PX is
+    // still useful for the % math when building presets.
 
     // Latest 0..255 mean luma of the detector input, written by
     // apply_clahe() (the histogram pass it does covers every pixel,
@@ -475,12 +473,85 @@ namespace
     constexpr int      AE_BRIGHT_TO_MID_LUMA = 150;
     constexpr int      AE_MID_TO_DIM_LUMA    = 85;
 
+    // Matching / preprocessing parameters that move with the AE
+    // preset. Same idea as apply_ae_preset() but for the AI side of
+    // the pipeline rather than the sensor: each scene-luma band has
+    // a different signal/noise profile, so the thresholds the
+    // matcher uses should track that profile.
+    //
+    //   match_thr        cosine similarity floor for "this is a known
+    //                    face". DIM: noise drags same-person sims
+    //                    toward 0.30-0.45 so we have to bend lower
+    //                    to keep recognising. BRIGHT: same-person
+    //                    sims comfortably hit 0.6+, so a tighter
+    //                    floor suppresses cross-IDs.
+    //   enroll_debounce  frames-in-a-row of "unknown" required
+    //                    before we commit a new enrolment. DIM
+    //                    needs 2 because noisy single frames can
+    //                    fake an unknown for a person we already
+    //                    know; MID/BRIGHT can fire on a single
+    //                    frame for snappy enrolment latency.
+    //   clahe_clip_lim   per-tile histogram clip-limit for CLAHE.
+    //                    DIM needs aggressive clipping so a flat
+    //                    histogram still produces big output range;
+    //                    BRIGHT needs gentle clipping so an
+    //                    already-balanced scene doesn't get over-
+    //                    contrasted into a posterised look.
+
+    struct Tuning {
+        float match_thr;
+        int   enroll_debounce;
+        int   clahe_clip_lim;   // absolute pixel count, not %
+    };
+
+    // Re-derive CLAHE clip absolutes from the tile size for clarity
+    // (rather than baking constants). Tile pixel count is fixed at
+    // compile time, so the % math collapses too.
+    static constexpr int TILE_PX_HELPER = (FRAME_DIM / 4) * (FRAME_DIM / 4); // 3600
+
+    constexpr Tuning TUNING_DIM = {
+        /*match_thr*/       0.32f,
+        /*enroll_debounce*/ 2,
+        /*clahe_clip_lim*/  TILE_PX_HELPER * 7 / 100,   // 252 / 3600 = 7%
+    };
+    constexpr Tuning TUNING_MID = {
+        0.38f,
+        1,
+        TILE_PX_HELPER * 5 / 100,                       // 180 / 3600 = 5%
+    };
+    constexpr Tuning TUNING_BRIGHT = {
+        0.45f,
+        1,
+        TILE_PX_HELPER * 3 / 100,                       // 108 / 3600 = 3%
+    };
+
+    // Live tuning that the rest of the loop reads. Updated alongside
+    // every AE preset transition. Initialised to MID because that's
+    // what camera.cpp's boot defaults apply.
+    Tuning g_tuning = TUNING_MID;
+
+    constexpr const Tuning &tuning_for(AEPreset p) noexcept
+    {
+        switch (p) {
+        case AEPreset::DIM:    return TUNING_DIM;
+        case AEPreset::BRIGHT: return TUNING_BRIGHT;
+        case AEPreset::MID:    break;
+        }
+        return TUNING_MID;
+    }
+
     // Push the named preset to the OV2640. Idempotent at the SCCB
     // level: re-applying the same preset is a no-op as far as the
     // sensor is concerned, so the caller doesn't need to track
     // whether anything actually changed.
     void apply_ae_preset(AEPreset p)
     {
+        // Update the app-side tuning first -- the sensor SCCB writes
+        // below can take 100+ ms to settle but the matcher /
+        // preprocessor parameters take effect immediately on the
+        // next frame, which is what we want.
+        g_tuning = tuning_for(p);
+
         sensor_t *s = esp_camera_sensor_get();
         if (!s) {
             return;
@@ -589,14 +660,17 @@ namespace
         }
 
         // ----- Pass 2: per-tile clip-limit -> CDF -> LUT -----------
+        const int clip_lim = g_tuning.clahe_clip_lim;
         for (int t = 0; t < CLAHE_N * CLAHE_N; ++t) {
-            // Clip the histogram at CLAHE_CLIP_LIM and tally the
-            // excess that we lopped off.
+            // Clip the histogram at the active clip-limit and tally
+            // the excess that we lopped off. The clip-limit moves
+            // with the AE preset so a dim scene gets aggressive
+            // boost while a bright scene gets a gentle touch-up.
             uint32_t excess = 0;
             for (int v = 0; v < 256; ++v) {
-                if (hist[t][v] > CLAHE_CLIP_LIM) {
-                    excess += hist[t][v] - CLAHE_CLIP_LIM;
-                    hist[t][v] = CLAHE_CLIP_LIM;
+                if (hist[t][v] > clip_lim) {
+                    excess += hist[t][v] - clip_lim;
+                    hist[t][v] = clip_lim;
                 }
             }
             // Redistribute the excess uniformly across all 256 bins
@@ -1580,7 +1654,7 @@ namespace
             }
             xSemaphoreGive(g_db_mux);
 
-            if (best_id > 0 && best_sim >= MATCH_THR)
+            if (best_id > 0 && best_sim >= g_tuning.match_thr)
             {
                 // Recognised — no enroll, no banner. We removed the
                 // "OH... IT'S YOU" path: recognition is now silent so
@@ -1606,15 +1680,15 @@ namespace
 
             // Either no enrolled faces at all, or every enrolled face was
             // below the match threshold. Treat this as evidence of "new
-            // face" but require ENROLL_DEBOUNCE_FRAMES such frames in a row
+            // face" but require g_tuning.enroll_debounce such frames in a row
             // before actually enrolling — a single low-confidence frame
             // for a person we already know shouldn't fork a new identity.
             ++unknown_streak;
             ESP_LOGD(TAG, "unknown frame: best_sim=%.3f streak=%d/%d focus=%d",
                      (double)best_sim, unknown_streak,
-                     ENROLL_DEBOUNCE_FRAMES, focus);
+                     g_tuning.enroll_debounce, focus);
 
-            if (unknown_streak < ENROLL_DEBOUNCE_FRAMES)
+            if (unknown_streak < g_tuning.enroll_debounce)
             {
                 esp_camera_fb_return(fb);
                 continue;
