@@ -374,14 +374,17 @@ void banner_render(float angle_rad)
 }
 
 /* Map an arbitrary input character to a glyph we know how to render.
-   FreeSansBold18pt7b covers ASCII 0x20..0x7E (printable 7-bit) so any
-   byte in that range passes through unchanged. Everything else
-   (control codes, high-bit characters, etc.) becomes a space so an
-   unknown byte just opens up tracking rather than shifting later
-   letters around. */
+   FreeSansBold18pt7b covers ASCII 0x20..0x7E (printable 7-bit). We
+   fold lowercase to uppercase on the way through so the name banner
+   stays visually consistent with the all-caps "NEW FACE DETECTED"
+   enrollment banner -- mixed-case bodies on a screen this small read
+   noticeably less crisp than caps. Everything outside the printable
+   range becomes a space so an unknown byte opens up tracking rather
+   than shifting later letters around. */
 static inline char name_char_filter(char c)
 {
     const uint8_t u = (uint8_t)c;
+    if (u >= 'a' && u <= 'z') return (char)(u - 'a' + 'A');
     return (u >= 0x20 && u <= 0x7E) ? c : ' ';
 }
 
