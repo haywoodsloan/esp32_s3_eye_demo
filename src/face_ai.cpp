@@ -1284,46 +1284,18 @@ namespace
         }
     }
 
-    float head_roll_for(const dl::detect::result_t *det, Orient o)
-    {
-        if (!det || det->keypoint.size() < 6)
-        {
-            return banner_angle_for(o); // missing keypoints -> fall back
-        }
-
-        // Eye midpoint + nose in detection frame, then unrotated into the
-        // display frame (= the LCD's view of the world).
-        int e0x = det->keypoint[0], e0y = det->keypoint[1];
-        int e1x = det->keypoint[2], e1y = det->keypoint[3];
-        int nx = det->keypoint[4], ny = det->keypoint[5];
-        unrotate_point(o, FRAME_DIM, e0x, e0y);
-        unrotate_point(o, FRAME_DIM, e1x, e1y);
-        unrotate_point(o, FRAME_DIM, nx, ny);
-
-        // Head-local "down" direction in display-frame coords. For an upright
-        // forward-facing face this is (0, +1) (nose below eye midpoint).
-        const float dx = static_cast<float>(nx - (e0x + e1x) / 2);
-        const float dy = static_cast<float>(ny - (e0y + e1y) / 2);
-        if (dx == 0.0f && dy == 0.0f)
-        {
-            return banner_angle_for(o);
-        }
-
-        // banner_render rotates the text's local +x axis to (cos a, sin a) in
-        // image coords. The banner's "text-right" should be perpendicular to
-        // and 90 deg CCW (visually) from "down": text_right = (down_y, -down_x).
-        // So a = atan2(text_right.y, text_right.x) = atan2(-down_x, down_y).
-        constexpr float pi = 3.14159265358979323846f;
-        constexpr float quarter = pi * 0.5f;
-        // The +quarter offset is an empirically-tuned correction: the
-        // un-rotation + atan2 derivation alone leaves the banner 90 deg
-        // CCW of the head, so we rotate it one quarter-turn CW.
-        const float a = atan2f(-dx, dy) + quarter;
-
-        // Snap to nearest 90 deg bucket. Head tilts between buckets round
-        // to whichever cardinal is closest.
-        return roundf(a / quarter) * quarter;
-    }
+    // Previously we also ran a `head_roll_for()` helper that refined the
+    // banner rotation using the detector's eye + nose keypoints. The
+    // refinement was unstable in practice: it computed atan2(-dx, dy)
+    // with a hard-coded +pi/2 offset, then snapped to the nearest
+    // quarter-turn. Any case where the nose landed slightly to the left
+    // of the eye midpoint (very common with glasses or even a hint of
+    // keypoint jitter) tipped the snap from the upright bucket into the
+    // upside-down bucket, producing inverted banner text on faces that
+    // were clearly upright. Since the snap output is one of four
+    // quarter-turns anyway, the orient-lock-driven banner_angle_for()
+    // gives the same granularity with none of the failure modes —
+    // we just trust the orient cycle.
 
     void face_ai_task(void *)
     {
@@ -1929,7 +1901,7 @@ namespace
                 // we skip the embedder on cache hits, so we have to
                 // re-publish here to keep the navy overlay alive.
                 publish_name_banner(recog_cache.matched_id,
-                                    head_roll_for(biggest, locked_orient));
+                                    banner_angle_for(locked_orient));
                 esp_camera_fb_return(fb);
                 continue;
             }
@@ -1994,7 +1966,7 @@ namespace
                 // Show the navy name banner along the bottom of the
                 // preview if this face has been named in the web UI.
                 publish_name_banner(best_id,
-                                    head_roll_for(biggest, locked_orient));
+                                    banner_angle_for(locked_orient));
 
                 esp_camera_fb_return(fb);
                 continue;
@@ -2076,10 +2048,10 @@ namespace
                 // alone.
                 if (g_banner_until_ms.load(std::memory_order_relaxed) <= now_ms())
                 {
-                    // Banner angle: discrete orientation refined with the
-                    // eye-line roll measured from the detector's keypoints.
-                    // See head_roll_for().
-                    const float roll = head_roll_for(biggest, locked_orient);
+                    // Banner rotation = orient-cycle's locked orientation.
+                    // Discrete quarter-turn from the orient lock; see
+                    // banner_angle_for() for the convention.
+                    const float roll = banner_angle_for(locked_orient);
                     banner_render(roll);
                     g_banner_until_ms.store(now_ms() + BANNER_HOLD_MS,
                                             std::memory_order_relaxed);
