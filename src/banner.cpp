@@ -1,5 +1,6 @@
 #include "banner.h"
 #include "board_pins.h"
+#include "fonts/FreeSansBold18pt7b.h"
 
 #include "esp_check.h"
 #include "esp_heap_caps.h"
@@ -15,55 +16,30 @@ static const char *TAG = "banner";
 #define BANNER_W            BOARD_LCD_H_RES   /* 240 */
 #define BANNER_H            BOARD_LCD_V_RES   /* 240 */
 
-/* Source bitmap font is 8x16, strokes are 1-2 source-pixels wide. The
-   renderer treats each lit source pixel as a soft circular DOT splatted
-   into an 8-bit alpha buffer (s_alpha): adjacent lit pixels' dots
-   overlap and their alpha values saturate to 255 in the stroke core,
-   while the dot's linear-falloff edge produces 1-2 pixels of smooth
-   gradient. The alpha buffer is later composited onto the live camera
-   frame by banner_compose_overlay(), so only the text pixels overwrite
-   the underlying image and the dot's edge gradient gives anti-aliased
-   green-on-camera text.
+/* Text is rendered from a real bitmap font (FreeSansBold 18pt) that
+   was pre-converted from a GNU FreeFont TTF using Adafruit's
+   `fontconvert` tool and shipped verbatim in src/fonts/. The format
+   is 1 bit per pixel, packed MSB-first into a shared byte array, with
+   a per-glyph metadata table giving width / height / pen-advance /
+   baseline-relative xOffset / yOffset. yAdvance (42 px) gives the
+   line height; cap height is ~25 px.
 
-   With SCALE=3 the longest line ("DETECTED", 8 glyphs) is
-   8 * GLYPH_W * SCALE = 192 px from glyph bitmaps alone; adding the
-   LETTER_GAP_PX between adjacent letters brings the total line width to
-   192 + 7 * 3 = 213 px on the 240 px buffer (~89%, leaving ~13 px /
-   ~5.5% padding on each side). The text is positioned along the bottom
-   of the face's view via Y_OFFSET below; on 90 deg rotations the same
-   text block fits along the corresponding LCD edge. */
-#define GLYPH_W             8
-#define GLYPH_H             16
-/* SCALE is the source-pixel -> destination-pixel ratio used both when
-   sampling each lit glyph pixel (splat centre stride below) and when
-   sizing CELL_W / CELL_H. A non-integer value is fine because the
-   splat is done with float coordinates; the only place we need an
-   integer derivative is CELL_W / CELL_H, which we truncate. */
-#define SCALE               2.55f
-#define CELL_W              ((int)(GLYPH_W * SCALE))   /* 20 */
-#define CELL_H              ((int)(GLYPH_H * SCALE))   /* 40 */
-#define LETTER_GAP_PX       3                   /* between glyph cells */
-#define LINE_GAP_PX         4                   /* between line baselines */
-/* Local-coord distance from the buffer centre (cy) to each line's
-   centre. With the two-line message we place the first line above the
-   centre and the second line below it, so they hug the top and bottom
-   edges of the face's view (and, after rotation, the corresponding
-   pair of LCD edges). Sized so the text + outline still fits inside
-   the 240 px buffer at every multiple-of-90-deg rotation. */
-#define LINE_OFFSET_PX      92
-/* A full CELL_W between words looked far too airy (the glyphs already
-   carry ~1 col of empty source padding on each side, plus LETTER_GAP_PX
-   between cells). Render the space character with a half-width cell so
-   word breaks read as a clear gap without dominating the line. */
-#define SPACE_CELL_W        (CELL_W / 2)        /* 12 */
+   Each lit glyph bit is splatted into the alpha buffer as a small
+   soft circular dot. The dot's only job here is to add 1 px of soft
+   AA at the boundary between lit and unlit pixels -- without it,
+   the text would have hard pixel-edge jaggies once the buffer is
+   rotated for off-axis face poses. The radius is much smaller than
+   the previous hand-rolled 8x16 splat font used (which relied on
+   overlapping dots for the stroke body); the FreeSans glyph shapes
+   already carry the typographic weight. */
 
-/* Dot radius (in destination pixels) used to splat each lit source
-   pixel. Two adjacent dots (SCALE px apart) sum to a ~5-6 px stroke
-   whose core is fully foreground-coloured and whose 1-2 px edge fades
-   through intermediate alpha values — i.e. anti-aliased. Scaled in
-   step with SCALE so the stroke weight stays visually proportional to
-   the glyph size. */
-#define DOT_RADIUS_PX       2.1f
+static const GFXfont &kFont = FreeSansBold18pt7b;
+
+#define LETTER_GAP_PX       1                   /* extra inter-letter tracking */
+#define LINE_OFFSET_PX      88                  /* centre -> line-centre, in local coords */
+#define BASELINE_OFFSET_PX  12                  /* line-centre -> baseline (~half the cap height) */
+#define DOT_RADIUS_PX       1.2f                /* edge-AA splat; not stroke weight */
+#define OUTLINE_RADIUS_PX   2                   /* black outline halo width */
 
 /* The LCD and the camera both use big-endian RGB565 byte order in memory
    (high byte first). We're authoring buffers on a little-endian host,
@@ -81,9 +57,8 @@ static const char *TAG = "banner";
 static uint8_t *s_alpha = NULL;
 
 /* Dilated copy of s_alpha used to draw a black outline around the
-   white text. Computed once per banner_render() as a max-filter over
-   s_alpha; intermediate values give the outline soft edges that match
-   the text's anti-aliasing. */
+   coloured text. Computed once per banner_render() as a max-filter
+   over s_alpha. */
 static uint8_t *s_outline = NULL;
 
 /* Second alpha + outline buffer pair, used by banner_render_name()
@@ -94,12 +69,6 @@ static uint8_t *s_outline = NULL;
    entry). */
 static uint8_t *s_name_alpha   = NULL;
 static uint8_t *s_name_outline = NULL;
-
-/* Outline halo half-width in destination pixels. 2 -> a 5x5 max
-   filter -> a ~2 px black ring around every stroke. The dilation
-   cost (BANNER_W * BANNER_H * (2R+1)^2 comparisons) is paid only on
-   banner_render(), which fires at most once per enrolment. */
-#define OUTLINE_RADIUS_PX   2
 
 /* Banner foreground: dark green. Readable against a wide range of skin
    / room tones; the black outline added by s_outline keeps it legible
@@ -121,89 +90,29 @@ static constexpr uint8_t BANNER_BG_R5 = 0;
 static constexpr uint8_t BANNER_BG_G6 = 0;
 static constexpr uint8_t BANNER_BG_B5 = 0;
 
-/* 8x16 monospace bitmap font. MSB of each row byte is the leftmost pixel.
-   Only the 11 glyphs that "I WILL REMEMBER YOU" needs are populated;
-   anything else falls back to a blank space. */
-typedef struct {
-    char    ch;
-    uint8_t rows[GLYPH_H];
-} glyph_t;
-
-static const glyph_t s_font[] = {
-    {' ',  {0}},
-    {'I',  {0, 0, 0x7E, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x7E, 0, 0, 0}},
-    {'W',  {0, 0, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x5A, 0x5A, 0x66, 0x42, 0, 0, 0}},
-    {'L',  {0, 0, 0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0x7E, 0, 0, 0}},
-    {'R',  {0, 0, 0x7C, 0x66, 0x66, 0x66, 0x7C, 0x6C, 0x66, 0x66, 0x66, 0x66, 0x66, 0, 0, 0}},
-    {'E',  {0, 0, 0x7E, 0x60, 0x60, 0x60, 0x7C, 0x60, 0x60, 0x60, 0x60, 0x60, 0x7E, 0, 0, 0}},
-    {'M',  {0, 0, 0x42, 0x66, 0x7E, 0x7E, 0x5A, 0x5A, 0x42, 0x42, 0x42, 0x42, 0x42, 0, 0, 0}},
-    {'B',  {0, 0, 0x7C, 0x66, 0x66, 0x66, 0x7C, 0x66, 0x66, 0x66, 0x66, 0x66, 0x7C, 0, 0, 0}},
-    {'Y',  {0, 0, 0x42, 0x42, 0x42, 0x42, 0x24, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0, 0, 0}},
-    {'O',  {0, 0, 0x3C, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0, 0, 0}},
-    {'U',  {0, 0, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x66, 0x3C, 0, 0, 0}},
-    /* Added for the "OH... IT'S YOU" recognition banner (kept around
-       even though the recognition banner has been removed; cheap, and
-       avoids regressing the font if other text is added later). */
-    {'H',  {0, 0, 0x42, 0x42, 0x42, 0x42, 0x42, 0x7E, 0x42, 0x42, 0x42, 0x42, 0x42, 0, 0, 0}},
-    {'T',  {0, 0, 0x7E, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0, 0, 0}},
-    {'S',  {0, 0, 0x7E, 0x60, 0x60, 0x60, 0x60, 0x7E, 0x06, 0x06, 0x06, 0x06, 0x7E, 0, 0, 0}},
-    {'.',  {0, 0, 0,    0,    0,    0,    0,    0,    0,    0,    0,    0x18, 0x18, 0, 0, 0}},
-    {'\'', {0, 0, 0x18, 0x18, 0x18, 0,    0,    0,    0,    0,    0,    0,    0,    0, 0, 0}},
-    /* Added for the "NEW FACE DETECTED" overlay. */
-    {'N',  {0, 0, 0x42, 0x62, 0x62, 0x52, 0x52, 0x4A, 0x4A, 0x46, 0x46, 0x42, 0x42, 0, 0, 0}},
-    {'F',  {0, 0, 0x7E, 0x60, 0x60, 0x60, 0x7C, 0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0, 0, 0}},
-    {'A',  {0, 0, 0x18, 0x3C, 0x66, 0x66, 0x42, 0x42, 0x7E, 0x42, 0x42, 0x42, 0x42, 0, 0, 0}},
-    {'C',  {0, 0, 0x3C, 0x66, 0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0x66, 0x3C, 0, 0, 0}},
-    {'D',  {0, 0, 0x78, 0x6C, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x6C, 0x78, 0, 0, 0}},
-    /* Filling out the rest of A-Z so user-entered names render properly
-       in the navy "recognized" banner. Glyphs are 8x16, MSB = leftmost
-       pixel, same convention as the originals above. */
-    {'G',  {0, 0, 0x3C, 0x66, 0x60, 0x60, 0x60, 0x6E, 0x66, 0x66, 0x66, 0x66, 0x3C, 0, 0, 0}},
-    {'J',  {0, 0, 0x1E, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x6C, 0x6C, 0x38, 0, 0, 0}},
-    {'K',  {0, 0, 0x66, 0x66, 0x6C, 0x6C, 0x78, 0x70, 0x78, 0x6C, 0x6C, 0x66, 0x66, 0, 0, 0}},
-    {'P',  {0, 0, 0x7C, 0x66, 0x66, 0x66, 0x66, 0x7C, 0x60, 0x60, 0x60, 0x60, 0x60, 0, 0, 0}},
-    {'Q',  {0, 0, 0x3C, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x6A, 0x6C, 0x36, 0, 0, 0}},
-    {'V',  {0, 0, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x66, 0x66, 0x3C, 0x18, 0, 0, 0}},
-    {'X',  {0, 0, 0x42, 0x42, 0x66, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x66, 0x42, 0x42, 0, 0, 0}},
-    {'Z',  {0, 0, 0x7E, 0x06, 0x0C, 0x0C, 0x18, 0x18, 0x30, 0x30, 0x60, 0x60, 0x7E, 0, 0, 0}},
-    /* Digits 0-9, same 8x16 convention. */
-    {'0',  {0, 0, 0x3C, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0, 0, 0}},
-    {'1',  {0, 0, 0x18, 0x38, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x7E, 0, 0, 0}},
-    {'2',  {0, 0, 0x3C, 0x66, 0x06, 0x06, 0x0C, 0x18, 0x30, 0x60, 0x60, 0x60, 0x7E, 0, 0, 0}},
-    {'3',  {0, 0, 0x3C, 0x66, 0x06, 0x06, 0x1C, 0x06, 0x06, 0x06, 0x06, 0x66, 0x3C, 0, 0, 0}},
-    {'4',  {0, 0, 0x0C, 0x1C, 0x2C, 0x4C, 0x4C, 0x7E, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0, 0, 0}},
-    {'5',  {0, 0, 0x7E, 0x60, 0x60, 0x60, 0x7C, 0x06, 0x06, 0x06, 0x06, 0x66, 0x3C, 0, 0, 0}},
-    {'6',  {0, 0, 0x3C, 0x66, 0x60, 0x60, 0x7C, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0, 0, 0}},
-    {'7',  {0, 0, 0x7E, 0x06, 0x06, 0x0C, 0x0C, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0, 0, 0}},
-    {'8',  {0, 0, 0x3C, 0x66, 0x66, 0x66, 0x3C, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0, 0, 0}},
-    {'9',  {0, 0, 0x3C, 0x66, 0x66, 0x66, 0x66, 0x3E, 0x06, 0x06, 0x06, 0x66, 0x3C, 0, 0, 0}},
-    /* Punctuation common in human names. */
-    {'-',  {0, 0, 0,    0,    0,    0,    0,    0x7E, 0,    0,    0,    0,    0,    0, 0, 0}},
-};
-
-/* The banner text is fixed: a single two-line message overlaid at the
-   bottom of the face's view whenever a new face has just been enrolled.
-   Split into two lines because the full string is too wide to fit on a
-   240 px buffer at SCALE=3. */
-static const char *const s_lines[] = { "NEW FACE", "DETECTED" };
+static const char *const s_lines[]    = { "NEW FACE", "DETECTED" };
 static constexpr int      s_line_count = sizeof(s_lines) / sizeof(s_lines[0]);
 
-static const uint8_t *find_glyph(char c)
+/* Look up a glyph by codepoint. Returns nullptr for codepoints outside
+   the shipped font's range; callers either skip (drawing) or substitute
+   a space (input filtering). */
+static inline const GFXglyph *find_glyph(char c)
 {
-    for (size_t i = 0; i < sizeof(s_font) / sizeof(s_font[0]); ++i) {
-        if (s_font[i].ch == c) {
-            return s_font[i].rows;
-        }
+    const uint8_t u = (uint8_t)c;
+    if (u < kFont.first || u > kFont.last) {
+        return NULL;
     }
-    return s_font[0].rows;
+    return &kFont.glyph[u - kFont.first];
 }
 
-/* Width of the cell occupied by a single character. All printable glyphs
-   use the full CELL_W; the space character gets a shorter cell so word
-   breaks are visible without being twice as wide as letter spacing. */
+/* Width of a character cell in pen-pixels: the glyph's xAdvance plus
+   inter-letter tracking. The space character has its own xAdvance in
+   the font metrics (no special-casing needed unlike the old 8x16
+   monospace font). */
 static inline int cell_width_for(char c)
 {
-    return (c == ' ') ? SPACE_CELL_W : CELL_W;
+    const GFXglyph *g = find_glyph(c);
+    return g ? (int)g->xAdvance + LETTER_GAP_PX : 0;
 }
 
 /* Splat one soft circular dot into the supplied alpha buffer at
@@ -270,44 +179,70 @@ static void render_lines_into(uint8_t *alpha, uint8_t *outline,
         const int   len  = (int)strlen(line);
 
         /* Compute the line's total pixel width by summing per-character
-           cell widths (spaces are narrower than letters) plus (len-1)
-           inter-letter gaps. Done as a separate pass because we need
-           the total to compute the centred left edge before drawing. */
+           xAdvance values from the font's glyph metrics (so variable-
+           width glyphs centre properly). Done as a separate pass
+           because we need the total before deciding the centred left
+           edge. The final character doesn't carry a trailing gap, so
+           subtract one tracking gap from the running total. */
         int line_w_px = 0;
         for (int ci = 0; ci < len; ++ci) {
             line_w_px += cell_width_for(line[ci]);
-            if (ci < len - 1) {
-                line_w_px += LETTER_GAP_PX;
-            }
+        }
+        if (line_w_px > 0) {
+            line_w_px -= LETTER_GAP_PX;
         }
 
-        /* Top-left of the line's bounding box in local coords.
-           sign == -1 -> line above centre (top of face view).
-           sign == +1 -> line below centre (bottom of face view). */
-        const float line_x0 = -(float)line_w_px * 0.5f;
-        const float sign    = (float)line_y_signs[li];
-        const float line_y0 = sign * (float)LINE_OFFSET_PX
-                              - (float)CELL_H * 0.5f;
+        /* Pen position in local coords. sign==-1 -> line above centre
+           (top edge of face view); sign==+1 -> line below centre.
+           baseline_local is where each glyph's baseline sits; glyphs
+           extend yOffset above it (yOffset is negative for caps).
+           BASELINE_OFFSET_PX is ~half the cap height, so the visual
+           centre of the line lands at sign * LINE_OFFSET_PX. */
+        const float pen_x0         = -(float)line_w_px * 0.5f;
+        const int   sign           = line_y_signs[li];
+        const float baseline_local = (float)sign * (float)LINE_OFFSET_PX
+                                     + (float)BASELINE_OFFSET_PX;
 
-        float x_offset = 0.0f;
+        float pen_x = pen_x0;
         for (int ci = 0; ci < len; ++ci) {
-            const uint8_t *rows = find_glyph(line[ci]);
-            const float    cx0  = line_x0 + x_offset;
+            const GFXglyph *g = find_glyph(line[ci]);
+            if (!g) {
+                /* Unknown codepoint: advance by a space's width so the
+                   rest of the line stays aligned. */
+                const GFXglyph *space = find_glyph(' ');
+                pen_x += space ? (float)space->xAdvance + (float)LETTER_GAP_PX
+                               : 0.0f;
+                continue;
+            }
 
-            for (int gy = 0; gy < GLYPH_H; ++gy) {
-                const uint8_t bits = rows[gy];
-                if (!bits) continue;
-                const float ly = line_y0 + ((float)gy + 0.5f) * (float)SCALE;
-                for (int gx = 0; gx < GLYPH_W; ++gx) {
-                    if (!(bits & (0x80 >> gx))) continue;
-                    const float lx = cx0 + ((float)gx + 0.5f) * (float)SCALE;
+            const uint8_t *gbits  = kFont.bitmap + g->bitmapOffset;
+            const int      gw     = (int)g->width;
+            const int      gh     = (int)g->height;
+            const float    glyph_lx = pen_x + (float)g->xOffset;
+            const float    glyph_ly = baseline_local + (float)g->yOffset;
+
+            /* Walk the glyph's packed 1bpp bitmap MSB-first. Each lit
+               bit corresponds to one source-font pixel; we splat a
+               soft edge-AA dot at the rotated destination location. */
+            int bit_cursor = 0;
+            for (int gy = 0; gy < gh; ++gy) {
+                for (int gx = 0; gx < gw; ++gx) {
+                    const int byte_idx = bit_cursor >> 3;
+                    const int bit_idx  = 7 - (bit_cursor & 7);
+                    ++bit_cursor;
+                    if (!((gbits[byte_idx] >> bit_idx) & 1)) continue;
+
+                    /* Source-pixel centre in local coords. */
+                    const float lx = glyph_lx + (float)gx + 0.5f;
+                    const float ly = glyph_ly + (float)gy + 0.5f;
+                    /* Rotate into destination-pixel space and splat. */
                     const float dst_cx = ca * lx - sa * ly + (float)cx;
                     const float dst_cy = sa * lx + ca * ly + (float)cy;
                     splat_dot(alpha, dst_cx, dst_cy);
                 }
             }
 
-            x_offset += (float)cell_width_for(line[ci]) + (float)LETTER_GAP_PX;
+            pen_x += (float)g->xAdvance + (float)LETTER_GAP_PX;
         }
     }
 
@@ -439,28 +374,26 @@ void banner_render(float angle_rad)
 }
 
 /* Map an arbitrary input character to a glyph we know how to render.
-   We're working with a fixed-up bitmap font that covers A-Z, 0-9, a
-   handful of punctuation. ASCII lowercase folds to uppercase; anything
-   else outside the supported set becomes a space (so unknown bytes
-   just open up letter-spacing instead of dropping the glyph and
-   shifting later letters around). */
+   FreeSansBold18pt7b covers ASCII 0x20..0x7E (printable 7-bit) so any
+   byte in that range passes through unchanged. Everything else
+   (control codes, high-bit characters, etc.) becomes a space so an
+   unknown byte just opens up tracking rather than shifting later
+   letters around. */
 static inline char name_char_filter(char c)
 {
-    if (c >= 'a' && c <= 'z') return (char)(c - 'a' + 'A');
-    if ((c >= 'A' && c <= 'Z') ||
-        (c >= '0' && c <= '9') ||
-        c == ' ' || c == '-' || c == '.' || c == '\'') {
-        return c;
-    }
-    return ' ';
+    const uint8_t u = (uint8_t)c;
+    return (u >= 0x20 && u <= 0x7E) ? c : ' ';
 }
 
-/* How many filtered characters fit on a single 240-px banner line.
-   We compute the budget assuming every char is a full CELL_W (worst
-   case -- spaces are narrower, so the actual line we render is always
-   <= this width). Conservatively leaves ~10 px of margin per side. */
-static constexpr int NAME_BANNER_MAX_CHARS =
-    (BANNER_W - 20) / (CELL_W + LETTER_GAP_PX);  /* ~10 chars */
+/* Hard cap on the working buffer regardless of what fits visually.
+   The visual truncation below uses the actual cumulative pen-advance
+   to stop adding glyphs once the line's about to overflow; this is
+   just here to bound stack usage. */
+static constexpr int NAME_BANNER_BUF_MAX = 64;
+
+/* Pixel budget for a single banner line: full panel width minus a
+   small margin so the outline doesn't kiss the edge. */
+static constexpr int NAME_BANNER_WIDTH_BUDGET_PX = BANNER_W - 20;
 
 void banner_render_name(const char *name, float angle_rad)
 {
@@ -468,14 +401,20 @@ void banner_render_name(const char *name, float angle_rad)
         return;
     }
 
-    /* Filter + uppercase into a local buffer, capping at the line's
-       character budget. Empty / all-space input is treated as a
-       request to clear the banner: render an empty line so the
-       compose loop has nothing to draw. */
-    char filtered[NAME_BANNER_MAX_CHARS + 1];
-    int  out = 0;
-    for (int i = 0; name[i] != '\0' && out < NAME_BANNER_MAX_CHARS; ++i) {
-        filtered[out++] = name_char_filter(name[i]);
+    /* Filter into a local buffer, truncating as soon as the next glyph
+       would push us past the line's width budget. Empty / all-space
+       input renders to an empty line, which the compose loop skips. */
+    char filtered[NAME_BANNER_BUF_MAX + 1];
+    int  out    = 0;
+    int  width  = 0;
+    for (int i = 0; name[i] != '\0' && out < NAME_BANNER_BUF_MAX; ++i) {
+        const char c = name_char_filter(name[i]);
+        const int  w = cell_width_for(c);
+        if (width + w > NAME_BANNER_WIDTH_BUDGET_PX) {
+            break;
+        }
+        filtered[out++] = c;
+        width += w;
     }
     filtered[out] = '\0';
 
