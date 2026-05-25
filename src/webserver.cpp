@@ -32,6 +32,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 
 static const char *TAG = "web";
 static httpd_handle_t s_server = nullptr;
@@ -292,8 +293,14 @@ static esp_err_t handle_face_thumb(httpd_req_t *req)
     static constexpr int PIX_BYTES = ROW_BYTES * H;
     static constexpr int FILE_BYTES = 54 + PIX_BYTES;
 
-    uint16_t thumb[W * H];
-    if (!face_db_copy_thumb(id, thumb, W * H)) {
+    // Heap-allocate the thumb buffer. Stack-allocating 64*64*2 = 8 KB
+    // here used to silently overflow the httpd task stack (cfg.stack_size
+    // is 8192) and the BMP serializer would then read back zeroed /
+    // garbage memory, which decoded as a solid black square in the
+    // browser. unique_ptr keeps the cleanup automatic on every exit
+    // path (success, copy_thumb failure, or chunk-send abort).
+    auto thumb = std::make_unique<uint16_t[]>(static_cast<size_t>(W) * H);
+    if (!face_db_copy_thumb(id, thumb.get(), static_cast<size_t>(W) * H)) {
         return httpd_resp_send_404(req);
     }
 
@@ -327,7 +334,7 @@ static esp_err_t handle_face_thumb(httpd_req_t *req)
 
     uint8_t row[ROW_BYTES];
     for (int y = 0; y < H; ++y) {
-        bmp_pack_row(thumb + (size_t)y * W, W, row);
+        bmp_pack_row(thumb.get() + static_cast<size_t>(y) * W, W, row);
         httpd_resp_send_chunk(req, (const char *)row, ROW_BYTES);
     }
     return httpd_resp_send_chunk(req, nullptr, 0);
