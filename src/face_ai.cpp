@@ -301,34 +301,41 @@ namespace
     // Detector-input pipeline
     // ---------------------------------------------------------------
     //
-    // For every frame we have to (potentially) (1) sample the frame to
-    // decide whether to contrast-stretch, (2) rotate the frame to make
-    // the face upright, and (3) apply the stretch. The naive version
-    // did each step as a separate full pass over 240x240 RGB565 in
-    // PSRAM, which on the S3 burns ~3-4 ms per pass on memory
-    // bandwidth alone. The fused version below does all three in at
-    // most one full pass plus one subsampled pass:
+    // Every camera frame the AI task picks up runs through:
     //
-    //   * analyze_luma_subsampled() walks every PREP_STRIDE-th pixel
-    //     in both axes (=> 1/16 of the frame) to build a coarse luma
-    //     histogram and pick the 2/98 percentile bounds. This is
-    //     plenty of statistical resolution for a frame-level stretch
-    //     decision and keeps the analysis pass effectively free.
+    //   1. rotate_to_scratch() -- 0/90/180/270 deg pre-rotation into a
+    //      scratch buffer so the detector (trained on upright faces
+    //      only) sees an upright input. ROT_0 fast-paths to the S3
+    //      SIMD memcpy; the rotated cases write non-sequentially.
     //
-    //   * If the frame is already well-exposed *and* the requested
-    //     orientation is ROT_0, we skip every subsequent step and
-    //     point the detector straight at the camera fb (zero copy).
+    //   2. apply_clahe() -- contrast-limited adaptive histogram
+    //      equalisation on the rotated buffer (luma channel only,
+    //      delta-applied to RGB). Skipped in BRIGHT AE mode where it
+    //      would either be a no-op or risk over-stretching noise in
+    //      already-balanced tiles; a tiny subsampled mean-luma scan
+    //      stands in there so the adaptive-AE check still has a
+    //      live value to read.
     //
-    //   * Otherwise prep_detect_input() runs exactly one pass that
-    //     fuses the rotation index math with an optional per-channel
-    //     LUT apply (the contrast stretch). The LUT branch is hoisted
-    //     out of the hot loop via a non-type template parameter so
-    //     the inner loop is straight-line on each instantiation.
+    //   3. HumanFaceDetect::run() -- MSR+MNP cascade from ESP-DL.
     //
-    // Net effect on the worst case (need stretch + rotate) drops from
-    // 3 full PSRAM passes down to ~1.06. The common-case live-preview
-    // path (well exposed, ROT_0 locked) drops to a single subsampled
-    // pass.
+    //   4. Close-range padded fallback -- if (3) returned nothing but
+    //      the user is still likely in frame, shrink the prepared
+    //      buffer into a centred inner box of a mid-grey frame and
+    //      re-run the detector. Recovers face-fills-the-frame poses
+    //      that the model misses at native scale.
+    //
+    //   5. App-level gates: MIN_DETECT_SCORE, keypoints_look_upright(),
+    //      MIN_FACE_PX, MIN_SHARPNESS.
+    //
+    //   6. Recognition cache (IoU-keyed) -- if the latest detection's
+    //      bbox overlaps the previous matched face strongly, skip the
+    //      ~50 ms embedder pass and treat it as a continuation.
+    //
+    //   7. HumanFaceFeat::run() + cosine-similarity sweep over the
+    //      known-face DB (SIMD via dsps_dotprod_f32).
+    //
+    //   8. Optional enrol (if no match) or name-banner publish (if
+    //      matched against a face that has a user-set name).
 
     // Pure rotate -- the CLAHE pass that follows handles all the
     // contrast work, so this function's only job is to land the
@@ -383,18 +390,15 @@ namespace
     // CLAHE (Contrast Limited Adaptive Histogram Equalization)
     // ---------------------------------------------------------------
     //
-    // The global percentile stretch we used to apply only fixes the
-    // whole frame's luma distribution; it can't help a face that's
-    // in shadow inside an otherwise bright scene (the global
-    // histogram still looks healthy). CLAHE solves that: the image
-    // is split into a grid of tiles, each tile gets its own
-    // equalisation LUT built from its own histogram, and pixels in
-    // between tiles get bilinearly-interpolated LUT outputs so
-    // there are no visible tile boundaries. A per-tile clip-limit
-    // caps how much any single histogram bin can contribute to its
-    // CDF, which keeps the equalisation from amplifying sensor
-    // noise in flat regions -- the exact failure mode that vanilla
-    // HE has in low light.
+    // Splits the frame into a grid of tiles, equalises each tile's
+    // luma histogram independently, and applies the per-tile LUT to
+    // each pixel using bilinear interpolation between the four
+    // surrounding tile centres (so there are no visible tile
+    // boundaries). The per-tile clip-limit caps how much any single
+    // histogram bin can contribute to its CDF -- this is the bit that
+    // keeps the equalisation from amplifying sensor noise in flat
+    // regions, the failure mode that vanilla histogram equalisation
+    // has in low light.
     //
     // Layout / numbers tuned for the 240x240 detector input:
     //
@@ -403,17 +407,20 @@ namespace
     //     instead of 48 KB) and still adapts well to top-vs-bottom
     //     and left-vs-right lighting differences that matter to
     //     face detection.
-    //   - clip limit       -> 3 % of tile pixel count (108 of 3600).
-    //     Standard CLAHE value; tighter clipping starves contrast,
-    //     looser clipping starts looking like vanilla HE again.
-    //   - luma proxy       -> G6 expanded to 8 bits. Same proxy the
-    //     percentile path used; cheap to extract from BE-packed
-    //     RGB565.
-    //   - apply            -> per-channel (R / G / B) using the
-    //     SAME luma-derived LUT. Skipping the YCbCr round-trip
-    //     keeps the inner loop tight; minor chroma shift is
-    //     irrelevant to the face detector, and the live preview
-    //     does not see this buffer.
+    //   - clip limit       -> adaptive via g_tuning.clahe_clip_lim
+    //                         (7 % DIM, 5 % MID, disabled in BRIGHT).
+    //                         See the Tuning struct further down.
+    //   - luma proxy       -> G6 expanded to 8 bits; used for both
+    //                         the histogram bin index and the LUT
+    //                         lookup (the two must match -- earlier
+    //                         iterations of this code mismatched them
+    //                         and silently looked up the wrong bin).
+    //   - apply            -> luma-only equalisation, with the delta
+    //                         (Y_out - Y_in) added to each of R/G/B.
+    //                         Same delta on all channels preserves
+    //                         chroma (face skin tones don't drift).
+    //                         One bilinear interpolation per pixel
+    //                         instead of three.
 
     constexpr int CLAHE_N        = 4;                          // tile grid (N x N)
     constexpr int CLAHE_TILE_SZ  = FRAME_DIM / CLAHE_N;        // 60
