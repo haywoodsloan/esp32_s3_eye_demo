@@ -70,6 +70,22 @@ static uint8_t *s_outline = NULL;
 static uint8_t *s_name_alpha   = NULL;
 static uint8_t *s_name_outline = NULL;
 
+/* Per-banner dirty-y bounds. Tracked during render_lines_into() so the
+   compose pass can skip the unconditionally-empty rows above and below
+   the rasterised glyphs -- a real win because the render task does the
+   compose every LCD frame on the live preview, and the banners only
+   ever touch ~25-30 % of the 240-row buffer at any given rotation.
+
+   min_y > max_y signals an empty mask (nothing has been rendered yet
+   or all glyphs were filtered out); compose loops skip out entirely in
+   that case. */
+struct BannerBounds {
+    int min_y;
+    int max_y;
+};
+static BannerBounds s_green_bounds = { BANNER_H, -1 };
+static BannerBounds s_name_bounds  = { BANNER_H, -1 };
+
 /* Banner foreground: dark green. Readable against a wide range of skin
    / room tones; the black outline added by s_outline keeps it legible
    even when the scene behind it is also greenish. */
@@ -122,9 +138,13 @@ static inline int cell_width_for(char c)
    scale). Alpha is accumulated additively and clamped to 255, so
    overlapping dots in the stroke core saturate to opaque while the
    dot edge falls smoothly to the background. Takes the destination
-   buffer as a parameter so the same primitive can be reused for the
-   name banner without aliasing the green-banner state. */
-static inline void splat_dot(uint8_t *alpha, float cx, float cy)
+   buffer + bounds pair as parameters so the same primitive can be
+   reused for the name banner without aliasing the green-banner state.
+   The bounds are updated to bracket every row the splat actually
+   touches; render_lines_into() expands them by the outline radius
+   afterwards so the dilation pass's output range is covered too. */
+static inline void splat_dot(uint8_t *alpha, BannerBounds *bounds,
+                             float cx, float cy)
 {
     int x0 = (int)floorf(cx - DOT_RADIUS_PX);
     int x1 = (int)ceilf (cx + DOT_RADIUS_PX);
@@ -135,6 +155,9 @@ static inline void splat_dot(uint8_t *alpha, float cx, float cy)
     if (x1 > BANNER_W - 1) x1 = BANNER_W - 1;
     if (y1 > BANNER_H - 1) y1 = BANNER_H - 1;
     if (x0 > x1 || y0 > y1) return;
+
+    if (y0 < bounds->min_y) bounds->min_y = y0;
+    if (y1 > bounds->max_y) bounds->max_y = y1;
 
     const float r2     = DOT_RADIUS_PX * DOT_RADIUS_PX;
     const float inv_r2 = 1.0f / r2;
@@ -161,13 +184,21 @@ static inline void splat_dot(uint8_t *alpha, float cx, float cy)
    240x240 buffer each line hugs (-1 = top, +1 = bottom). All lines are
    centred horizontally and rendered into the same buffer in one pass.
    `angle_rad` rotates the entire text block around the buffer centre
-   (positive = clockwise in screen coordinates). */
+   (positive = clockwise in screen coordinates). `bounds` is updated
+   to the dirty-y range of the resulting alpha+outline pair so the
+   per-frame compose can skip rows the banner doesn't touch. */
 static void render_lines_into(uint8_t *alpha, uint8_t *outline,
+                              BannerBounds *bounds,
                               const char *const *lines,
                               const int *line_y_signs,
                               int n_lines, float angle_rad)
 {
     memset(alpha, 0, (size_t)BANNER_W * BANNER_H);
+    /* Empty-mask sentinels; splat_dot widens them as it draws, then
+       the dilation pass below expands by OUTLINE_RADIUS_PX so the
+       outline halo's vertical extent is covered too. */
+    bounds->min_y = BANNER_H;
+    bounds->max_y = -1;
 
     const float ca = cosf(angle_rad);
     const float sa = sinf(angle_rad);
@@ -238,7 +269,7 @@ static void render_lines_into(uint8_t *alpha, uint8_t *outline,
                     /* Rotate into destination-pixel space and splat. */
                     const float dst_cx = ca * lx - sa * ly + (float)cx;
                     const float dst_cy = sa * lx + ca * ly + (float)cy;
-                    splat_dot(alpha, dst_cx, dst_cy);
+                    splat_dot(alpha, bounds, dst_cx, dst_cy);
                 }
             }
 
@@ -246,13 +277,31 @@ static void render_lines_into(uint8_t *alpha, uint8_t *outline,
         }
     }
 
+    /* Empty mask -- no glyphs landed in the buffer (rendering an empty
+       string, or a name that was all-filtered). Zero the outline so a
+       stale previous render doesn't bleed through, leave bounds in the
+       empty-sentinel state, and skip the dilation pass. */
+    if (bounds->max_y < bounds->min_y) {
+        memset(outline, 0, (size_t)BANNER_W * BANNER_H);
+        return;
+    }
+
     /* Dilate the alpha mask into the outline buffer: each pixel is the
        maximum of `alpha` over a (2R+1) x (2R+1) window centred on it.
        Keeps the soft-edge gradient at the dilation boundary so the
-       outline AA-matches the foreground stroke. Naive 2D max is fine
-       here -- 240*240*25 = ~1.4M comparisons, well under 1 ms. */
-    const int R = OUTLINE_RADIUS_PX;
-    for (int y = 0; y < BANNER_H; ++y) {
+       outline AA-matches the foreground stroke. We only need to write
+       outline pixels in [min_y - R, max_y + R] because anywhere
+       outside that band the alpha window is uniformly zero -- and we
+       memset the whole outline first so stale pixels from a previous
+       render with a wider dirty band can't survive. */
+    const int R          = OUTLINE_RADIUS_PX;
+    const int dilation_y0 = (bounds->min_y > R) ? bounds->min_y - R : 0;
+    const int dilation_y1 = (bounds->max_y + R < BANNER_H)
+                            ? bounds->max_y + R : BANNER_H - 1;
+
+    memset(outline, 0, (size_t)BANNER_W * BANNER_H);
+
+    for (int y = dilation_y0; y <= dilation_y1; ++y) {
         const int y0 = (y > R) ? y - R : 0;
         const int y1 = (y + R < BANNER_H) ? y + R : BANNER_H - 1;
         uint8_t *orow = outline + (size_t)y * BANNER_W;
@@ -273,20 +322,45 @@ static void render_lines_into(uint8_t *alpha, uint8_t *outline,
             orow[x] = m;
         }
     }
+
+    /* Expand bounds to cover the outline halo so the compose pass sees
+       the full dirty range, not just the inner glyph stroke band. */
+    bounds->min_y = dilation_y0;
+    bounds->max_y = dilation_y1;
 }
 
 /* Shared worker: composite a banner alpha + outline pair into an
    RGB565BE frame buffer with the given foreground colour. Outline is
    black (all-zero channels); foreground is the 5/6/5 triple passed in.
-   See banner_compose_overlay() for the per-channel math. */
-static void compose_with(uint16_t *frame, int width, int height,
-                         const uint8_t *alpha, const uint8_t *outline,
+   `bounds` restricts the y loop to the rows where the banner actually
+   has non-zero content (the rasterise pass tracks this so we don't
+   walk the ~70 % of the buffer that's empty in any given rotation).
+   See banner_compose_overlay() for the per-channel math.
+
+   Hot + O3 because this runs every LCD frame in the render task, and
+   the inner loop is precisely the kind of straight-line per-pixel
+   blend GCC can pipeline tightly given the chance. */
+__attribute__((hot, optimize("O3")))
+static void compose_with(uint16_t *__restrict__ frame, int width, int height,
+                         const uint8_t *__restrict__ alpha,
+                         const uint8_t *__restrict__ outline,
+                         BannerBounds bounds,
                          int fg_r5, int fg_g6, int fg_b5)
 {
-    const int w = (width  < BANNER_W) ? width  : BANNER_W;
-    const int h = (height < BANNER_H) ? height : BANNER_H;
+    /* Empty mask -> nothing to do. The empty sentinel is min_y=BANNER_H,
+       max_y=-1, both leaving the loop with zero iterations even without
+       this short-circuit, but the explicit early-out avoids the per-row
+       bounds-clamp math. */
+    if (bounds.max_y < bounds.min_y) {
+        return;
+    }
 
-    for (int y = 0; y < h; ++y) {
+    const int w  = (width  < BANNER_W) ? width  : BANNER_W;
+    const int h  = (height < BANNER_H) ? height : BANNER_H;
+    const int y0 = (bounds.min_y > 0) ? bounds.min_y : 0;
+    const int y1 = (bounds.max_y + 1 < h) ? bounds.max_y + 1 : h;
+
+    for (int y = y0; y < y1; ++y) {
         const uint8_t *arow = alpha   + (size_t)y * BANNER_W;
         const uint8_t *orow = outline + (size_t)y * BANNER_W;
         uint16_t      *frow = frame   + (size_t)y * width;
@@ -369,7 +443,7 @@ void banner_render(float angle_rad)
        the bottom. Together they form the "NEW FACE / DETECTED"
        enrollment overlay. */
     static const int signs[s_line_count] = { -1, +1 };
-    render_lines_into(s_alpha, s_outline, s_lines, signs,
+    render_lines_into(s_alpha, s_outline, &s_green_bounds, s_lines, signs,
                       s_line_count, angle_rad);
 }
 
@@ -423,7 +497,7 @@ void banner_render_name(const char *name, float angle_rad)
 
     const char *const lines[1] = { filtered };
     const int         signs[1] = { +1 };          /* bottom edge */
-    render_lines_into(s_name_alpha, s_name_outline,
+    render_lines_into(s_name_alpha, s_name_outline, &s_name_bounds,
                       lines, signs, 1, angle_rad);
 }
 
@@ -432,7 +506,7 @@ void banner_compose_overlay(uint16_t *frame, int width, int height)
     if (!s_alpha || !s_outline || !frame) {
         return;
     }
-    compose_with(frame, width, height, s_alpha, s_outline,
+    compose_with(frame, width, height, s_alpha, s_outline, s_green_bounds,
                  BANNER_FG_R5, BANNER_FG_G6, BANNER_FG_B5);
 }
 
@@ -442,5 +516,6 @@ void banner_compose_name_overlay(uint16_t *frame, int width, int height)
         return;
     }
     compose_with(frame, width, height, s_name_alpha, s_name_outline,
+                 s_name_bounds,
                  NAME_FG_R5, NAME_FG_G6, NAME_FG_B5);
 }
