@@ -44,15 +44,30 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 # Pin the camera capture task to core 0; the render task runs on core 1.
 CONFIG_CAMERA_CORE0=y
 
-# Brownout detector: when running camera + LCD + ESP-DL inference under
-# USB power the rail can briefly dip below the IDF default threshold
-# (~3.0 V) during peak current draw, even though everything is working
-# correctly. Pick a middle-ground threshold: more permissive than the
-# IDF default (SEL_7, ~3.19 V) so harmless transients don't reset us,
-# but not so low that we let the chip keep running while it's actually
-# under-voltage (which corrupts PSRAM/flash and can hang USB
-# enumeration). If you still see spurious brownouts on a good supply,
-# drop this another step or two.
+# Brownout detector: SEL_4 (2.79 V) is the practical floor we'll
+# tolerate, prioritising memory safety over transient tolerance.
+#
+# Component floors for reference:
+#   * ST7789 LCD: VCC >= 2.4 V.
+#   * OV2640 camera: AVDD >= 2.5 V.
+#   * ESP32-S3: VDD33 spec min 3.0 V; PSRAM / flash interfaces become
+#     unreliable below ~2.9 V (silent corruption rather than a clean
+#     reset).
+#
+# The SoC is the actual limit, not the peripherals. SEL_4 is already
+# below the S3's nominal spec, so a brownout *trigger* at this level
+# is still well-justified -- the rail has dipped further than the chip
+# is meant to operate at, and a clean reset is far better than risking
+# scrambled PSRAM contents. SEL_3 / SEL_2 would only buy more
+# transient tolerance at the cost of letting the chip keep running
+# into undefined-behaviour territory. Don't.
+#
+# If you see *spurious* brownouts on a known-good supply, the right
+# fix is usually a thicker USB cable / better hub / a powered hub,
+# not lowering this threshold further.
+#
+# Levels (S3): 7=3.19 V (IDF default), 6=3.05 V, 5=2.92 V, 4=2.79 V,
+# 3=2.66 V, 2=2.52 V, 1=2.39 V.
 CONFIG_ESP_BROWNOUT_DET_LVL_SEL_7=n
 CONFIG_ESP_BROWNOUT_DET_LVL_SEL_4=y
 CONFIG_ESP_BROWNOUT_DET_LVL=4

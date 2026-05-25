@@ -291,6 +291,14 @@ esp_err_t webserver_init(void)
     // builder and the wildcard handlers fit comfortably.
     cfg.stack_size       = 8192;
     cfg.max_uri_handlers = 8;
+    // Pin the server task to core 1 (same core as face_ai). Default is
+    // tskNO_AFFINITY, which lets it float onto core 0 and contend with
+    // cam_hal + the LCD render task -- exactly the pipeline we want
+    // kept clean for live preview. face_ai is the only consumer on
+    // core 1 and it sleeps NO_FACE_DELAY_MS (40 ms) between misses,
+    // so HTTP requests slot into those gaps cleanly without
+    // perturbing the preview path.
+    cfg.core_id          = 1;
     // Enable wildcard URI matching so a single handler can serve
     // /api/face/<id>/thumb for every id.
     cfg.uri_match_fn     = httpd_uri_match_wildcard;
