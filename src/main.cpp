@@ -181,7 +181,7 @@ static void render_task(void *arg)
         // the frame in-place before pushing it to the LCD. This replaces
         // the old behaviour where the entire screen was hijacked by a
         // static banner buffer.
-        camera_fb_t *fb = esp_camera_fb_get();
+        camera_fb_t *fb = camera_fb_get_square();
         if (!fb) {
             ESP_LOGW(TAG, "frame capture failed");
             vTaskDelay(pdMS_TO_TICKS(10));

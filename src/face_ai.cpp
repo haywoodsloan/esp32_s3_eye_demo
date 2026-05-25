@@ -19,6 +19,7 @@
 
 #include "face_ai.h"
 #include "banner.h"
+#include "camera.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -1809,7 +1810,7 @@ namespace
                 name_banner_cache.angle_bucket = -999;
             }
 
-            camera_fb_t *fb = esp_camera_fb_get();
+            camera_fb_t *fb = camera_fb_get_square();
             if (!fb)
             {
                 vTaskDelay(pdMS_TO_TICKS(20));

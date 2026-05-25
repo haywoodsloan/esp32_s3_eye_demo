@@ -4,7 +4,20 @@
 #include "esp_check.h"
 #include "esp_log.h"
 
+#include <cstring>
+
 static const char *TAG = "camera";
+
+// Capture dimensions. The sensor is configured for 4:3 QVGA so the
+// DSP downscaler operates at equal x/y ratios (true isotropic
+// pixels); we then center-crop to a 240x240 square in software via
+// camera_fb_get_square(). FRAMESIZE_240X240's claimed "1:1" output
+// is in practice anamorphic on OV2640, so we don't use it. See the
+// header for the full story.
+static constexpr int CAM_CAPTURE_W = 320;
+static constexpr int CAM_CAPTURE_H = 240;
+static constexpr int CAM_SQUARE    = 240;
+static constexpr int CAM_CROP_X    = (CAM_CAPTURE_W - CAM_SQUARE) / 2; // 40
 
 esp_err_t camera_init(void)
 {
@@ -35,7 +48,7 @@ esp_err_t camera_init(void)
     cfg.ledc_channel   = LEDC_CHANNEL_0;
 
     cfg.pixel_format   = PIXFORMAT_RGB565;
-    cfg.frame_size     = FRAMESIZE_240X240;
+    cfg.frame_size     = FRAMESIZE_QVGA;        // true-aspect 4:3, cropped to square in software
     cfg.jpeg_quality   = 12;                  // ignored for RGB565
     // Four buffers: one being filled by the camera, one being read by
     // the LCD DMA, one held by the AI task while it runs inference,
@@ -70,7 +83,48 @@ esp_err_t camera_init(void)
         s->set_awb_gain(s, 1);
     }
 
-    ESP_LOGI(TAG, "OV2640 ready: RGB565 %dx%d, %d fb in PSRAM",
-             BOARD_LCD_H_RES, BOARD_LCD_V_RES, cfg.fb_count);
+    ESP_LOGI(TAG, "OV2640 ready: RGB565 %dx%d (capture) -> %dx%d (square) %d fb in PSRAM",
+             CAM_CAPTURE_W, CAM_CAPTURE_H,
+             CAM_SQUARE, CAM_SQUARE, cfg.fb_count);
     return ESP_OK;
+}
+
+camera_fb_t *camera_fb_get_square(void)
+{
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+        return nullptr;
+    }
+    if (fb->width == CAM_SQUARE && fb->height == CAM_SQUARE) {
+        // Already a square frame (e.g. a unit test or someone reconfigured
+        // the sensor at runtime) -- nothing to crop.
+        return fb;
+    }
+    if (fb->width != CAM_CAPTURE_W || fb->height != CAM_CAPTURE_H) {
+        // Unexpected capture size -- return as-is and let the consumer
+        // log/reject. We don't want to silently shred a buffer whose
+        // layout we don't recognise.
+        ESP_LOGW(TAG, "unexpected capture size %dx%d (expected %dx%d)",
+                 (int)fb->width, (int)fb->height,
+                 CAM_CAPTURE_W, CAM_CAPTURE_H);
+        return fb;
+    }
+
+    // Center-crop in place: every output row y in [0, 240) takes the
+    // 240-pixel slice [CAM_CROP_X, CAM_CROP_X + 240) of input row y
+    // and packs it at offset y*240 of the same buffer. Dst always
+    // starts at a lower byte offset than src for every row, so a
+    // forward memmove is safe; we still use memmove (not memcpy) for
+    // the row that straddles -- rows 0..2 -- where dst+rowlen actually
+    // overlaps src.
+    uint16_t *p = reinterpret_cast<uint16_t *>(fb->buf);
+    for (int y = 0; y < CAM_SQUARE; ++y) {
+        std::memmove(p + y * CAM_SQUARE,
+                     p + y * CAM_CAPTURE_W + CAM_CROP_X,
+                     CAM_SQUARE * sizeof(uint16_t));
+    }
+    fb->width  = CAM_SQUARE;
+    fb->height = CAM_SQUARE;
+    fb->len    = static_cast<size_t>(CAM_SQUARE) * CAM_SQUARE * sizeof(uint16_t);
+    return fb;
 }
