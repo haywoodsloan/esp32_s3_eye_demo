@@ -21,6 +21,7 @@
 
 #include "webserver.h"
 #include "face_ai.h"
+#include "web/index_html_data.h"
 
 #include "esp_check.h"
 #include "esp_err.h"
@@ -62,136 +63,13 @@ static void mdns_bringup(void)
     s_mdns_up = true;
     ESP_LOGI(TAG, "mDNS up: http://%s.local/", HOSTNAME);
 }
-
 // --- HTML page ------------------------------------------------------
 
-// Single-file UI. Inline CSS + JS keep us at one HTTP round-trip and
-// avoid having to serve a static asset directory. Polling every few
-// seconds is enough -- enrollments are rare and the UI is meant to be
-// looked at, not stared at.
-static const char INDEX_HTML[] = R"HTML(<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ESP32-S3-EYE faces</title>
-<style>
-  :root { color-scheme: dark; }
-  body {
-    font-family: system-ui, sans-serif;
-    background: #0f1115; color: #e9eaee;
-    margin: 0; padding: 24px;
-  }
-  h1 { margin: 0 0 16px; font-weight: 600; }
-  #status { color: #888; font-size: 13px; margin-bottom: 16px; }
-  #grid { display: grid; gap: 16px;
-          grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); }
-  .card {
-    background: #1a1d24;
-    border: 1px solid #2a2e38;
-    border-radius: 12px;
-    padding: 12px;
-    text-align: center;
-  }
-  .card img {
-    width: 128px; height: 128px;
-    image-rendering: pixelated;
-    background: #000;
-    border-radius: 8px;
-    display: block; margin: 0 auto 8px;
-  }
-  .meta { font-size: 12px; color: #888; margin-bottom: 8px; }
-  .row { display: flex; gap: 6px; }
-  input[type=text] {
-    flex: 1; min-width: 0;
-    background: #0f1115; color: #e9eaee;
-    border: 1px solid #2a2e38; border-radius: 6px;
-    padding: 6px 8px; font: inherit;
-  }
-  button {
-    background: #2a78ff; color: white; border: 0;
-    border-radius: 6px; padding: 6px 12px; cursor: pointer;
-    font: inherit;
-  }
-  button:hover { background: #3a88ff; }
-  .empty { color: #888; padding: 32px; text-align: center; }
-</style>
-</head>
-<body>
-<h1>Detected faces</h1>
-<div id="status">loading\u2026</div>
-<div id="grid"></div>
-<script>
-let lastCount = -1;
-function displayName(f) {
-  return (f.name && f.name.length) ? f.name : ('#' + (f.id + 1));
-}
-async function load() {
-  try {
-    const r = await fetch('/api/faces');
-    const list = await r.json();
-    document.getElementById('status').textContent =
-      list.length + ' face' + (list.length === 1 ? '' : 's') + ' enrolled';
-    if (list.length === lastCount) {
-      // Same count; only refresh names (avoids flashing thumbnails).
-      for (const f of list) {
-        const card  = document.getElementById('face-' + f.id);
-        if (!card) continue;
-        const input = card.querySelector('input');
-        const meta  = card.querySelector('.meta');
-        if (input && document.activeElement !== input) input.value = f.name || '';
-        if (meta) meta.textContent = displayName(f);
-      }
-      return;
-    }
-    lastCount = list.length;
-    const grid = document.getElementById('grid');
-    if (list.length === 0) {
-      grid.innerHTML = '<div class="empty">No faces yet. Stand in front of the camera.</div>';
-      return;
-    }
-    grid.innerHTML = '';
-    for (const f of list) {
-      const card = document.createElement('div');
-      card.className = 'card';
-      card.id = 'face-' + f.id;
-      card.innerHTML =
-        '<img src="/api/face/' + f.id + '/thumb">'
-        + '<div class="meta">' + displayName(f).replace(/</g, '&lt;') + '</div>'
-        + '<div class="row">'
-        +   '<input type="text" placeholder="name" value="'
-        +     (f.name || '').replace(/"/g, '&quot;') + '">'
-        +   '<button>Save</button>'
-        + '</div>';
-      const input = card.querySelector('input');
-      const meta  = card.querySelector('.meta');
-      card.querySelector('button').onclick = async () => {
-        await fetch('/api/face/' + f.id + '/name', {
-          method: 'POST',
-          headers: { 'Content-Type': 'text/plain' },
-          body: input.value
-        });
-        // Optimistic local update so the meta line flips immediately,
-        // before the next poll round-trip lands.
-        f.name = input.value;
-        meta.textContent = displayName(f);
-        load();
-      };
-      input.addEventListener('keydown', e => {
-        if (e.key === 'Enter') card.querySelector('button').click();
-      });
-      grid.appendChild(card);
-    }
-  } catch (err) {
-    document.getElementById('status').textContent = 'error: ' + err;
-  }
-}
-load();
-setInterval(load, 2000);
-</script>
-</body>
-</html>
-)HTML";
+// The UI source of truth is src/web/index.html. A PlatformIO pre-script
+// (scripts/embed_web_html.py) regenerates src/web/index_html_data.h on
+// every build, embedding the file as a raw-string literal in the
+// web:: namespace. That gives us a single-round-trip self-contained
+// page without dragging in SPIFFS or littering this file with HTML.
 
 // --- helpers --------------------------------------------------------
 
@@ -243,7 +121,7 @@ static void bmp_pack_row(const uint16_t *src, int width, uint8_t *dst)
 static esp_err_t handle_root(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html; charset=utf-8");
-    return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
+    return httpd_resp_send(req, web::index_html, web::index_html_len);
 }
 
 static esp_err_t handle_faces_list(httpd_req_t *req)
