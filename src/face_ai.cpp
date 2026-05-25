@@ -451,6 +451,197 @@ namespace
         }
     }
 
+    // ---------------------------------------------------------------
+    // CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    // ---------------------------------------------------------------
+    //
+    // The global percentile stretch we used to apply only fixes the
+    // whole frame's luma distribution; it can't help a face that's
+    // in shadow inside an otherwise bright scene (the global
+    // histogram still looks healthy). CLAHE solves that: the image
+    // is split into a grid of tiles, each tile gets its own
+    // equalisation LUT built from its own histogram, and pixels in
+    // between tiles get bilinearly-interpolated LUT outputs so
+    // there are no visible tile boundaries. A per-tile clip-limit
+    // caps how much any single histogram bin can contribute to its
+    // CDF, which keeps the equalisation from amplifying sensor
+    // noise in flat regions -- the exact failure mode that vanilla
+    // HE has in low light.
+    //
+    // Layout / numbers tuned for the 240x240 detector input:
+    //
+    //   - 4 x 4 tile grid  -> 60 x 60 pixels per tile. Coarser than
+    //     OpenCV's default 8x8 but cheap (12 KB of static state
+    //     instead of 48 KB) and still adapts well to top-vs-bottom
+    //     and left-vs-right lighting differences that matter to
+    //     face detection.
+    //   - clip limit       -> 3 % of tile pixel count (108 of 3600).
+    //     Standard CLAHE value; tighter clipping starves contrast,
+    //     looser clipping starts looking like vanilla HE again.
+    //   - luma proxy       -> G6 expanded to 8 bits. Same proxy the
+    //     percentile path used; cheap to extract from BE-packed
+    //     RGB565.
+    //   - apply            -> per-channel (R / G / B) using the
+    //     SAME luma-derived LUT. Skipping the YCbCr round-trip
+    //     keeps the inner loop tight; minor chroma shift is
+    //     irrelevant to the face detector, and the live preview
+    //     does not see this buffer.
+
+    constexpr int CLAHE_N        = 4;                          // tile grid (N x N)
+    constexpr int CLAHE_TILE_SZ  = FRAME_DIM / CLAHE_N;        // 60
+    constexpr int CLAHE_TILE_PX  = CLAHE_TILE_SZ * CLAHE_TILE_SZ;  // 3600
+    constexpr int CLAHE_CLIP_LIM = CLAHE_TILE_PX * 3 / 100;    // 108
+
+    void apply_clahe(uint16_t *pixels) noexcept
+    {
+        // hist[t] : per-tile 256-bin luma histogram (uint16 is plenty
+        //           since one tile holds CLAHE_TILE_PX = 3600 pixels).
+        // lut[t]  : per-tile 256-entry 8 -> 8-bit equalisation LUT.
+        // Both are `static` so they stay resident in internal SRAM
+        // (random-access in the histogram pass benefits massively
+        // from L1/IRAM speed vs PSRAM) without paying a
+        // malloc/free every detect call.
+        static uint16_t hist[CLAHE_N * CLAHE_N][256];
+        static uint8_t  lut[CLAHE_N * CLAHE_N][256];
+
+        // Precompute the bilinear interpolation tables along each
+        // axis once -- `fx`/`fy` are constant given x/y, and the
+        // tile-index pair (t0, t1) only changes at tile boundaries.
+        // 240 * 3 * sizeof(int16_t) = 1.4 KB total -- trivial.
+        static int16_t fx_tab[FRAME_DIM];   // 0..256
+        static int16_t tx0_tab[FRAME_DIM];
+        static int16_t tx1_tab[FRAME_DIM];
+
+        auto build_axis_table = [](int16_t f_out[FRAME_DIM],
+                                   int16_t t0_out[FRAME_DIM],
+                                   int16_t t1_out[FRAME_DIM]) {
+            for (int x = 0; x < FRAME_DIM; ++x) {
+                const int xc = x - CLAHE_TILE_SZ / 2;
+                int t0 = xc / CLAHE_TILE_SZ;
+                int frac = xc - t0 * CLAHE_TILE_SZ;
+                if (xc < 0) { t0 = 0; frac = 0; }
+                int t1 = t0 + 1;
+                if (t1 >= CLAHE_N) { t1 = CLAHE_N - 1; frac = 0; }
+                f_out[x]  = (int16_t)((frac * 256) / CLAHE_TILE_SZ);
+                t0_out[x] = (int16_t)t0;
+                t1_out[x] = (int16_t)t1;
+            }
+        };
+        static bool axis_tables_built = false;
+        if (!axis_tables_built) {
+            build_axis_table(fx_tab, tx0_tab, tx1_tab);
+            axis_tables_built = true;
+        }
+
+        // ----- Pass 1: per-tile histograms -------------------------
+        std::memset(hist, 0, sizeof(hist));
+        const uint8_t *p8 = (const uint8_t *)pixels;
+        for (int y = 0; y < FRAME_DIM; ++y) {
+            const int ty = y / CLAHE_TILE_SZ;
+            const int row_base = y * FRAME_DIM;
+            for (int x = 0; x < FRAME_DIM; ++x) {
+                const int tx = x / CLAHE_TILE_SZ;
+                const int idx = (row_base + x) * 2;
+                const uint8_t hi = p8[idx];
+                const uint8_t lo = p8[idx + 1];
+                const uint8_t g6 = (uint8_t)(((hi & 0x07) << 3) | (lo >> 5));
+                const uint8_t y8 = (uint8_t)((g6 << 2) | (g6 >> 4));
+                ++hist[ty * CLAHE_N + tx][y8];
+            }
+        }
+
+        // ----- Pass 2: per-tile clip-limit -> CDF -> LUT -----------
+        for (int t = 0; t < CLAHE_N * CLAHE_N; ++t) {
+            // Clip the histogram at CLAHE_CLIP_LIM and tally the
+            // excess that we lopped off.
+            uint32_t excess = 0;
+            for (int v = 0; v < 256; ++v) {
+                if (hist[t][v] > CLAHE_CLIP_LIM) {
+                    excess += hist[t][v] - CLAHE_CLIP_LIM;
+                    hist[t][v] = CLAHE_CLIP_LIM;
+                }
+            }
+            // Redistribute the excess uniformly across all 256 bins
+            // (with the remainder spread across the lowest bins).
+            // This keeps the total pixel count == CLAHE_TILE_PX so
+            // the CDF -> LUT scaling stays normalised.
+            const uint32_t bonus    = excess >> 8;
+            const uint32_t leftover = excess & 0xFF;
+            for (int v = 0; v < 256; ++v) {
+                hist[t][v] += bonus + (v < (int)leftover ? 1 : 0);
+            }
+            // CDF, scaled into the LUT's 0..255 output range.
+            uint32_t cdf = 0;
+            for (int v = 0; v < 256; ++v) {
+                cdf += hist[t][v];
+                lut[t][v] = (uint8_t)((cdf * 255) / CLAHE_TILE_PX);
+            }
+        }
+
+        // ----- Pass 3: apply with bilinear interpolation ----------
+        uint8_t *w8 = (uint8_t *)pixels;
+        for (int y = 0; y < FRAME_DIM; ++y) {
+            // Per-row vertical tile indices and Q8 fraction.
+            const int yc = y - CLAHE_TILE_SZ / 2;
+            int ty0 = yc / CLAHE_TILE_SZ;
+            int ty_frac = yc - ty0 * CLAHE_TILE_SZ;
+            if (yc < 0) { ty0 = 0; ty_frac = 0; }
+            int ty1 = ty0 + 1;
+            if (ty1 >= CLAHE_N) { ty1 = CLAHE_N - 1; ty_frac = 0; }
+            const int fy     = (ty_frac * 256) / CLAHE_TILE_SZ;
+            const int fy_inv = 256 - fy;
+            const int row_base = y * FRAME_DIM;
+
+            for (int x = 0; x < FRAME_DIM; ++x) {
+                const int tx0 = tx0_tab[x];
+                const int tx1 = tx1_tab[x];
+                const int fx  = fx_tab[x];
+                const int fx_inv = 256 - fx;
+
+                const int idx = (row_base + x) * 2;
+                const uint8_t hi = w8[idx];
+                const uint8_t lo = w8[idx + 1];
+                const uint8_t r5 = (uint8_t)(hi >> 3);
+                const uint8_t g6 = (uint8_t)(((hi & 0x07) << 3) | (lo >> 5));
+                const uint8_t b5 = (uint8_t)(lo & 0x1F);
+                const uint8_t r8e = (uint8_t)((r5 << 3) | (r5 >> 2));
+                const uint8_t g8e = (uint8_t)((g6 << 2) | (g6 >> 4));
+                const uint8_t b8e = (uint8_t)((b5 << 3) | (b5 >> 2));
+
+                // Cache the four neighbouring LUT bases for this
+                // pixel. The compiler should hoist these, but
+                // spelling them out keeps the per-channel `interp`
+                // below readable.
+                const uint8_t *l00 = lut[ty0 * CLAHE_N + tx0];
+                const uint8_t *l01 = lut[ty0 * CLAHE_N + tx1];
+                const uint8_t *l10 = lut[ty1 * CLAHE_N + tx0];
+                const uint8_t *l11 = lut[ty1 * CLAHE_N + tx1];
+
+                auto interp = [&](uint8_t v) -> uint8_t {
+                    const int v00 = l00[v];
+                    const int v01 = l01[v];
+                    const int v10 = l10[v];
+                    const int v11 = l11[v];
+                    // Q8 horizontal blend per row, then Q16 vertical
+                    // blend; final shift >> 16 takes us back to 8-bit.
+                    const int top = v00 * fx_inv + v01 * fx;
+                    const int bot = v10 * fx_inv + v11 * fx;
+                    const int tot = top * fy_inv + bot * fy;
+                    return (uint8_t)(tot >> 16);
+                };
+                const uint8_t nr8 = interp(r8e);
+                const uint8_t ng8 = interp(g8e);
+                const uint8_t nb8 = interp(b8e);
+
+                const uint8_t nr5 = (uint8_t)(nr8 >> 3);
+                const uint8_t ng6 = (uint8_t)(ng8 >> 2);
+                const uint8_t nb5 = (uint8_t)(nb8 >> 3);
+                w8[idx]     = (uint8_t)((nr5 << 3) | (ng6 >> 3));
+                w8[idx + 1] = (uint8_t)((ng6 << 5) | nb5);
+            }
+        }
+    }
+
     // Prepare the buffer the detector will read this frame. Returns
     // the pointer to feed into HumanFaceDetect::run(). May return
     // `src` (zero-copy fast path) or `scratch` (after a rotate /
@@ -461,23 +652,29 @@ namespace
                                       int n) noexcept
     {
         int y_lo = 0, y_hi = 255;
-        const bool need_stretch =
+        const bool need_help =
             analyze_luma_subsampled(src, n, y_lo, y_hi);
 
         // Fast path: nothing to do, hand the camera fb to the
         // detector directly. Triggers whenever the user is in good
         // lighting and the detector has locked onto the natural
         // (ROT_0) orientation, which is the dominant runtime case.
-        if (!need_stretch && o == Orient::ROT_0) {
+        if (!need_help && o == Orient::ROT_0) {
             return src;
         }
 
-        if (need_stretch) {
-            uint8_t lut[256];
-            build_stretch_lut(y_lo, y_hi, lut);
-            rotate_to_scratch<true>(o, src, scratch, n, lut);
-        } else {
-            rotate_to_scratch<false>(o, src, scratch, n, nullptr);
+        // Rotate (or memcpy, for ROT_0) into the detector scratch.
+        rotate_to_scratch<false>(o, src, scratch, n, nullptr);
+
+        // CLAHE-equalise the detector input whenever the subsampled
+        // luma histogram came back narrow. This subsumes the older
+        // global percentile stretch -- CLAHE is strictly better at
+        // low-light + mixed-light scenes because the equalisation is
+        // local and clip-limited, so a face in shadow against a
+        // bright background no longer disappears into the histogram
+        // floor.
+        if (need_help) {
+            apply_clahe(scratch);
         }
         return scratch;
     }
