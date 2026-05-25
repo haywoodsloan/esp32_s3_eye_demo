@@ -229,10 +229,17 @@ namespace
     }
 
     // Embeddings are L2-normalised by FeatPostprocessor::l2_norm() before
-    // they leave the model, so cosine similarity collapses to a plain dot
-    // product. ESP-DSP ships an Xtensa LX7 SIMD (PIE) implementation of
-    // dsps_dotprod_f32 that hits roughly 6x the throughput of a plain C
-    // loop on this chip, which matters as the known-face list grows.
+    // they leave the model (verified in esp-dl's
+    // vision/recognition/dl_feat_postprocessor.cpp: postprocess() always
+    // invokes l2_norm() before returning), so cosine similarity collapses
+    // to a plain dot product. ESP-DSP ships an Xtensa LX7 SIMD
+    // implementation of dsps_dotprod_f32 written with the PIE EE.*
+    // 128-bit Q-register instructions; per the official ESP-DSP
+    // benchmark page (docs.espressif.com/projects/esp-dsp/.../esp-dsp-
+    // benchmarks.html) the S3-optimised version at N=256 is roughly
+    // 3-5x the throughput of the ANSI implementation, which is enough
+    // to keep the match loop well under a millisecond even at the full
+    // 32-face DB cap.
     float cosine_sim(const float *__restrict__ a,
                      const float *__restrict__ b, int n) noexcept
     {
@@ -309,11 +316,16 @@ namespace
     {
         switch (o) {
         case Orient::ROT_0:
-            // dsps_memcpy_aes3 is the S3 SIMD memcpy. On a
-            // 16-byte-aligned buffer the SCRATCH<-fb copy of
-            // 115 KB drops to roughly 2/3 the wall time of libc
-            // memcpy because the inner loop pumps 16 bytes per
-            // iteration via the AES3 store-pair extension.
+            // dsps_memcpy_aes3 is the ESP-DSP S3-specific
+            // assembly memcpy (see
+            // managed_components/.../modules/support/mem/esp32s3/
+            // dsps_memcpy_aes3.S). The aligned hot loop pumps
+            // 32 bytes per iteration via two ee.vld.128.ip +
+            // ee.vst.128.ip pairs against the PIE Q registers,
+            // measurably faster than scalar libc memcpy on a
+            // 16-byte-aligned PSRAM->SRAM 115 KB copy. The exact
+            // speedup is workload- and alignment-dependent; ESP-DSP
+            // doesn't publish a benchmark for memcpy specifically.
             dsps_memcpy_aes3(dst, src, (size_t)n * n * sizeof(uint16_t));
             break;
         case Orient::ROT_90_CW:
@@ -697,10 +709,12 @@ namespace
         }
 
         // ----- Pass 1: per-tile histograms -------------------------
-        // dsps_memset_aes3 is the S3-tuned SIMD memset from ESP-DSP;
-        // it clears 16 bytes per inner-loop iteration via the AES3
-        // store extension, ~3-4x faster than libc memset on a 32 KB
-        // buffer in internal SRAM.
+        // dsps_memset_aes3 is the ESP-DSP S3-specific assembly
+        // memset, which writes 16 bytes per ee.vst.128.ip into a
+        // PIE Q register. Faster than libc memset on this 32 KB
+        // buffer; the published ESP-DSP benchmarks don't cover
+        // memset specifically so the exact factor is unmeasured
+        // here.
         dsps_memset_aes3(hist, 0, sizeof(hist));
         const uint8_t *p8 = (const uint8_t *)pixels;
         for (int y = 0; y < FRAME_DIM; ++y) {
@@ -768,16 +782,17 @@ namespace
 
         // ----- Pass 3: apply with bilinear interpolation ----------
         //
-        // OpenMV's CLAHE (which is Zuiderveld's textbook
-        // implementation) equalizes the LUMA channel only and
-        // reconstructs RGB from the equalized Y + the original U/V.
-        // We do the same idea more cheaply: compute Y for each pixel,
-        // bilinear-interp the LUT to get Y', then add `dY = Y' - Y`
-        // to each of R/G/B. Same luma shift on every channel keeps
-        // the chroma differences (R-G, G-B, R-B) identical to the
-        // input, so face skin tones don't drift the way they did
-        // under the previous per-channel CLAHE. Bonus: one bilinear
-        // interpolation per pixel instead of three.
+        // Standard textbook trick (Zuiderveld 1994 and every modern
+        // luma-only CLAHE implementation): equalize the LUMA channel
+        // only and reconstruct RGB from the equalized Y + the
+        // original U/V. We do the same idea more cheaply: compute Y
+        // for each pixel, bilinear-interp the LUT to get Y', then
+        // add `dY = Y' - Y` to each of R/G/B. Same luma shift on
+        // every channel keeps the chroma differences (R-G, G-B,
+        // R-B) identical to the input, so face skin tones don't
+        // drift the way they did under the previous per-channel
+        // CLAHE. Bonus: one bilinear interpolation per pixel
+        // instead of three.
         //
         // Hot-loop micro-optimisations vs the textbook layout:
         //  * The four neighbouring LUT base pointers (l00..l11) only
@@ -925,14 +940,16 @@ namespace
 
     // --- Close-range padded fallback -------------------------------
     //
-    // ESP-WHO's MSR+MNP face detector is trained on faces that occupy
-    // roughly 5-60 % of the image. When the user is very close to the
-    // OV2640 the face fills almost the whole 240x240 frame, which
-    // pushes the detector well outside its training distribution and
-    // causes it to silently fail. The primary detection pass catches
-    // every realistic mid/far-range case; this fallback exists for
-    // when that pass returns nothing despite the user clearly being
-    // there.
+    // ESP-WHO's MSR+MNP face detector silently fails on very-close-
+    // range faces (subject's face filling almost the whole 240x240
+    // frame). The model README
+    // (espressif/esp-dl/models/human_face_detect/README.md) doesn't
+    // publish training-set face-size statistics, so I can't quote
+    // an exact in-distribution range, but empirically: when the
+    // user is sitting at normal arm's-length the primary pass works;
+    // when they lean in to the point the face covers >~80% of the
+    // frame, primary returns nothing. The fallback exists for that
+    // case.
     //
     // The recipe is dead simple: resample the prepared detector
     // buffer down into a centred INNER x INNER box of an otherwise
