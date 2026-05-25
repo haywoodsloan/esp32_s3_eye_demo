@@ -196,11 +196,8 @@ flowchart TD
     AECHECK --> MOTIONGATE{lock expired<br/>AND scene_is_static?}
     MOTIONGATE -- yes --> SKIP[skip pipeline,<br/>vTaskDelay 40 ms]
     MOTIONGATE -- no --> ROTATE[rotate_to_scratch<br/>0/90/180/270 deg into internal SRAM]
-    ROTATE --> CLAHEGATE{clahe_clip_lim &gt; 0?}
-    CLAHEGATE -- DIM / MID --> CLAHE[apply_clahe<br/>fused hist + bilinear LUT apply]
-    CLAHEGATE -- BRIGHT --> LUMASCAN[sample_mean_luma<br/>1/16 stride subsample]
+    ROTATE --> CLAHE[apply_clahe<br/>fused hist + bilinear LUT apply<br/>clip-limit per AE preset]
     CLAHE --> DETECT[HumanFaceDetect::run<br/>MSR + MNP cascade]
-    LUMASCAN --> DETECT
     DETECT --> BIGGEST[pick largest-area result]
     BIGGEST --> PADGATE{empty AND recent lock?}
     PADGATE -- yes --> PADDED[shrink_into_padded<br/>resample into centred 160x160<br/>+ re-run detector]
@@ -248,7 +245,7 @@ the pipeline:
 |---|---|---|---|---|
 | `match_thr` | 0.32 | 0.38 | 0.45 | Cosine-sim floor for "known face". Loosened in DIM where noise drags same-person sims down; tightened in BRIGHT where the cleaner signal lets us be stricter without losing recognitions. |
 | `enroll_debounce` | 2 | 1 | 1 | Frames-in-a-row of "unknown" required before a new enrolment commits. DIM needs the extra frame because high-gain noise can fake a single-frame "unknown" for a known person. |
-| `clahe_clip_lim` | 252 (7 %) | 180 (5 %) | 0 (skip) | Per-tile histogram clip in CLAHE; aggressive in DIM, gentle in MID, disabled in BRIGHT (CLAHE's documented win is concentrated in shadow recovery, and the upstream ESP-DL example feeds raw frames in bright scenes and works fine). |
+| `clahe_clip_lim` | 252 (7 %) | 180 (5 %) | 72 (2 %) | Per-tile histogram clip-limit. Aggressive in DIM (dark scenes need the contrast lift even at the cost of some noise), moderate in MID, and very gentle in BRIGHT (just enough to recover backlit / washed-out faces without amplifying sensor noise in already-flat highlights). |
 
 ### 2. Motion pre-screen
 
@@ -282,18 +279,26 @@ buffer preferentially placed in internal SRAM; if the 115 KB doesn't
 fit alongside the IDF + camera stacks we transparently fall back to
 PSRAM and lose only the bandwidth bonus.
 
-**3b. `apply_clahe()`** — runs unless the BRIGHT preset has gated it
-off. Contrast Limited Adaptive Histogram Equalization on a 4×4 tile
-grid (60×60 px per tile, 16 tiles total). Luma proxy is the G6
-channel expanded to 8 bits — the same value is used both as the
-histogram bin index and the LUT lookup index, so the LUT entry
-applied to a pixel matches the bin that pixel voted into. (Earlier
-versions of this code mismatched the two — hist by G-only, apply by
-RGB-weighted — and silently looked up the wrong bin.) The apply is
-luma-only: compute Y_in, bilinear-interp the LUT across the four
-surrounding tiles to get Y_out, then add the delta `(Y_out - Y_in)`
-to each of R/G/B. Same delta on every channel preserves chroma so
-face skin tones don't drift.
+**3b. `apply_clahe()`** — runs on every detection frame; only the
+clip-limit varies by AE preset (aggressive in DIM, moderate in MID,
+gentle in BRIGHT). Contrast Limited Adaptive Histogram Equalisation
+on a 4×4 tile grid (60×60 px per tile, 16 tiles total). Luma proxy
+is the G6 channel expanded to 8 bits — the same value is used both
+as the histogram bin index and the LUT lookup index, so the LUT
+entry applied to a pixel matches the bin that pixel voted into.
+(Earlier versions of this code mismatched the two — hist by G-only,
+apply by RGB-weighted — and silently looked up the wrong bin.) The
+apply is luma-only: compute Y_in, bilinear-interp the LUT across the
+four surrounding tiles to get Y_out, then add the delta
+`(Y_out - Y_in)` to each of R/G/B. Same delta on every channel
+preserves chroma so face skin tones don't drift.
+
+Note that CLAHE is symmetric — the same per-tile equaliser handles
+*both* dark-narrow and bright-narrow histograms (a tile full of
+washed-out highlight pixels gets its narrow bright band redistributed
+back across 0-255 exactly the way a shadowed tile gets its narrow
+dark band lifted). The clip-limit is the only knob that varies per
+lighting regime.
 
 Implementation note: the histogram build and the apply are **fused
 into one read-modify-write pass over the scratch buffer**. The LUT
@@ -303,11 +308,6 @@ frame N+1. That one-frame staleness saves a full ~115 KB pass over
 internal SRAM each call (~1 ms wall time) and is invisible at the
 detector's ~10 FPS rate. Identity LUT initialisation on the very
 first frame so cold start doesn't black-screen the detector.
-
-**3c. (BRIGHT only) `sample_mean_luma()`** — when CLAHE is skipped
-we still need a live `g_last_mean_luma` value for stage 1 to drive
-the AE preset cycle. A tiny stride-4 subsampled scan (~3600 pixels,
-< 200 µs) stands in.
 
 ### 4. Detection (MSR + MNP cascade)
 

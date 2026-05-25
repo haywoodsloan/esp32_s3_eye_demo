@@ -598,26 +598,23 @@ namespace
     constexpr Tuning TUNING_BRIGHT = {
         0.45f,
         1,
-        // CLAHE disabled in BRIGHT (clip_lim == 0 -> skip). This is
-        // a conservative simplification, not a claim that CLAHE
-        // "breaks" bright scenes -- the canonical references (Pizer
-        // 1987, Zuiderveld 1994; see also the OpenCV CLAHE tutorial)
-        // are clear that the clip-limit's whole purpose is to keep
-        // CLAHE well-behaved on peaky histograms, so a properly
-        // tuned 3 %% clip should not in itself ruin a bright face.
+        // Tight clip-limit (2 % of tile pixel count = 72 / 3600).
+        // CLAHE in bright scenes is for the *low-contrast* failure
+        // modes -- backlit subjects, pale skin against a sunlit
+        // wall, washed-out scenes where the histogram lives in a
+        // narrow bright band -- where the per-tile equaliser
+        // genuinely lifts contrast inside the face. 2 % is the
+        // gentlest clip that still does useful work; anything
+        // looser starts amplifying sensor noise in already-flat
+        // tiles, anything tighter is functionally a no-op.
         //
-        // The reason to skip it here is twofold:
-        //   * The upstream ESP-DL face-recognition example feeds
-        //     raw frames in every lighting condition and detects
-        //     bright faces reliably, so removing preprocessing is
-        //     known to be safe in this regime.
-        //   * CLAHE's documented win is concentrated in low-
-        //     contrast / shadow-recovery scenarios; in BRIGHT it
-        //     is at best neutral and at worst a mild noise
-        //     amplifier on homogeneous skin-tone tiles (Wikipedia
-        //     AHE "Properties" section). Skipping it removes that
-        //     risk and recovers ~5 ms / frame of CPU.
-        0,
+        // Earlier this slot was 0 (CLAHE disabled outright). The
+        // theory at the time -- that the upstream ESP-DL example
+        // feeds raw frames and works fine in bright light, so we
+        // could too -- turned out to be conservative; in practice
+        // re-enabling at a low clip recovered noticeable bright-
+        // light detections without observable downside.
+        TILE_PX_HELPER * 2 / 100,                       // 72 / 3600 = 2%
     };
 
     // Live tuning that the rest of the loop reads. Updated alongside
@@ -945,43 +942,12 @@ namespace
     }
 
     // Sub-sampled mean-luma scan over the rotated detector input.
-    // Used as a fallback for g_last_mean_luma when CLAHE is skipped
-    // (BRIGHT preset) -- without this, the adaptive-AE check sees a
-    // stale value and never transitions BRIGHT -> MID again. Touches
-    // 1/16 of the frame at stride 4 in both axes, ~3600 pixels, < 200
-    // us on the S3.
-    __attribute__((hot))
-    int sample_mean_luma(const uint16_t *pixels) noexcept
-    {
-        const uint8_t *p8 = reinterpret_cast<const uint8_t *>(pixels);
-        uint32_t sum = 0;
-        uint32_t cnt = 0;
-        for (int y = 0; y < FRAME_DIM; y += 4) {
-            const uint8_t *row = p8 + static_cast<size_t>(y) * FRAME_DIM * 2;
-            for (int x = 0; x < FRAME_DIM; x += 4) {
-                const int idx = x * 2;
-                const uint8_t hi = row[idx];
-                const uint8_t lo = row[idx + 1];
-                const uint8_t g6 =
-                    static_cast<uint8_t>(((hi & 0x07) << 3) | (lo >> 5));
-                sum += static_cast<uint32_t>((g6 << 2) | (g6 >> 4));
-                ++cnt;
-            }
-        }
-        return cnt ? static_cast<int>(sum / cnt) : 128;
-    }
-
     // Prepare the buffer the detector will read this frame. Returns
     // the pointer to feed into HumanFaceDetect::run() -- always
     // `scratch` here, since we always rotate (the rotate is required
-    // by the orient-cycle even when CLAHE itself is off).
-    //
-    // CLAHE is gated on g_tuning.clahe_clip_lim: positive => run it
-    // (DIM / MID), zero => skip the apply pass entirely (BRIGHT --
-    // raw rotated frame goes to the detector, same as the default
-    // S3-EYE example does in bright scenes). When skipping, we still
-    // need a frame-mean-luma update to drive the AE preset cycle, so
-    // a tiny subsampled scan stands in for the histogram pass.
+    // by the orient-cycle) and always run CLAHE (gentle clip for
+    // BRIGHT, moderate for MID, aggressive for DIM -- the clip-limit
+    // is the per-preset tuning knob, not the on/off switch).
     __attribute__((hot))
     const uint16_t *prep_detect_input(Orient o,
                                       const uint16_t *src,
@@ -989,12 +955,7 @@ namespace
                                       int n) noexcept
     {
         rotate_to_scratch(o, src, scratch, n);
-        if (g_tuning.clahe_clip_lim > 0) {
-            apply_clahe(scratch);
-        } else {
-            g_last_mean_luma.store(sample_mean_luma(scratch),
-                                   std::memory_order_relaxed);
-        }
+        apply_clahe(scratch);
         return scratch;
     }
 
