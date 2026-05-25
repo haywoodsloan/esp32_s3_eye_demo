@@ -1198,17 +1198,24 @@ namespace
             // detection frame and let the rest of the pipeline treat
             // it like a normal hit.
             dl::detect::result_t padded_remap;
-            // Padded retry now runs on EVERY miss frame, not just
-            // inside the sticky window. The ~80 ms extra detector
-            // call per miss is the cost of admitting that the
-            // close-range out-of-distribution case is real and
-            // happens whenever the user gets closer than the model's
-            // training data covers. Cold-start orient discovery is
-            // still cheap because the primary detector pass on
-            // each orient finishes first; we only pay the padded
-            // cost when the primary returned empty.
-            if (!biggest && padded_scratch && fb->width == FRAME_DIM &&
-                fb->height == FRAME_DIM)
+            // Padded retry pays ~80 ms per call. We want that cost
+            // when the user is in frame and the close-range model-
+            // distribution mismatch is the only thing keeping the
+            // primary pass from finding them, but NOT during cold-
+            // start orient discovery where the face is genuinely
+            // absent on three of the four orients. Heuristic: only
+            // run the retry while we still have a "recent lock"
+            // (consecutive_misses < OVERLAY_CLEAR_MISSES), which is
+            // the same window the on-screen HUD treats as "the
+            // face is still here, just glitching". Past that
+            // window we accept that the face has actually left and
+            // cycle orients at the cheap primary-pass rate until
+            // someone re-appears.
+            const bool padded_eligible =
+                padded_scratch &&
+                fb->width == FRAME_DIM && fb->height == FRAME_DIM &&
+                consecutive_misses < OVERLAY_CLEAR_MISSES;
+            if (!biggest && padded_eligible)
             {
                 shrink_into_padded(to_detect, padded_scratch);
 
