@@ -567,6 +567,14 @@ namespace
     // a stale value.
     std::atomic<int> g_last_mean_luma{128};
 
+    // Latest inter-tile luma spread (max tile mean - min tile mean)
+    // from the 4x4 CLAHE grid. Written by apply_clahe(), exposed as
+    // an atomic so the per-second stats line can log it (useful for
+    // tuning the half-lit / backlit CLAHE boost path). 0 means "all
+    // tiles roughly equal" (flat lighting); 60+ means "harsh
+    // directional lighting".
+    std::atomic<int> g_last_luma_spread{0};
+
     // ---------------------------------------------------------------
     // Adaptive AE bias
     // ---------------------------------------------------------------
@@ -932,23 +940,40 @@ namespace
             }
         }
 
-        // Frame-mean luma from the histograms we just built. Free as
-        // a side-effect of the fused pass. Read by the AE preset cycle
-        // every AE_CHECK_INTERVAL_MS; relaxed ordering is fine because
-        // both writer and reader are the same task here.
+        // Per-tile stats from the histograms we just built:
+        //   * frame mean luma  -- drives the AE preset cycle.
+        //   * inter-tile luma spread (max tile mean - min tile mean)
+        //     -- proxy for "scene is half-lit / strongly directional".
+        //     A flat-lit face produces spread ~5-15 across the 16
+        //     tiles; a half-lit face with the shadow line through
+        //     the cheeks easily hits 60-120. Used below to bump
+        //     the CLAHE clip-limit for asymmetric-lighting scenes
+        //     so the dark side still gets equalised even when the
+        //     frame's mean luma lands in BRIGHT (where the static
+        //     2 % clip is too gentle to do useful work on a deep
+        //     shadow). Free as a side-effect of the per-tile sum.
+        int tile_mean_min = 255;
+        int tile_mean_max = 0;
         {
             uint32_t total_sum = 0;
             for (int t = 0; t < CLAHE_N * CLAHE_N; ++t) {
+                uint32_t tile_sum = 0;
                 for (int v = 0; v < 256; ++v) {
-                    total_sum += static_cast<uint32_t>(hist[t][v]) *
-                                 static_cast<uint32_t>(v);
+                    tile_sum += static_cast<uint32_t>(hist[t][v]) *
+                                static_cast<uint32_t>(v);
                 }
+                total_sum += tile_sum;
+                const int tile_mean = static_cast<int>(tile_sum / CLAHE_TILE_PX);
+                if (tile_mean < tile_mean_min) tile_mean_min = tile_mean;
+                if (tile_mean > tile_mean_max) tile_mean_max = tile_mean;
             }
             g_last_mean_luma.store(
                 static_cast<int>(total_sum /
                                  (static_cast<uint32_t>(FRAME_DIM) * FRAME_DIM)),
                 std::memory_order_relaxed);
         }
+        const int luma_spread = tile_mean_max - tile_mean_min;
+        g_last_luma_spread.store(luma_spread, std::memory_order_relaxed);
 
         // Build NEXT frame's LUT from this frame's histograms. The
         // resulting `lut[][]` will be picked up by the fused pass on
@@ -957,7 +982,29 @@ namespace
         // pass design: by the time we look up `lut[]` in the fused
         // loop above, it's already been built from the previous
         // frame's stats.
-        const int clip_lim = g_tuning.clahe_clip_lim;
+        //
+        // Spread-adaptive clip-limit: start from the preset's base
+        // value, then for half-lit / backlit scenes ramp up toward
+        // the DIM-preset clip (7 %) so CLAHE can actually pull the
+        // dark side of the face out of crush. The ramp is linear
+        // between LUMA_SPREAD_FLAT (= no adjustment) and
+        // LUMA_SPREAD_HARSH (= full DIM-preset clip). Below the
+        // flat threshold the preset's own value wins; above the
+        // harsh threshold we cap at the DIM clip so a single
+        // blown-out highlight can't push the clip past what we'd
+        // use for an actually-dim scene.
+        constexpr int LUMA_SPREAD_FLAT  = 30;
+        constexpr int LUMA_SPREAD_HARSH = 90;
+        constexpr int CLIP_HARSH        = TILE_PX_HELPER * 7 / 100;   // DIM-preset value
+        int clip_lim = g_tuning.clahe_clip_lim;
+        if (luma_spread > LUMA_SPREAD_FLAT && clip_lim < CLIP_HARSH) {
+            const int ramp = std::min(luma_spread, LUMA_SPREAD_HARSH) -
+                             LUMA_SPREAD_FLAT;
+            const int span = LUMA_SPREAD_HARSH - LUMA_SPREAD_FLAT;
+            const int boosted = clip_lim +
+                                ((CLIP_HARSH - clip_lim) * ramp) / span;
+            clip_lim = boosted;
+        }
         for (int t = 0; t < CLAHE_N * CLAHE_N; ++t) {
             // Clip the histogram at the active clip-limit and tally
             // the excess that we lopped off. The clip-limit moves
