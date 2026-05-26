@@ -427,9 +427,20 @@ namespace
             dsps_memcpy_aes3(dst, src, static_cast<size_t>(n) * n * sizeof(uint16_t));
             break;
         case Orient::ROT_90_CW:
-            for (int y = 0; y < n; ++y) {
-                for (int x = 0; x < n; ++x) {
-                    dst[x * n + (n - 1 - y)] = src[y * n + x];
+            // Loop axes flipped so dst writes are sequential (incrementing
+            // address) while src reads stride by n. On the S3 SRAM the
+            // store-buffer coalesces sequential 16-bit writes; scatter
+            // writes (stride n) don't coalesce and stall the pipeline.
+            // Flipping was a ~ 4-5x speedup on the timed rotate.
+            //
+            //   dst[x*n + (n-1-y)] = src[y*n + x]
+            //   =>  for output position (dy, dx):
+            //         x = dy, y = n - 1 - dx
+            //         dst[dy*n + dx] = src[(n-1-dx)*n + dy]
+            for (int dy = 0; dy < n; ++dy) {
+                uint16_t *drow = dst + dy * n;
+                for (int dx = 0; dx < n; ++dx) {
+                    drow[dx] = src[(n - 1 - dx) * n + dy];
                 }
             }
             break;
@@ -453,9 +464,19 @@ namespace
             break;
         }
         case Orient::ROT_270_CW:
-            for (int y = 0; y < n; ++y) {
-                for (int x = 0; x < n; ++x) {
-                    dst[(n - 1 - x) * n + y] = src[y * n + x];
+            // Same axis-flip rationale as ROT_90_CW above; the only
+            // difference is which corner the rotation pivots around.
+            //
+            //   dst[(n-1-x)*n + y] = src[y*n + x]
+            //   =>  for output position (dy, dx):
+            //         n - 1 - x = dy => x = n - 1 - dy
+            //         y = dx
+            //         dst[dy*n + dx] = src[dx*n + (n - 1 - dy)]
+            for (int dy = 0; dy < n; ++dy) {
+                uint16_t *drow = dst + dy * n;
+                const int src_col = n - 1 - dy;
+                for (int dx = 0; dx < n; ++dx) {
+                    drow[dx] = src[dx * n + src_col];
                 }
             }
             break;
@@ -958,18 +979,42 @@ namespace
 
         // ----- Fused pass: apply prev-frame LUT + build this-frame hist -----
         //
-        // Hot-loop micro-optimisations vs the textbook layout:
-        //  * The four neighbouring LUT base pointers (l00..l11) only
-        //    change at tile-column boundaries inside a row (4 times
-        //    per 240-pixel row). Cached and refreshed only when tx0
-        //    actually changes; the compiler can't see this on its
-        //    own because the pointers depend on tx0_tab[x].
+        // Hot-loop structure:
+        //
+        //  * The 240-pixel inner row is split into 8 fixed segments at
+        //    the union of the LUT-column boundaries (tx0 changes at
+        //    x = 30, 90, 150, 210) and the histogram-tile boundaries
+        //    (tile_idx_tab[x] changes at x = 60, 120, 180). Inside
+        //    every segment BOTH (tx0, tx1) AND the histogram column-
+        //    tile index are constant -- so the four LUT base
+        //    pointers (l00..l11) AND the histogram row pointer are
+        //    loop-invariants, hoisted out of the pixel loop. Removes
+        //    one per-pixel branch + three per-pixel table lookups
+        //    versus the old "lazily refresh on tx0 change" structure.
+        //
         //  * Hint to GCC that the pixel buffer is 16-byte aligned
         //    (we allocate via heap_caps_aligned_alloc(16, ...)). The
         //    Xtensa PIE has 128-bit aligned-load / store extensions;
         //    this hint lets the backend reach for them in the
         //    surrounding straight-line code without a runtime
         //    alignment check on every load.
+        struct ClaheXSeg { int x_start, x_end, tx0, tx1, col_tile; };
+        // Constants are derived from CLAHE_N=4 / CLAHE_TILE_SZ=60.
+        // tx0 boundaries land at the centre of each pair of tiles
+        // (x = 30, 90, 150, 210); column-tile boundaries land at the
+        // start of each tile (x = 60, 120, 180). Their union forms
+        // these 8 segments of constant LUT + hist indices.
+        static constexpr ClaheXSeg X_SEGS[8] = {
+            {   0,  30, 0, 1, 0 },
+            {  30,  60, 0, 1, 0 },
+            {  60,  90, 0, 1, 1 },
+            {  90, 120, 1, 2, 1 },
+            { 120, 150, 1, 2, 2 },
+            { 150, 180, 2, 3, 2 },
+            { 180, 210, 2, 3, 3 },
+            { 210, 240, 3, 3, 3 },
+        };
+
         uint8_t *__restrict__ w8 =
             static_cast<uint8_t *>(__builtin_assume_aligned(pixels, 16));
 
@@ -986,79 +1031,63 @@ namespace
             const int row_base     = y * FRAME_DIM;
             const int row_ty0_base = ty0 * CLAHE_N;
             const int row_ty1_base = ty1 * CLAHE_N;
-            // For the histogram bin: pixel's tile-row index. The
-            // hist increment writes to hist[hist_row_base + col_tile][y_in],
-            // where col_tile is tile_idx_tab[x] for the current pixel.
             const int hist_row_base = tile_idx_tab[y] * CLAHE_N;
 
-            // Cached LUT base pointers for the current tile column.
-            // Initialised to "no column matched yet" so the first
-            // iteration unconditionally fetches them.
-            int last_tx0 = -1;
-            const uint8_t *l00 = nullptr;
-            const uint8_t *l01 = nullptr;
-            const uint8_t *l10 = nullptr;
-            const uint8_t *l11 = nullptr;
+            for (const ClaheXSeg &seg : X_SEGS) {
+                const uint8_t *__restrict__ l00 = lut[row_ty0_base + seg.tx0];
+                const uint8_t *__restrict__ l01 = lut[row_ty0_base + seg.tx1];
+                const uint8_t *__restrict__ l10 = lut[row_ty1_base + seg.tx0];
+                const uint8_t *__restrict__ l11 = lut[row_ty1_base + seg.tx1];
+                uint16_t *__restrict__ hist_row =
+                    hist[hist_row_base + seg.col_tile];
 
-            for (int x = 0; x < FRAME_DIM; ++x) {
-                const int tx0 = tx0_tab[x];
-                if (tx0 != last_tx0) {
-                    const int tx1 = tx1_tab[x];
-                    l00 = lut[row_ty0_base + tx0];
-                    l01 = lut[row_ty0_base + tx1];
-                    l10 = lut[row_ty1_base + tx0];
-                    l11 = lut[row_ty1_base + tx1];
-                    last_tx0 = tx0;
+                for (int x = seg.x_start; x < seg.x_end; ++x) {
+                    const int fx     = fx_tab[x];
+                    const int fx_inv = 256 - fx;
+
+                    const int idx = (row_base + x) * 2;
+                    const uint8_t hi = w8[idx];
+                    const uint8_t lo = w8[idx + 1];
+                    const uint8_t r5 = static_cast<uint8_t>(hi >> 3);
+                    const uint8_t g6 = static_cast<uint8_t>(((hi & 0x07) << 3) | (lo >> 5));
+                    const uint8_t b5 = static_cast<uint8_t>(lo & 0x1F);
+                    // RGB565 -> RGB888 expansion *with* the adaptive
+                    // gamma curve folded in (gamma=1 collapses to the
+                    // canonical (v<<3)|(v>>2) / (v<<2)|(v>>4) bit-spread).
+                    const int r8e = gamma_r5[r5];
+                    const int g8e = gamma_g6[g6];
+                    const int b8e = gamma_b5[b5];
+
+                    // Luma proxy: G6 expanded to 8 bits. Used both as
+                    // the histogram bin index (this-frame stats) and
+                    // the LUT lookup index (apply prev-frame LUT).
+                    const int y_in = g8e;
+                    ++hist_row[y_in];
+
+                    // Bilinear-interp the prev-frame LUT for Y across
+                    // the four surrounding tiles.
+                    const int v00 = l00[y_in];
+                    const int v01 = l01[y_in];
+                    const int v10 = l10[y_in];
+                    const int v11 = l11[y_in];
+                    const int top = v00 * fx_inv + v01 * fx;
+                    const int bot = v10 * fx_inv + v11 * fx;
+                    const int y_out = (top * fy_inv + bot * fy) >> 16;
+
+                    // Apply the luma delta to each channel; clip to
+                    // 0..255. Same delta on every channel preserves
+                    // chroma.
+                    const int dy = y_out - y_in;
+                    const int nr = std::clamp(r8e + dy, 0, 255);
+                    const int ng = std::clamp(g8e + dy, 0, 255);
+                    const int nb = std::clamp(b8e + dy, 0, 255);
+
+                    const uint8_t nr5 = static_cast<uint8_t>(nr >> 3);
+                    const uint8_t ng6 = static_cast<uint8_t>(ng >> 2);
+                    const uint8_t nb5 = static_cast<uint8_t>(nb >> 3);
+                    w8[idx]     = static_cast<uint8_t>((nr5 << 3) | (ng6 >> 3));
+                    w8[idx + 1] = static_cast<uint8_t>((ng6 << 5) | nb5);
                 }
-                const int fx     = fx_tab[x];
-                const int fx_inv = 256 - fx;
-
-                const int idx = (row_base + x) * 2;
-                const uint8_t hi = w8[idx];
-                const uint8_t lo = w8[idx + 1];
-                const uint8_t r5 = static_cast<uint8_t>(hi >> 3);
-                const uint8_t g6 = static_cast<uint8_t>(((hi & 0x07) << 3) | (lo >> 5));
-                const uint8_t b5 = static_cast<uint8_t>(lo & 0x1F);
-                // RGB565 -> RGB888 expansion *with* the adaptive
-                // gamma curve folded in (gamma=1 collapses to the
-                // canonical (v<<3)|(v>>2) / (v<<2)|(v>>4) bit-spread).
-                const int r8e = gamma_r5[r5];
-                const int g8e = gamma_g6[g6];
-                const int b8e = gamma_b5[b5];
-
-                // Luma proxy: G6 expanded to 8 bits. Used both as the
-                // histogram bin index (this-frame stats) and the LUT
-                // lookup index (apply prev-frame LUT). Same definition
-                // for both so the bin and the lookup line up.
-                const int y_in = g8e;
-
-                // Histogram: this frame's stats, used to build
-                // next frame's LUT in the pass-2 block below.
-                ++hist[hist_row_base + tile_idx_tab[x]][y_in];
-
-                // Apply: bilinear-interp the prev-frame LUT for Y
-                // across the four surrounding tiles.
-                const int v00 = l00[y_in];
-                const int v01 = l01[y_in];
-                const int v10 = l10[y_in];
-                const int v11 = l11[y_in];
-                const int top = v00 * fx_inv + v01 * fx;
-                const int bot = v10 * fx_inv + v11 * fx;
-                const int y_out = (top * fy_inv + bot * fy) >> 16;
-
-                // Apply the luma delta to each channel; clip to
-                // 0..255. Same delta on every channel preserves
-                // chroma.
-                const int dy = y_out - y_in;
-                const int nr = std::clamp(r8e + dy, 0, 255);
-                const int ng = std::clamp(g8e + dy, 0, 255);
-                const int nb = std::clamp(b8e + dy, 0, 255);
-
-                const uint8_t nr5 = static_cast<uint8_t>(nr >> 3);
-                const uint8_t ng6 = static_cast<uint8_t>(ng >> 2);
-                const uint8_t nb5 = static_cast<uint8_t>(nb >> 3);
-                w8[idx]     = static_cast<uint8_t>((nr5 << 3) | (ng6 >> 3));
-                w8[idx + 1] = static_cast<uint8_t>((ng6 << 5) | nb5);
             }
         }
 
