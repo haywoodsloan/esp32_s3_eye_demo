@@ -13,13 +13,22 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # ESP-DL uses C++ exceptions in a few error paths
 CONFIG_COMPILER_CXX_EXCEPTIONS=y
 
-# ESP-WHO face detection (MSR+MNP two-stage) flashed to its own partition.
-# FLASH_PARTITION (rather than FLASH_RODATA) avoids a PlatformIO + esp-dl
-# CMake bug where the BUILD_DIR relative path gets doubled when generating
-# the embedded-binary .S file. It also keeps the app binary small.
+# ESP-WHO face detection (ESPDet PICO 224x224 single-stage detector)
+# flashed to its own partition. FLASH_PARTITION (rather than
+# FLASH_RODATA) avoids a PlatformIO + esp-dl CMake bug where the
+# BUILD_DIR relative path gets doubled when generating the embedded-
+# binary .S file. It also keeps the app binary small.
+#
+# The two-stage MSR+MNP cascade that was previously the default got
+# benchmarked at mAP50-95 = 0.367 on Espressif's val set; ESPDet PICO
+# 224 hits 0.495 -- a sizeable accuracy improvement that catches
+# glasses, off-angle, far-range, and harsh-lighting cases the cascade
+# was missing. The trade is ~3x inference cost (~130 ms vs ~43 ms),
+# which we accept here.
 CONFIG_HUMAN_FACE_DETECT_MODEL_IN_FLASH_PARTITION=y
-CONFIG_HUMAN_FACE_DETECT_MSRMNP_S8_V1=y
-CONFIG_FLASH_HUMAN_FACE_DETECT_MSRMNP_S8_V1=y
+CONFIG_FLASH_ESPDET_PICO_224_224_FACE=y
+CONFIG_ESPDET_PICO_224_224_FACE=y
+CONFIG_DEFAULT_HUMAN_FACE_DETECT_MODEL=1
 
 # ESP-WHO face recognition (MobileFaceNet, smaller/faster of the two) also
 # in its own partition for the same reason.

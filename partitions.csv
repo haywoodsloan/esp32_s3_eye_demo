@@ -1,7 +1,8 @@
 # ESP32-S3-EYE 8 MB flash layout.
 #
 # - factory:         the app (no ESP-DL models embedded, see sdkconfig)
-# - human_face_det:  ESP-WHO face-detection .espdl blob (MSR + MNP ~190 KB packed)
+# - human_face_det:  ESP-WHO face-detection .espdl blob (ESPDet PICO 224
+#                    is ~496 KB packed, so the partition is 512 KB)
 # - human_face_feat: ESP-WHO face-recognition .espdl blob (MFN ~1.3 MB packed)
 # - storage:         SPIFFS for the face-recognition DB. The face_ai task
 #                    wipes it every boot (clear_all_feats), so its contents
@@ -15,6 +16,6 @@
 nvs,               data, nvs,      0x9000,   0x6000
 phy_init,          data, phy,      0xf000,   0x1000
 factory,           app,  factory,  0x10000,  0x400000
-human_face_det,    data, spiffs,   ,         0x40000
+human_face_det,    data, spiffs,   ,         0x80000
 human_face_feat,   data, spiffs,   ,         0x180000
 storage,           data, spiffs,   ,         0x80000

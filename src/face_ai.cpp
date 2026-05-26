@@ -105,10 +105,11 @@ namespace
     //     sideways) routinely score 0.7-0.9 so this floor doesn't
     //     gate genuine use.
     //
-    // The orient-cycle's other gates -- keypoints_look_upright() and
-    // the IoU recognition cache -- catch the remaining false-positive
-    // classes (upside-down faces with mis-labelled keypoints, blob
-    // misfires on textured backgrounds).
+    // The orient cycle's other gates -- the 2-frame non-ROT_0 lock
+    // confirmation, the ROT_0 cross-check, and the IoU recognition
+    // cache -- catch the remaining false-positive classes (single-
+    // frame fluky lock at the wrong orient, blob misfires on
+    // textured backgrounds).
     constexpr float MIN_DETECT_SCORE_ROT0    = 0.35f;
     constexpr float MIN_DETECT_SCORE_ROTATED = 0.55f;
 
@@ -367,45 +368,49 @@ namespace
     //
     // Every camera frame the AI task picks up runs through:
     //
-    //   1. rotate_to_scratch() -- 0/90/180/270 deg pre-rotation into a
-    //      scratch buffer so the detector (trained on upright faces
-    //      only) sees an upright input. ROT_0 fast-paths to the S3
-    //      SIMD memcpy; the rotated cases write non-sequentially.
+    //   1. prep_detect_input() -- 0/90/180/270 deg pre-rotation into
+    //      an SRAM scratch buffer so the detector (trained on
+    //      upright faces only) sees an upright input. ROT_0 fast-
+    //      paths to the S3 SIMD memcpy; the rotated cases write
+    //      non-sequentially. The same pass sub-samples the rotated
+    //      buffer and publishes mean luma so the adaptive-AE preset
+    //      cycle has live scene-brightness data to act on.
     //
-    //   2. apply_clahe() -- contrast-limited adaptive histogram
-    //      equalisation on the rotated buffer (luma channel only,
-    //      delta-applied to RGB). Skipped in BRIGHT AE mode where it
-    //      would either be a no-op or risk over-stretching noise in
-    //      already-balanced tiles; a tiny subsampled mean-luma scan
-    //      stands in there so the adaptive-AE check still has a
-    //      live value to read.
+    //   2. HumanFaceDetect::run() -- ESPDet PICO 224x224 single-stage
+    //      detector from ESP-DL. The component's own
+    //      ImagePreprocessor handles RGB565 -> RGB888 expansion,
+    //      letterboxing to 224x224, and mean/std normalisation.
     //
-    //   3. HumanFaceDetect::run() -- MSR+MNP cascade from ESP-DL.
-    //
-    //   4. Close-range padded fallback -- if (3) returned nothing but
+    //   3. Close-range padded fallback -- if (2) returned nothing but
     //      the user is still likely in frame, shrink the prepared
     //      buffer into a centred inner box of a mid-grey frame and
     //      re-run the detector. Recovers face-fills-the-frame poses
     //      that the model misses at native scale.
     //
-    //   5. App-level gates: MIN_DETECT_SCORE, keypoints_look_upright(),
-    //      MIN_FACE_PX, MIN_SHARPNESS.
+    //   4. Far-range upscale fallback -- counterpart of (3): a small
+    //      far face below ESPDet's anchor floor gets pulled into
+    //      range by nearest-neighbour upscaling a centred crop. Runs
+    //      on the opposite phase of the orient cycle from (3).
+    //
+    //   5. App-level gates: MIN_DETECT_SCORE, MIN_FACE_PX, MIN_SHARPNESS.
     //
     //   6. Recognition cache (IoU-keyed) -- if the latest detection's
     //      bbox overlaps the previous matched face strongly, skip the
     //      ~50 ms embedder pass and treat it as a continuation.
     //
     //   7. HumanFaceFeat::run() + cosine-similarity sweep over the
-    //      known-face DB (SIMD via dsps_dotprod_f32).
+    //      known-face DB (SIMD via dsps_dotprod_f32). The matcher
+    //      max-pools over each face's gallery of templates.
     //
     //   8. Optional enrol (if no match) or name-banner publish (if
     //      matched against a face that has a user-set name).
 
-    // Pure rotate -- the CLAHE pass that follows handles all the
-    // contrast work, so this function's only job is to land the
-    // upright copy into `dst`. ROT_0 fast-paths to the S3 SIMD
-    // memcpy; the rotated cases are scalar by necessity (non-
-    // sequential stores break SIMD).
+    // Pure rotate -- ESPDet does its own internal preprocessing
+    // (mean=0/std=255 -> [0,1] normalisation + letterbox to 224x224),
+    // so this function's only job is to land the upright copy into
+    // `dst`. ROT_0 fast-paths to the S3 SIMD memcpy; the rotated
+    // cases are scalar by necessity (non-sequential stores break
+    // SIMD).
     __attribute__((hot))
     void rotate_to_scratch(Orient o,
                            const uint16_t *__restrict__ src,
@@ -484,53 +489,13 @@ namespace
     }
 
     // ---------------------------------------------------------------
-    // CLAHE (Contrast Limited Adaptive Histogram Equalization)
-    // ---------------------------------------------------------------
-    //
-    // Splits the frame into a grid of tiles, equalises each tile's
-    // luma histogram independently, and applies the per-tile LUT to
-    // each pixel using bilinear interpolation between the four
-    // surrounding tile centres (so there are no visible tile
-    // boundaries). The per-tile clip-limit caps how much any single
-    // histogram bin can contribute to its CDF -- this is the bit that
-    // keeps the equalisation from amplifying sensor noise in flat
-    // regions, the failure mode that vanilla histogram equalisation
-    // has in low light.
-    //
-    // Layout / numbers tuned for the 240x240 detector input:
-    //
-    //   - 4 x 4 tile grid  -> 60 x 60 pixels per tile. Coarser than
-    //     OpenCV's default 8x8 but cheap (12 KB of static state
-    //     instead of 48 KB) and still adapts well to top-vs-bottom
-    //     and left-vs-right lighting differences that matter to
-    //     face detection.
-    //   - clip limit       -> adaptive via g_tuning.clahe_clip_lim
-    //                         (7 % DIM, 5 % MID, disabled in BRIGHT).
-    //                         See the Tuning struct further down.
-    //   - luma proxy       -> G6 expanded to 8 bits; used for both
-    //                         the histogram bin index and the LUT
-    //                         lookup (the two must match -- earlier
-    //                         iterations of this code mismatched them
-    //                         and silently looked up the wrong bin).
-    //   - apply            -> luma-only equalisation, with the delta
-    //                         (Y_out - Y_in) added to each of R/G/B.
-    //                         Same delta on all channels preserves
-    //                         chroma (face skin tones don't drift).
-    //                         One bilinear interpolation per pixel
-    //                         instead of three.
-
-    constexpr int CLAHE_N        = 4;                          // tile grid (N x N)
-    constexpr int CLAHE_TILE_SZ  = FRAME_DIM / CLAHE_N;        // 60
-    constexpr int CLAHE_TILE_PX  = CLAHE_TILE_SZ * CLAHE_TILE_SZ;  // 3600
-
-    // ---------------------------------------------------------------
     // Motion pre-screen
     // ---------------------------------------------------------------
     //
     // Once the detector lock has fully expired (consecutive_misses
     // beyond OVERLAY_CLEAR_MISSES) the AI loop is just polling a
-    // mostly-empty room. Running CLAHE + the detector + the padded
-    // fallback on every frame in that state is ~80-160 ms of dead
+    // mostly-empty room. Running the detector + the padded / upscale
+    // fallbacks on every frame in that state is ~80-160 ms of dead
     // work per cycle for zero benefit.
     //
     // Standard embedded-vision trick: take a coarse SAD between
@@ -594,26 +559,13 @@ namespace
         m.quiet_frames = 0;
         return false;
     }
-    // CLAHE clip limit is driven by the adaptive tuning (see Tuning
-    // / g_tuning further down). The compile-time CLAHE_TILE_PX is
-    // still useful for the % math when building presets.
-
-    // Latest 0..255 mean luma of the detector input, written by
-    // apply_clahe() (the histogram pass it does covers every pixel,
-    // so the mean is essentially free to compute). Read by the AI
-    // loop's adaptive-AE check; relaxed ordering is fine because
-    // both writer and reader are on the same task, and the only
-    // cross-task reader (web UI heartbeat in the future) tolerates
-    // a stale value.
+    // Latest 0..255 mean luma of the detector input, written each
+    // frame by prep_detect_input() (an 8-stride subsample, ~10 us).
+    // Read by the AI loop's adaptive-AE check; relaxed ordering is
+    // fine because both writer and reader are on the same task, and
+    // the only cross-task reader (web UI heartbeat in the future)
+    // tolerates a stale value.
     std::atomic<int> g_last_mean_luma{128};
-
-    // Latest inter-tile luma spread (max tile mean - min tile mean)
-    // from the 4x4 CLAHE grid. Written by apply_clahe(), exposed as
-    // an atomic so the per-second stats line can log it (useful for
-    // tuning the half-lit / backlit CLAHE boost path). 0 means "all
-    // tiles roughly equal" (flat lighting); 60+ means "harsh
-    // directional lighting".
-    std::atomic<int> g_last_luma_spread{0};
 
     // Latest face-region mean luma, sampled from the locked face's
     // bbox each frame the detector hits. -1 means "no recent face,
@@ -675,53 +627,23 @@ namespace
     //                    fake an unknown for a person we already
     //                    know; MID/BRIGHT can fire on a single
     //                    frame for snappy enrolment latency.
-    //   clahe_clip_lim   per-tile histogram clip-limit for CLAHE.
-    //                    DIM needs aggressive clipping so a flat
-    //                    histogram still produces big output range;
-    //                    BRIGHT needs gentle clipping so an
-    //                    already-balanced scene doesn't get over-
-    //                    contrasted into a posterised look.
 
     struct Tuning {
         float match_thr;
         int   enroll_debounce;
-        int   clahe_clip_lim;   // absolute pixel count, not %
     };
-
-    // Re-derive CLAHE clip absolutes from the tile size for clarity
-    // (rather than baking constants). Tile pixel count is fixed at
-    // compile time, so the % math collapses too.
-    static constexpr int TILE_PX_HELPER = (FRAME_DIM / 4) * (FRAME_DIM / 4); // 3600
 
     constexpr Tuning TUNING_DIM = {
         /*match_thr*/       0.32f,
         /*enroll_debounce*/ 2,
-        /*clahe_clip_lim*/  TILE_PX_HELPER * 9 / 100,   // 324 / 3600 = 9%
     };
     constexpr Tuning TUNING_MID = {
         0.38f,
         1,
-        TILE_PX_HELPER * 5 / 100,                       // 180 / 3600 = 5%
     };
     constexpr Tuning TUNING_BRIGHT = {
         0.45f,
         1,
-        // Bumped from 2 % -> 4 %. 2 % was the gentlest "this still
-        // does useful work" clip, but on backlit scenes (subject
-        // in front of a sunlit window) it left visible shadow
-        // crush on the face. 4 % digs noticeably more out of those
-        // shadows without amplifying sensor noise in the already-
-        // flat bright regions, because CLAHE's clip is a per-tile
-        // cap -- a tile that's already evenly bright has no excess
-        // to redistribute regardless of the cap value.
-        //
-        // Earlier this slot was 0 (CLAHE disabled outright). The
-        // theory at the time -- that the upstream ESP-DL example
-        // feeds raw frames and works fine in bright light, so we
-        // could too -- turned out to be conservative; in practice
-        // re-enabling at a low clip recovered noticeable bright-
-        // light detections without observable downside.
-        TILE_PX_HELPER * 4 / 100,                       // 144 / 3600 = 4%
     };
 
     // Live tuning that the rest of the loop reads. Updated alongside
@@ -800,399 +722,21 @@ namespace
         }
     }
 
-    // The CLAHE apply pass is the hottest 57,600-pixel inner loop
-    // in the project. Marking it `hot` plus per-function `O3` lets
-    // the compiler unroll the inner kernel more aggressively and
-    // -- on this GCC version with the Xtensa LX7 backend -- emit
-    // tighter pipelined sequences for the bilinear + clip math.
+    // Prepare the buffer the detector will read this frame: pre-
+    // rotate the camera fb into the orient-cycle's chosen orientation
+    // (the detector is trained on upright faces only) and write a
+    // fresh mean luma to g_last_mean_luma so the adaptive-AE cycle
+    // has something to act on. ESPDet handles its own input
+    // normalisation and is robust enough to lighting variation that
+    // application-side CLAHE / gamma preprocessing -- which the
+    // earlier MSR+MNP cascade benefited from -- actively hurts here
+    // by pushing the input outside ESPDet's training distribution.
     //
-    // Single-pass design: the histogram build and the LUT apply are
-    // fused into one buffer read/modify/write loop. The applied LUT
-    // is the *previous* frame's; the histogram we build during this
-    // pass produces the LUT we'll apply on the *next* frame. That
-    // costs us one frame of LUT staleness on a hard scene change
-    // (invisible at the detector's ~10 FPS rate) and saves a full
-    // ~115 KB pass over the internal-SRAM scratch each call.
-    //
-    // Luma proxy is the G6 channel expanded to 8 bits, used for both
-    // the histogram index and the LUT lookup. Earlier versions of
-    // this code mismatched the two -- hist used G-only, apply used
-    // 0.25R + 0.5G + 0.25B -- so the LUT entry being looked up did
-    // not actually correspond to the bin that pixel had voted into.
-    // Using G everywhere fixes that latent inconsistency and is also
-    // measurably faster (no R5/B5 unpack on the luma path).
-    __attribute__((hot, optimize("O3")))
-    void apply_clahe(uint16_t *pixels) noexcept
-    {
-        // hist[t]   : per-tile 256-bin G6-derived luma histogram for
-        //             the CURRENT frame. Rebuilt every call.
-        // lut[t]    : per-tile 256-entry LUT. Read as the "apply" LUT
-        //             during the fused pass (built from the PREVIOUS
-        //             frame's hist), then overwritten with the new
-        //             LUT built from this frame's hist for next time.
-        // Both static -> internal SRAM (BSS), no malloc/free per call.
-        static uint16_t hist[CLAHE_N * CLAHE_N][256];
-        static uint8_t  lut[CLAHE_N * CLAHE_N][256];
-
-        // Precompute the bilinear interpolation tables along each
-        // axis once -- `fx`/`fy` are constant given x/y, and the
-        // tile-index pair (t0, t1) only changes at tile boundaries.
-        // We also cache the simple `x / CLAHE_TILE_SZ` map used by
-        // the histogram pass; Xtensa LX7 has no integer-divide
-        // instruction so the compiler lowers /60 to a multiply-by-
-        // reciprocal sequence, and a byte-wide table replaces ~3-5
-        // cycles with a single load.
-        // 240 * 4 * sizeof(int16_t) ~ 1.9 KB total -- trivial.
-        static int16_t fx_tab[FRAME_DIM];   // 0..256
-        static int16_t tx0_tab[FRAME_DIM];
-        static int16_t tx1_tab[FRAME_DIM];
-        static int8_t  tile_idx_tab[FRAME_DIM];
-
-        auto build_axis_table = [](int16_t f_out[FRAME_DIM],
-                                   int16_t t0_out[FRAME_DIM],
-                                   int16_t t1_out[FRAME_DIM]) {
-            for (int x = 0; x < FRAME_DIM; ++x) {
-                const int xc = x - CLAHE_TILE_SZ / 2;
-                int t0 = xc / CLAHE_TILE_SZ;
-                int frac = xc - t0 * CLAHE_TILE_SZ;
-                if (xc < 0) { t0 = 0; frac = 0; }
-                int t1 = t0 + 1;
-                if (t1 >= CLAHE_N) { t1 = CLAHE_N - 1; frac = 0; }
-                f_out[x]  = (int16_t)((frac * 256) / CLAHE_TILE_SZ);
-                t0_out[x] = (int16_t)t0;
-                t1_out[x] = (int16_t)t1;
-            }
-        };
-        static bool axis_tables_built = false;
-        if (!axis_tables_built) {
-            build_axis_table(fx_tab, tx0_tab, tx1_tab);
-            for (int x = 0; x < FRAME_DIM; ++x) {
-                tile_idx_tab[x] = (int8_t)(x / CLAHE_TILE_SZ);
-            }
-            axis_tables_built = true;
-        }
-
-        // First-call LUT initialisation. Without this, the very first
-        // frame would apply uninitialised (zero) LUTs and the detector
-        // would see a solid-black image. Identity LUT means the first
-        // frame passes through unchanged; from frame 2 on we have a
-        // properly-built CLAHE LUT from the previous frame's stats.
-        static bool lut_initialised = false;
-        if (!lut_initialised) {
-            for (int t = 0; t < CLAHE_N * CLAHE_N; ++t) {
-                for (int v = 0; v < 256; ++v) {
-                    lut[t][v] = static_cast<uint8_t>(v);
-                }
-            }
-            lut_initialised = true;
-        }
-
-        // ---------------------------------------------------------------
-        // Adaptive gamma (auto-tone) -- fused into the RGB565->RGB888
-        // byte expansion below as three tiny LUTs (32 + 64 + 32 entries
-        // = 128 bytes), so it costs nothing extra in the hot loop and
-        // composes cleanly in front of the existing per-tile CLAHE.
-        //
-        // Rationale -- why a global tone curve in addition to CLAHE:
-        //
-        // CLAHE is a *local* contrast equaliser; it does nothing to the
-        // *global* midpoint of the image. When the sensor's AE under-
-        // exposes (lamp-lit room, mean luma drifting to ~70) or over-
-        // exposes (subject in front of a window, mean ~200) CLAHE
-        // still has to work against a midtone that's far from the
-        // detector's training distribution.
-        //
-        // A power-law gamma curve is the cheapest way to retarget the
-        // global midpoint to 128. We solve gamma so that
-        //
-        //     255 * (prev_mean/255)^gamma == 128
-        //
-        // which gives gamma = log(128/255) / log(prev_mean/255).
-        // For prev_mean = 70 this is gamma ~= 0.53 (brightens shadows);
-        // for prev_mean = 200 it's gamma ~= 2.86 (compresses highlights).
-        // We clamp to [0.55, 1.7] so we never apply a transform so
-        // extreme that the sensor's noise gets amplified beyond what
-        // the detector tolerates -- this clamp range is empirically
-        // similar to what's used in Tan & Triggs' face-recognition
-        // preprocessing (2007), where gamma=0.5 is recommended as the
-        // first stage of their illumination-normalisation pipeline.
-        //
-        // The LUT is folded INTO the RGB565->RGB888 byte expansion the
-        // CLAHE loop already does for each pixel, so the inner-loop
-        // cost change is "three LUT loads vs three shift+OR pairs":
-        // a wash on the S3, and the LUTs are small enough to stay hot
-        // in I/D cache for the full frame.
-        //
-        // Refs:
-        //  - Tan, X. & Triggs, B., "Enhanced Local Texture Feature Sets
-        //    for Face Recognition Under Difficult Lighting Conditions",
-        //    IEEE TIP 2010 (gamma -> DoG -> contrast eq.).
-        //  - Huang, S.-C. et al., "Efficient Contrast Enhancement Using
-        //    Adaptive Gamma Correction With Weighting Distribution",
-        //    IEEE TIP 2013 (auto-gamma from histogram CDF).
-        //  - Pizer, S. et al., "Adaptive Histogram Equalization and Its
-        //    Variations", CVGIP 1987 (CLAHE itself).
-        static uint8_t gamma_r5[32];
-        static uint8_t gamma_g6[64];
-        static uint8_t gamma_b5[32];
-        static float   last_gamma = 0.f;
-        {
-            const int prev_mean = g_last_mean_luma.load(std::memory_order_relaxed);
-            constexpr int   GAMMA_TARGET = 128;
-            constexpr float GAMMA_MIN    = 0.55f;
-            constexpr float GAMMA_MAX    = 1.70f;
-            float target_gamma = 1.0f;
-            if (prev_mean >= 10 && prev_mean <= 245 &&
-                prev_mean != GAMMA_TARGET)
-            {
-                const float num = std::log(GAMMA_TARGET / 255.0f);
-                const float den = std::log(prev_mean / 255.0f);
-                target_gamma = std::clamp(num / den, GAMMA_MIN, GAMMA_MAX);
-            }
-            // Rebuild only on meaningful drift -- powf is ~ 100 ns per
-            // call on the S3 FPU, and rebuilding 128 entries every
-            // frame would burn ~ 13 us per frame for no visible benefit.
-            if (last_gamma == 0.f ||
-                std::fabs(target_gamma - last_gamma) > 0.04f)
-            {
-                last_gamma = target_gamma;
-                const float inv_255 = 1.0f / 255.0f;
-                for (int i = 0; i < 32; ++i) {
-                    const int   v8 = (i << 3) | (i >> 2);
-                    const float g  = std::pow(v8 * inv_255, target_gamma);
-                    const int   out = std::clamp(
-                        static_cast<int>(g * 255.0f + 0.5f), 0, 255);
-                    gamma_r5[i] = static_cast<uint8_t>(out);
-                    gamma_b5[i] = static_cast<uint8_t>(out);
-                }
-                for (int i = 0; i < 64; ++i) {
-                    const int   v8 = (i << 2) | (i >> 4);
-                    const float g  = std::pow(v8 * inv_255, target_gamma);
-                    const int   out = std::clamp(
-                        static_cast<int>(g * 255.0f + 0.5f), 0, 255);
-                    gamma_g6[i] = static_cast<uint8_t>(out);
-                }
-            }
-        }
-
-        dsps_memset_aes3(hist, 0, sizeof(hist));
-
-        // ----- Fused pass: apply prev-frame LUT + build this-frame hist -----
-        //
-        // Hot-loop structure:
-        //
-        //  * The 240-pixel inner row is split into 8 fixed segments at
-        //    the union of the LUT-column boundaries (tx0 changes at
-        //    x = 30, 90, 150, 210) and the histogram-tile boundaries
-        //    (tile_idx_tab[x] changes at x = 60, 120, 180). Inside
-        //    every segment BOTH (tx0, tx1) AND the histogram column-
-        //    tile index are constant -- so the four LUT base
-        //    pointers (l00..l11) AND the histogram row pointer are
-        //    loop-invariants, hoisted out of the pixel loop. Removes
-        //    one per-pixel branch + three per-pixel table lookups
-        //    versus the old "lazily refresh on tx0 change" structure.
-        //
-        //  * Hint to GCC that the pixel buffer is 16-byte aligned
-        //    (we allocate via heap_caps_aligned_alloc(16, ...)). The
-        //    Xtensa PIE has 128-bit aligned-load / store extensions;
-        //    this hint lets the backend reach for them in the
-        //    surrounding straight-line code without a runtime
-        //    alignment check on every load.
-        struct ClaheXSeg { int x_start, x_end, tx0, tx1, col_tile; };
-        // Constants are derived from CLAHE_N=4 / CLAHE_TILE_SZ=60.
-        // tx0 boundaries land at the centre of each pair of tiles
-        // (x = 30, 90, 150, 210); column-tile boundaries land at the
-        // start of each tile (x = 60, 120, 180). Their union forms
-        // these 8 segments of constant LUT + hist indices.
-        static constexpr ClaheXSeg X_SEGS[8] = {
-            {   0,  30, 0, 1, 0 },
-            {  30,  60, 0, 1, 0 },
-            {  60,  90, 0, 1, 1 },
-            {  90, 120, 1, 2, 1 },
-            { 120, 150, 1, 2, 2 },
-            { 150, 180, 2, 3, 2 },
-            { 180, 210, 2, 3, 3 },
-            { 210, 240, 3, 3, 3 },
-        };
-
-        uint8_t *__restrict__ w8 =
-            static_cast<uint8_t *>(__builtin_assume_aligned(pixels, 16));
-
-        for (int y = 0; y < FRAME_DIM; ++y) {
-            // Per-row vertical tile indices and Q8 fraction.
-            const int yc = y - CLAHE_TILE_SZ / 2;
-            int ty0 = yc / CLAHE_TILE_SZ;
-            int ty_frac = yc - ty0 * CLAHE_TILE_SZ;
-            if (yc < 0) { ty0 = 0; ty_frac = 0; }
-            int ty1 = ty0 + 1;
-            if (ty1 >= CLAHE_N) { ty1 = CLAHE_N - 1; ty_frac = 0; }
-            const int fy           = (ty_frac * 256) / CLAHE_TILE_SZ;
-            const int fy_inv       = 256 - fy;
-            const int row_base     = y * FRAME_DIM;
-            const int row_ty0_base = ty0 * CLAHE_N;
-            const int row_ty1_base = ty1 * CLAHE_N;
-            const int hist_row_base = tile_idx_tab[y] * CLAHE_N;
-
-            for (const ClaheXSeg &seg : X_SEGS) {
-                const uint8_t *__restrict__ l00 = lut[row_ty0_base + seg.tx0];
-                const uint8_t *__restrict__ l01 = lut[row_ty0_base + seg.tx1];
-                const uint8_t *__restrict__ l10 = lut[row_ty1_base + seg.tx0];
-                const uint8_t *__restrict__ l11 = lut[row_ty1_base + seg.tx1];
-                uint16_t *__restrict__ hist_row =
-                    hist[hist_row_base + seg.col_tile];
-
-                for (int x = seg.x_start; x < seg.x_end; ++x) {
-                    const int fx     = fx_tab[x];
-                    const int fx_inv = 256 - fx;
-
-                    const int idx = (row_base + x) * 2;
-                    const uint8_t hi = w8[idx];
-                    const uint8_t lo = w8[idx + 1];
-                    const uint8_t r5 = static_cast<uint8_t>(hi >> 3);
-                    const uint8_t g6 = static_cast<uint8_t>(((hi & 0x07) << 3) | (lo >> 5));
-                    const uint8_t b5 = static_cast<uint8_t>(lo & 0x1F);
-                    // RGB565 -> RGB888 expansion *with* the adaptive
-                    // gamma curve folded in (gamma=1 collapses to the
-                    // canonical (v<<3)|(v>>2) / (v<<2)|(v>>4) bit-spread).
-                    const int r8e = gamma_r5[r5];
-                    const int g8e = gamma_g6[g6];
-                    const int b8e = gamma_b5[b5];
-
-                    // Luma proxy: G6 expanded to 8 bits. Used both as
-                    // the histogram bin index (this-frame stats) and
-                    // the LUT lookup index (apply prev-frame LUT).
-                    const int y_in = g8e;
-                    ++hist_row[y_in];
-
-                    // Bilinear-interp the prev-frame LUT for Y across
-                    // the four surrounding tiles.
-                    const int v00 = l00[y_in];
-                    const int v01 = l01[y_in];
-                    const int v10 = l10[y_in];
-                    const int v11 = l11[y_in];
-                    const int top = v00 * fx_inv + v01 * fx;
-                    const int bot = v10 * fx_inv + v11 * fx;
-                    const int y_out = (top * fy_inv + bot * fy) >> 16;
-
-                    // Apply the luma delta to each channel; clip to
-                    // 0..255. Same delta on every channel preserves
-                    // chroma.
-                    const int dy = y_out - y_in;
-                    const int nr = std::clamp(r8e + dy, 0, 255);
-                    const int ng = std::clamp(g8e + dy, 0, 255);
-                    const int nb = std::clamp(b8e + dy, 0, 255);
-
-                    const uint8_t nr5 = static_cast<uint8_t>(nr >> 3);
-                    const uint8_t ng6 = static_cast<uint8_t>(ng >> 2);
-                    const uint8_t nb5 = static_cast<uint8_t>(nb >> 3);
-                    w8[idx]     = static_cast<uint8_t>((nr5 << 3) | (ng6 >> 3));
-                    w8[idx + 1] = static_cast<uint8_t>((ng6 << 5) | nb5);
-                }
-            }
-        }
-
-        // Per-tile stats from the histograms we just built:
-        //   * frame mean luma  -- drives the AE preset cycle.
-        //   * inter-tile luma spread (max tile mean - min tile mean)
-        //     -- proxy for "scene is half-lit / strongly directional".
-        //     A flat-lit face produces spread ~5-15 across the 16
-        //     tiles; a half-lit face with the shadow line through
-        //     the cheeks easily hits 60-120. Used below to bump
-        //     the CLAHE clip-limit for asymmetric-lighting scenes
-        //     so the dark side still gets equalised even when the
-        //     frame's mean luma lands in BRIGHT (where the static
-        //     2 % clip is too gentle to do useful work on a deep
-        //     shadow). Free as a side-effect of the per-tile sum.
-        int tile_mean_min = 255;
-        int tile_mean_max = 0;
-        {
-            uint32_t total_sum = 0;
-            for (int t = 0; t < CLAHE_N * CLAHE_N; ++t) {
-                uint32_t tile_sum = 0;
-                for (int v = 0; v < 256; ++v) {
-                    tile_sum += static_cast<uint32_t>(hist[t][v]) *
-                                static_cast<uint32_t>(v);
-                }
-                total_sum += tile_sum;
-                const int tile_mean = static_cast<int>(tile_sum / CLAHE_TILE_PX);
-                if (tile_mean < tile_mean_min) tile_mean_min = tile_mean;
-                if (tile_mean > tile_mean_max) tile_mean_max = tile_mean;
-            }
-            g_last_mean_luma.store(
-                static_cast<int>(total_sum /
-                                 (static_cast<uint32_t>(FRAME_DIM) * FRAME_DIM)),
-                std::memory_order_relaxed);
-        }
-        const int luma_spread = tile_mean_max - tile_mean_min;
-        g_last_luma_spread.store(luma_spread, std::memory_order_relaxed);
-
-        // Build NEXT frame's LUT from this frame's histograms. The
-        // resulting `lut[][]` will be picked up by the fused pass on
-        // the next apply_clahe() call. Doing this last (rather than
-        // mid-function as the old pass 2) is what enables the single-
-        // pass design: by the time we look up `lut[]` in the fused
-        // loop above, it's already been built from the previous
-        // frame's stats.
-        //
-        // Spread-adaptive clip-limit: start from the preset's base
-        // value, then for half-lit / backlit scenes ramp up toward
-        // the DIM-preset clip (7 %) so CLAHE can actually pull the
-        // dark side of the face out of crush. The ramp is linear
-        // between LUMA_SPREAD_FLAT (= no adjustment) and
-        // LUMA_SPREAD_HARSH (= full DIM-preset clip). Below the
-        // flat threshold the preset's own value wins; above the
-        // harsh threshold we cap at the DIM clip so a single
-        // blown-out highlight can't push the clip past what we'd
-        // use for an actually-dim scene.
-        constexpr int LUMA_SPREAD_FLAT  = 30;
-        constexpr int LUMA_SPREAD_HARSH = 90;
-        constexpr int CLIP_HARSH        = TILE_PX_HELPER * 9 / 100;   // DIM-preset value
-        int clip_lim = g_tuning.clahe_clip_lim;
-        if (luma_spread > LUMA_SPREAD_FLAT && clip_lim < CLIP_HARSH) {
-            const int ramp = std::min(luma_spread, LUMA_SPREAD_HARSH) -
-                             LUMA_SPREAD_FLAT;
-            const int span = LUMA_SPREAD_HARSH - LUMA_SPREAD_FLAT;
-            const int boosted = clip_lim +
-                                ((CLIP_HARSH - clip_lim) * ramp) / span;
-            clip_lim = boosted;
-        }
-        for (int t = 0; t < CLAHE_N * CLAHE_N; ++t) {
-            // Clip the histogram at the active clip-limit and tally
-            // the excess that we lopped off. The clip-limit moves
-            // with the AE preset so a dim scene gets aggressive
-            // boost while a bright scene gets a gentle touch-up.
-            uint32_t excess = 0;
-            for (int v = 0; v < 256; ++v) {
-                if (hist[t][v] > clip_lim) {
-                    excess += hist[t][v] - clip_lim;
-                    hist[t][v] = clip_lim;
-                }
-            }
-            // Redistribute the excess uniformly across all 256 bins
-            // (with the remainder spread across the lowest bins).
-            // This keeps the total pixel count == CLAHE_TILE_PX so
-            // the CDF -> LUT scaling stays normalised.
-            const uint32_t bonus    = excess >> 8;
-            const uint32_t leftover = excess & 0xFF;
-            for (int v = 0; v < 256; ++v) {
-                hist[t][v] += bonus + (v < static_cast<int>(leftover) ? 1 : 0);
-            }
-            // CDF, scaled into the LUT's 0..255 output range.
-            uint32_t cdf = 0;
-            for (int v = 0; v < 256; ++v) {
-                cdf += hist[t][v];
-                lut[t][v] = static_cast<uint8_t>((cdf * 255) / CLAHE_TILE_PX);
-            }
-        }
-    }
-
-    // Sub-sampled mean-luma scan over the rotated detector input.
-    // Prepare the buffer the detector will read this frame. Returns
-    // the pointer to feed into HumanFaceDetect::run() -- always
-    // `scratch` here, since we always rotate (the rotate is required
-    // by the orient-cycle) and always run CLAHE (gentle clip for
-    // BRIGHT, moderate for MID, aggressive for DIM -- the clip-limit
-    // is the per-preset tuning knob, not the on/off switch).
+    // Returns the pointer to feed into HumanFaceDetect::run() -- the
+    // rotated scratch buffer in all cases (the rotation must happen
+    // before the detector sees the frame, and we can't mutate the
+    // camera fb because the render task on the other core is using
+    // it for the live preview).
     __attribute__((hot))
     const uint16_t *prep_detect_input(Orient o,
                                       const uint16_t *src,
@@ -1200,51 +744,31 @@ namespace
                                       int n) noexcept
     {
         rotate_to_scratch(o, src, scratch, n);
-#if CONFIG_ESPDET_PICO_224_224_FACE || CONFIG_ESPDET_PICO_416_416_FACE
-        // ESPDet's single-stage anchor-free detector was trained on
-        // natural-image input statistics; our adaptive gamma + per-
-        // tile CLAHE preprocessing pushes pixel distributions far
-        // enough out of distribution that the model returns zero
-        // detections on a face that's plainly in frame. Skip the
-        // heavy preprocessing for ESPDet builds -- the ImagePre-
-        // processor inside the component handles its own [0..1]
-        // normalisation, and ESPDet's published mAP50-95 of 0.495
-        // already factors in robust handling of lighting variation.
-        //
-        // We still need to keep g_last_mean_luma fresh so the AE
-        // preset cycle works, so do a coarse mean-luma scan in
-        // place of apply_clahe's "free side effect" mean.
-        {
-            const uint8_t *p8 = reinterpret_cast<const uint8_t *>(scratch);
-            uint32_t sum = 0;
-            uint32_t cnt = 0;
-            for (int y = 0; y < FRAME_DIM; y += 8) {
-                const int row_base = y * FRAME_DIM;
-                for (int x = 0; x < FRAME_DIM; x += 8) {
-                    const int idx = (row_base + x) * 2;
-                    const uint8_t hi = p8[idx];
-                    const uint8_t lo = p8[idx + 1];
-                    const uint8_t g6 = static_cast<uint8_t>(
-                        ((hi & 0x07) << 3) | (lo >> 5));
-                    sum += static_cast<uint32_t>((g6 << 2) | (g6 >> 4));
-                    ++cnt;
-                }
+
+        // 8-stride sub-sampled mean of the G6-derived luma proxy.
+        // ~ 900 pixel reads / call, well under 100 us, gives the AE
+        // preset cycle a stable scene-luma readout to follow.
+        const uint8_t *p8 = reinterpret_cast<const uint8_t *>(scratch);
+        uint32_t sum = 0;
+        uint32_t cnt = 0;
+        for (int y = 0; y < FRAME_DIM; y += 8) {
+            const int row_base = y * FRAME_DIM;
+            for (int x = 0; x < FRAME_DIM; x += 8) {
+                const int idx = (row_base + x) * 2;
+                const uint8_t hi = p8[idx];
+                const uint8_t lo = p8[idx + 1];
+                const uint8_t g6 = static_cast<uint8_t>(
+                    ((hi & 0x07) << 3) | (lo >> 5));
+                sum += static_cast<uint32_t>((g6 << 2) | (g6 >> 4));
+                ++cnt;
             }
-            if (cnt) {
-                g_last_mean_luma.store(static_cast<int>(sum / cnt),
-                                       std::memory_order_relaxed);
-            }
-            // No per-tile spread proxy here; CLAHE is disabled so
-            // the spread-adaptive clip-limit path is moot. Keep the
-            // atomic at zero so anyone reading it sees "flat".
-            g_last_luma_spread.store(0, std::memory_order_relaxed);
         }
-#else
-        apply_clahe(scratch);
-#endif
+        if (cnt) {
+            g_last_mean_luma.store(static_cast<int>(sum / cnt),
+                                   std::memory_order_relaxed);
+        }
         return scratch;
     }
-
     // --- Close-range padded fallback -------------------------------
     //
     // ESP-WHO's MSR+MNP face detector silently fails on very-close-
@@ -1427,7 +951,7 @@ namespace
                 const uint8_t hi  = p8[idx];
                 const uint8_t lo  = p8[idx + 1];
                 // G6 expanded to 8 bits = luma proxy, matching what
-                // apply_clahe() uses for g_last_mean_luma.
+                // prep_detect_input() uses for g_last_mean_luma.
                 const uint8_t g6  = static_cast<uint8_t>(((hi & 0x07) << 3) |
                                                          (lo >> 5));
                 sum += static_cast<uint32_t>((g6 << 2) | (g6 >> 4));
@@ -1497,83 +1021,11 @@ namespace
         }
     }
 
-    // Reject detections whose keypoint geometry doesn't match an
-    // upright face in the DETECTOR INPUT frame. The primary failure
-    // mode this guards against is the detector firing on an upside-
-    // down face (faces have rough top/bottom symmetry: forehead vs
-    // chin, eye sockets vs nostrils). The previous "nose below
-    // eye-midline" check wasn't enough because when the detector
-    // does fire on a flipped face it labels keypoints CORRECTLY for
-    // what it sees, which means the nose lands above the eye
-    // midline in detector coords and the check is supposed to fail
-    // -- but a near-coincident keypoint set can still pass it by a
-    // single pixel.
-    //
-    // Three independent properties must all hold for an upright
-    // face. An upside-down or sideways detection can't fake all
-    // three simultaneously, even with worst-case keypoint noise.
-    //
-    //   1. Eyes must be more horizontal than vertical, with a
-    //      non-trivial separation. Rejects sideways faces and
-    //      degenerate "all keypoints at the centre" results.
-    //   2. Nose y must be at least eye_dx / 8 below the eye
-    //      midline. A flipped face has the nose-keypoint above the
-    //      eye midline (nose_drop < 0) and an ambiguous near-zero
-    //      drop is also rejected by the explicit margin.
-    //   3. When mouth keypoints are present (always, for MNP) the
-    //      mouth midline must be below the nose. Catches the rare
-    //      cases where the detector mis-labels enough points to
-    //      slip past (2) but the mouth-vs-nose ordering still
-    //      reveals the flip.
-    bool keypoints_look_upright(const dl::detect::result_t *det)
-    {
-        if (!det || det->keypoint.size() < 6) {
-            // No keypoints to validate — trust the bbox.
-            return true;
-        }
-
-        const int e0x = det->keypoint[0];
-        const int e0y = det->keypoint[1];
-        const int e1x = det->keypoint[2];
-        const int e1y = det->keypoint[3];
-        const int ny  = det->keypoint[5];
-
-        const int eye_mid_y = (e0y + e1y) / 2;
-        const int eye_dx    = std::abs(e1x - e0x);
-
-        // Reject degenerate keypoint sets (eyes coincident or
-        // implausibly close). This catches the original false-
-        // positive class where the detector lit up on a near-
-        // symmetric blob and emitted near-identical keypoints --
-        // including the upside-down-faces-look-face-like case --
-        // because in those failures eye_dx collapses toward zero.
-        if (eye_dx < 4) {
-            return false;
-        }
-
-        // The one check that an upside-down real face cannot fake:
-        // the detector's predicted nose must sit below the predicted
-        // eye midline. Real upside-down faces have nose ABOVE the
-        // eye midline in detector input (the predicted keypoints
-        // come out CORRECT for what the model sees, which is flipped).
-        // The margin >= eye_dx / 8 protects against near-coincident
-        // keypoints sneaking past on a single-pixel noise.
-        //
-        // Previous iterations of this function also enforced a
-        // "eyes more horizontal than vertical" check and a "mouth
-        // below nose" check; both rejected too many real upright
-        // detections in low light because high-gain keypoint noise
-        // and the natural ~45 deg tilt the orient cycle leaves on
-        // the table consistently tripped them. Letting those go is
-        // safe -- the nose-below-eyes margin alone is sufficient
-        // for the upside-down case, which was the original concern.
-        const int nose_drop = ny - eye_mid_y;
-        if (nose_drop * 8 < eye_dx) {
-            return false;
-        }
-
-        return true;
-    }
+    // (Removed: the keypoint-geometry sanity check that gated the
+    // MSR+MNP cascade. ESPDet doesn't emit keypoints, so there's
+    // nothing to check; the score floor + 2-frame non-ROT_0 confirm
+    // + ROT_0 cross-check carry the false-positive defence on their
+    // own. See git history for the previous implementation.)
 
     // IoU between two integer axis-aligned bboxes, returned as a
     // 0..100 percentage. Used by the recognition cache to decide
@@ -1675,13 +1127,12 @@ namespace
         // automatically if the task ever exits (today it doesn't, but
         // the leak-free shape costs nothing).
         auto detect = std::make_unique<HumanFaceDetect>();
-        // We previously bumped the MSR (proposal) stage's score floor to
-        // 0.65 to speed up MNP refinement. That helped throughput at
-        // mid range but starved real close-range detections whose MSR
-        // confidence is naturally lower (face out of training
-        // distribution). The default 0.5 was the right tradeoff; we now
-        // get the same false-positive resistance from MIN_DETECT_SCORE
-        // + keypoints_look_upright at the app level.
+        // The detector model is ESPDet PICO 224x224 (single-stage,
+        // anchor-free). ESP-DL's component initialises it with a 0.5
+        // sigmoid score threshold inside the postprocessor; on top of
+        // that we apply MIN_DETECT_SCORE_ROT0 / MIN_DETECT_SCORE_ROTATED
+        // at the app level to gate orient-cycle locks against the
+        // few low-confidence rotated false-positives that slip past.
         auto      feat     = std::make_unique<HumanFaceFeat>();
         const int feat_len = feat->get_feat_len();
 
@@ -1767,7 +1218,6 @@ namespace
         uint32_t s_motion_skip = 0;   // skipped detection due to no scene change
         uint32_t s_detections = 0;    // kept after every gate (size/focus/score/upright)
         uint32_t s_rej_score = 0;     // biggest rejected by MIN_DETECT_SCORE
-        uint32_t s_rej_geom = 0;      // biggest rejected by keypoints_look_upright
         uint32_t s_too_small = 0;     // biggest rejected for bbox size
         uint32_t s_too_blurry = 0;    // biggest rejected for focus
         uint32_t s_recognised = 0;    // matched an existing enrollment
@@ -1855,16 +1305,16 @@ namespace
         Orient try_orient = Orient::ROT_0;
 
         // Non-ROT_0 orient-lock confirmation. A single fluky detection
-        // at a rotated orient can pass score + keypoints_look_upright
-        // checks and lock us onto an upside-down / sideways orient,
-        // even when the user is actually holding the device upright.
-        // Common case: the detector fires on a noisy patch at ROT_180
-        // with a score in the 0.55-0.7 band, banner ends up upside-
-        // down, user has to wait for the cycle to recover. Requiring
-        // two consecutive frames of agreement at the SAME non-ROT_0
-        // orient before committing the lock filters that out without
-        // slowing legitimate rotated tracking by more than one frame.
-        // ROT_0 needs no confirmation (it's the default / cold-start
+        // at a rotated orient can pass the score floor and lock us
+        // onto an upside-down / sideways orient, even when the user
+        // is actually holding the device upright. Common case: the
+        // detector fires on a noisy patch at ROT_180 with a score in
+        // the 0.55-0.7 band, banner ends up upside-down, user has to
+        // wait for the cycle to recover. Requiring two consecutive
+        // frames of agreement at the SAME non-ROT_0 orient before
+        // committing the lock filters that out without slowing
+        // legitimate rotated tracking by more than one frame. ROT_0
+        // needs no confirmation (it's the default / cold-start
         // orient and a wrong lock there is benign), and once we've
         // locked an orient subsequent frames at that same orient go
         // through unconditionally so steady-state tracking is
@@ -1909,7 +1359,7 @@ namespace
 
             // Adaptive AE bias. Run on the same coarse cadence as the
             // stats heartbeat; the mean-luma value driving the decision
-            // is refreshed every detection frame inside apply_clahe(),
+            // is refreshed every detection frame inside prep_detect_input(),
             // so this check is cheap (one atomic load + a few
             // comparisons). The asymmetric hysteresis bands stop us
             // from oscillating between presets when a scene's luma
@@ -1963,10 +1413,45 @@ namespace
             {
                 const float avg_score = s_score_n ?
                     (s_score_sum / (float)s_score_n) : 0.f;
+
+                // Snapshot live state used for the diagnostic readout.
+                // Keeps the printf format string self-contained even
+                // though half its inputs come from atomics / external
+                // structures.
+                const int  cur_mean_luma  = g_last_mean_luma.load(
+                    std::memory_order_relaxed);
+                const int  cur_face_luma  = g_last_face_luma.load(
+                    std::memory_order_relaxed);
+                const uint32_t face_lum_ms = g_last_face_luma_ms.load(
+                    std::memory_order_relaxed);
+                const bool face_lum_fresh =
+                    cur_face_luma >= 0 &&
+                    (now_ms() - face_lum_ms) < FACE_LUMA_STALE_MS;
+                size_t   db_size       = 0;
+                unsigned total_tpls    = 0;
+                {
+                    FaceDbLock lock;
+                    db_size = g_known_faces.size();
+                    for (const auto &kf : g_known_faces) {
+                        total_tpls += static_cast<unsigned>(kf.feats.size());
+                    }
+                }
+                static const char *AE_NAMES[] = { "DIM", "MID", "BRIGHT" };
+                char face_lum_buf[8];
+                if (face_lum_fresh) {
+                    std::snprintf(face_lum_buf, sizeof(face_lum_buf),
+                                  "%d", cur_face_luma);
+                } else {
+                    face_lum_buf[0] = '-';
+                    face_lum_buf[1] = '\0';
+                }
+
                 ESP_LOGI(TAG,
                          "1s: frame=%u skip=%u raw=%u pad=%u kept=%u score_avg=%.2f "
-                         "| rej:score=%u geom=%u small=%u blurry=%u "
-                         "| known=%u new=%u (db=%u o=%d)",
+                         "| rej:score=%u small=%u blurry=%u "
+                         "| known=%u new=%u (db=%u tpl=%u) "
+                         "| ae=%s luma=%d/%s try=%d lock=%d "
+                         "(misses=%d pend=%d/2)",
                          (unsigned)s_frames,
                          (unsigned)s_motion_skip,
                          (unsigned)s_raw_dets,
@@ -1974,14 +1459,20 @@ namespace
                          (unsigned)s_detections,
                          (double)avg_score,
                          (unsigned)s_rej_score,
-                         (unsigned)s_rej_geom,
                          (unsigned)s_too_small,
                          (unsigned)s_too_blurry,
                          (unsigned)s_recognised, (unsigned)s_enrolled,
-                         (unsigned)g_known_faces.size(),
-                         (int)try_orient);
+                         (unsigned)db_size,
+                         total_tpls,
+                         AE_NAMES[(int)ae_preset],
+                         cur_mean_luma,
+                         face_lum_buf,
+                         (int)try_orient,
+                         (int)last_locked_orient,
+                         consecutive_misses,
+                         pending_confirm);
                 s_frames = s_motion_skip = s_raw_dets = s_pad_hits = s_detections =
-                    s_rej_score = s_rej_geom = s_too_small = s_too_blurry =
+                    s_rej_score = s_too_small = s_too_blurry =
                     s_recognised = s_enrolled = 0;
                 s_score_sum = 0.f;
                 s_score_n = 0;
@@ -2165,19 +1656,14 @@ namespace
                     padded_remap.box      = pbest->box;
                     padded_remap.keypoint = pbest->keypoint;
                     remap_padded_result(&padded_remap);
-                    // The upright check is performed in detection-
-                    // frame coords, which after remap are equivalent
-                    // to the primary path's coords -- safe to re-run.
-                    if (keypoints_look_upright(&padded_remap)) {
-                        ESP_LOGI(TAG,
-                                 "padded fallback hit: score=%.2f "
-                                 "(close-range face)",
-                                 (double)padded_remap.score);
-                        biggest = &padded_remap;
-                        s_score_sum += padded_remap.score;
-                        ++s_score_n;
-                        ++s_pad_hits;
-                    }
+                    ESP_LOGI(TAG,
+                             "padded fallback hit: score=%.2f "
+                             "(close-range face)",
+                             (double)padded_remap.score);
+                    biggest = &padded_remap;
+                    s_score_sum += padded_remap.score;
+                    ++s_score_n;
+                    ++s_pad_hits;
                 }
             }
 
@@ -2222,46 +1708,34 @@ namespace
                     upscale_remap.box      = ubest->box;
                     upscale_remap.keypoint = ubest->keypoint;
                     remap_upscale_result(&upscale_remap);
-                    if (keypoints_look_upright(&upscale_remap)) {
-                        ESP_LOGI(TAG,
-                                 "upscale fallback hit: score=%.2f "
-                                 "(far-range face)",
-                                 (double)upscale_remap.score);
-                        biggest = &upscale_remap;
-                        s_score_sum += upscale_remap.score;
-                        ++s_score_n;
-                        // Bucketed under pad_hits in the stats line
-                        // -- both are exception-path recoveries.
-                        ++s_pad_hits;
-                    }
+                    ESP_LOGI(TAG,
+                             "upscale fallback hit: score=%.2f "
+                             "(far-range face)",
+                             (double)upscale_remap.score);
+                    biggest = &upscale_remap;
+                    s_score_sum += upscale_remap.score;
+                    ++s_score_n;
+                    // Bucketed under pad_hits in the stats line
+                    // -- both are exception-path recoveries.
+                    ++s_pad_hits;
                 }
             }
 
             const float score_floor = min_detect_score_for(try_orient);
-            if (!biggest ||
-                biggest->score < score_floor ||
-                !keypoints_look_upright(biggest))
+            if (!biggest || biggest->score < score_floor)
             {
                 if (biggest)
                 {
-                    if (biggest->score < score_floor) {
-                        // Low-confidence detection: don't bother
-                        // running the embedder on it, don't update
-                        // the HUD with a flaky bbox, and don't lock
-                        // the orient cycle onto whatever it landed on.
-                        ESP_LOGD(TAG,
-                                 "drop low-score det: score=%.2f < %.2f (orient=%d)",
-                                 (double)biggest->score,
-                                 (double)score_floor,
-                                 (int)try_orient);
-                        ++s_rej_score;
-                    } else {
-                        // Detector fired on a face whose keypoint
-                        // geometry doesn't match an upright face --
-                        // most often this is the upside-down /
-                        // sideways false-positive class.
-                        ++s_rej_geom;
-                    }
+                    // Low-confidence detection: don't bother running
+                    // the embedder on it, don't update the HUD with a
+                    // flaky bbox, and don't lock the orient cycle
+                    // onto whatever it landed on.
+                    ESP_LOGD(TAG,
+                             "drop low-score det: score=%.2f < %.2f (orient=%d)",
+                             (double)biggest->score,
+                             (double)score_floor,
+                             (int)try_orient);
+                    ++s_rej_score;
                 }
                 unknown_streak = 0;
                 // A miss votes against any pending non-ROT_0 confirmation:
@@ -2368,8 +1842,7 @@ namespace
                 }
                 const bool rot0_wins =
                     r0_best &&
-                    r0_best->score >= MIN_DETECT_SCORE_ROT0 &&
-                    keypoints_look_upright(r0_best);
+                    r0_best->score >= MIN_DETECT_SCORE_ROT0;
 
                 if (rot0_wins) {
                     ESP_LOGI(TAG,
@@ -2486,7 +1959,7 @@ namespace
             // global frame mean reads ~bright (because the window
             // dominates) and the AE picks BRIGHT, but the face
             // itself is dim and we actually want DIM (or at least
-            // MID) so CLAHE has room to lift it. Sampling on every
+            // MID) so the embedder has a properly-exposed crop. Sampling on every
             // successful detection keeps the value fresh; AE itself
             // still runs on its own AE_CHECK_INTERVAL_MS cadence
             // with hysteresis to avoid preset thrash.

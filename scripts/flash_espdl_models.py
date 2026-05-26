@@ -44,36 +44,22 @@ PACK_SCRIPT = ESP_DL_DIR / "fbs_loader" / "pack_espdl_models.py"
 # for a different chip, the matching subfolder name would differ.
 MODELS_SUBDIR = "models/s3"
 
-# Select detector sources + partition offsets per PlatformIO env. The
-# `pico224` env switches to ESPDET_PICO_224_224_FACE (single-stage,
-# bigger model) and a partition table with a 512 KB face-det slot --
-# see sdkconfig.defaults.pico224 / partitions.pico224.csv. The
-# recognition model and its offset move because they live AFTER the
-# face-det partition, so their offset shifts by the size delta.
-PIO_ENV = env["PIOENV"]  # noqa: F821
-IS_PICO224 = PIO_ENV.endswith("-pico224")
-
-if IS_PICO224:
-    DETECT_SOURCES = [
-        DETECT_DIR / MODELS_SUBDIR / "espdet_pico_224_224_face.espdl",
-    ]
-    # partitions.pico224.csv: human_face_det 0x80000 instead of 0x40000,
-    # so human_face_feat shifts up by 0x40000 to 0x490000.
-    DETECT_PART_OFFSET = "0x410000"
-    RECOG_PART_OFFSET  = "0x490000"
-else:
-    DETECT_SOURCES = [
-        DETECT_DIR / MODELS_SUBDIR / "human_face_detect_msr_s8_v1.espdl",
-        DETECT_DIR / MODELS_SUBDIR / "human_face_detect_mnp_s8_v1.espdl",
-    ]
-    # partitions.csv: human_face_det at 0x410000 size 0x40000,
-    # human_face_feat at 0x450000.
-    DETECT_PART_OFFSET = "0x410000"
-    RECOG_PART_OFFSET  = "0x450000"
-
+# Source models bundled with each component. We use the ESPDet PICO
+# 224x224 single-stage detector (~496 KB) and the MobileFaceNet
+# embedder (~1.3 MB). These selections must match the Kconfig defaults
+# in sdkconfig.defaults; change both together if you swap models.
+DETECT_SOURCES = [
+    DETECT_DIR / MODELS_SUBDIR / "espdet_pico_224_224_face.espdl",
+]
 RECOG_SOURCES = [
     RECOG_DIR / MODELS_SUBDIR / "human_face_feat_mfn_s8_v1.espdl",
 ]
+
+# Partition offsets MUST match partitions.csv. human_face_det starts
+# right after the 4 MB factory app; human_face_feat follows after the
+# 512 KB face-det partition.
+DETECT_PART_OFFSET = "0x410000"
+RECOG_PART_OFFSET  = "0x490000"
 
 # Output filenames must match what the upstream CMake would have
 # produced, because the partition contents are looked up by name on
