@@ -2011,7 +2011,45 @@ namespace
             // its floats before doing anything else that might run the
             // model again (which currently we don't, but the copy is
             // ~512 floats so it's not worth the foot-gun).
-            dl::TensorBase *t = feat->run(img, biggest->keypoint);
+            //
+            // ESPDet's anchor-free postprocessor doesn't produce facial
+            // landmarks (its output is bbox + score only). The MFN
+            // embedder's FeatImagePreprocessor hard-asserts
+            // `landmarks.size() == 10` so it can run a 5-point
+            // similarity-transform face alignment. To unblock the
+            // pipeline we synthesise five anchor landmarks from the
+            // bbox itself: the standard 112x112 ArcFace landmark
+            // template (eye centres, nose, mouth corners) projected
+            // proportionally into the bbox. The resulting affine
+            // transform collapses to a straight scale-and-translate
+            // -- effectively cropping the bbox into the embedder
+            // input -- which is the same thing a no-landmarks
+            // recogniser would do. Recognition is more sensitive to
+            // pose without genuine alignment, so the multi-template
+            // gallery we already maintain matters more here than it
+            // did under the MSR+MNP cascade.
+            std::vector<int> aligned_landmarks;
+            const std::vector<int> *kp_for_feat = &biggest->keypoint;
+            if (biggest->keypoint.size() != 10) {
+                static constexpr float STD_LDKS_112[10] = {
+                    38.2946f, 51.6963f,   // left eye
+                    73.5318f, 51.5014f,   // right eye
+                    56.0252f, 71.7366f,   // nose
+                    41.5493f, 92.3655f,   // left mouth
+                    70.7299f, 92.2041f,   // right mouth
+                };
+                const int bw = biggest->box[2] - biggest->box[0];
+                const int bh = biggest->box[3] - biggest->box[1];
+                aligned_landmarks.resize(10);
+                for (int i = 0; i < 5; ++i) {
+                    aligned_landmarks[2 * i] = biggest->box[0] +
+                        static_cast<int>((STD_LDKS_112[2 * i]     / 112.0f) * bw);
+                    aligned_landmarks[2 * i + 1] = biggest->box[1] +
+                        static_cast<int>((STD_LDKS_112[2 * i + 1] / 112.0f) * bh);
+                }
+                kp_for_feat = &aligned_landmarks;
+            }
+            dl::TensorBase *t = feat->run(img, *kp_for_feat);
             if (!t || t->get_size() != feat_len)
             {
                 ESP_LOGW(TAG, "feat model returned unexpected tensor");
