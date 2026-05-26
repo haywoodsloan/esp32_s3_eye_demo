@@ -1536,12 +1536,26 @@ namespace
             // sits near a boundary.
             if (now_us >= ae_next_check_us)
             {
-                // Prefer face-region luma when we've seen a face
-                // recently; fall back to whole-frame mean when the
-                // room is empty (or the lock dropped long enough that
-                // the face-luma reading is stale). The face-priority
-                // path is what handles backlit subjects correctly --
-                // see g_last_face_luma's declaration block.
+                // Face-weighted scene metering. The previous behaviour
+                // -- "use face_luma when present, else global_luma" --
+                // turned the preset cycle into an oscillator: face
+                // present pulled the metering target down (skin in
+                // shadow is darker than scene mean), the sensor
+                // cranked up gain, the next frame's global luma shot
+                // up, and on a frame where the lock dropped or the
+                // face-luma reading went stale the AE check read
+                // global_luma instead and flipped the preset back.
+                // Result: MID <-> BRIGHT every check interval with
+                // the face still in frame, visible exposure breathing
+                // and noisier alignment / recognition.
+                //
+                // The InsightFace / Hikvision-style fix is a *weighted
+                // average* between face-region and global luma rather
+                // than an either/or. Face data is a 30 % bias, not a
+                // replacement -- a backlit subject still pulls the
+                // target down, but a steady face can't drag global
+                // metering into a feedback loop with itself. Same
+                // hysteresis bands as before.
                 const int  global_luma = g_last_mean_luma.load(
                     std::memory_order_relaxed);
                 const int  face_lum    = g_last_face_luma.load(
@@ -1551,8 +1565,12 @@ namespace
                 const bool face_fresh =
                     face_lum >= 0 &&
                     (now_ms() - face_ms) < FACE_LUMA_STALE_MS;
-                const int  luma        = face_fresh ? face_lum
-                                                    : global_luma;
+                constexpr int FACE_AE_WEIGHT_PCT = 30; // out of 100
+                int luma = global_luma;
+                if (face_fresh) {
+                    luma = (FACE_AE_WEIGHT_PCT * face_lum +
+                            (100 - FACE_AE_WEIGHT_PCT) * global_luma) / 100;
+                }
                 AEPreset next = ae_preset;
                 switch (ae_preset) {
                 case AEPreset::DIM:
