@@ -2233,31 +2233,113 @@ namespace
 
             // Detection passed every gate. If this would lock the
             // orient cycle onto a non-ROT_0 orient that we WEREN'T
-            // already locked to, require one prior frame at the same
-            // orient (i.e. two consecutive confirming hits) before
-            // committing. Same-orient re-locks (already locked there)
-            // and ROT_0 locks bypass the confirmation -- those are
-            // both either already-confirmed or the safe default.
+            // already locked to, run two extra safety nets before
+            // committing -- both targeted at the upside-down /
+            // sideways false-positive class that has consistently
+            // been the hardest to suppress:
+            //
+            //   1. ROT_0 cross-check. Re-run the detector on the
+            //      SAME source frame at ROT_0. A genuinely-rotated
+            //      device produces no ROT_0 hit (the face is rotated
+            //      in the raw frame, so the upright-trained model
+            //      sees a rotated face and bails). A spurious non-
+            //      ROT_0 firing on an actually-upright user, on the
+            //      other hand, almost always coexists with a high-
+            //      confidence ROT_0 detection -- the user's face is
+            //      *also* present and upright in the raw frame.
+            //      When ROT_0 produces a confident upright hit we
+            //      adopt that as the candidate and proceed at ROT_0,
+            //      suppressing the rotated lock entirely. This is
+            //      the same idea used by rotation-invariant
+            //      detectors (PCN, Shi et al. 2018) -- "calibrate"
+            //      ambiguous orient predictions against a
+            //      reference orient -- adapted to a frozen-model
+            //      pipeline by paying for one extra detector run
+            //      only on the rare frame where a non-ROT_0
+            //      candidate is actually being considered.
+            //
+            //   2. Two-frame confirmation (unchanged). If the cross-
+            //      check is inconclusive, fall back to the original
+            //      "require two consecutive confirming hits at the
+            //      same non-ROT_0 orient" gate.
+            //
+            // ROT_0 locks and same-orient re-locks (already
+            // confirmed) bypass both gates.
+            dl::detect::result_t rot0_candidate;
+            dl::detect::result_t saved_candidate;
             if (try_orient != Orient::ROT_0 &&
                 try_orient != last_locked_orient)
             {
-                if (pending_orient == try_orient) {
-                    ++pending_confirm;
-                } else {
-                    pending_orient  = try_orient;
-                    pending_confirm = 1;
+                // Deep-copy the non-ROT_0 candidate before the
+                // verification run clobbers the detector's internal
+                // list.
+                saved_candidate.category = biggest->category;
+                saved_candidate.score    = biggest->score;
+                saved_candidate.box      = biggest->box;
+                saved_candidate.keypoint = biggest->keypoint;
+
+                const uint16_t *rot0_input = prep_detect_input(
+                    Orient::ROT_0, src, scratch, FRAME_DIM);
+                dl::image::img_t r0img = {};
+                r0img.data     = (void *)rot0_input;
+                r0img.width    = FRAME_DIM;
+                r0img.height   = FRAME_DIM;
+                r0img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565BE;
+
+                auto &r0_dets = detect->run(r0img);
+                const dl::detect::result_t *r0_best = nullptr;
+                int r0_best_area = 0;
+                for (const auto &d : r0_dets) {
+                    const int a = d.box_area();
+                    if (a > r0_best_area) {
+                        r0_best_area = a;
+                        r0_best = &d;
+                    }
                 }
-                if (pending_confirm < 2) {
-                    ESP_LOGD(TAG,
-                             "non-ROT_0 lock confirm %d/2 at orient=%d score=%.2f",
-                             pending_confirm, (int)try_orient,
-                             (double)biggest->score);
-                    // Don't advance try_orient and don't count this as a
-                    // miss -- next frame retries the same orient. If it
-                    // also passes, we commit; if it fails, the miss path
-                    // will reset pending and resume cycling.
-                    esp_camera_fb_return(fb);
-                    continue;
+                const bool rot0_wins =
+                    r0_best &&
+                    r0_best->score >= MIN_DETECT_SCORE_ROT0 &&
+                    keypoints_look_upright(r0_best);
+
+                if (rot0_wins) {
+                    ESP_LOGI(TAG,
+                             "orient cross-check: ROT_0 wins (score=%.2f) "
+                             "over orient=%d (score=%.2f) -- suppressing "
+                             "rotated lock as upside-down false positive",
+                             (double)r0_best->score,
+                             (int)try_orient,
+                             (double)saved_candidate.score);
+                    rot0_candidate.category = r0_best->category;
+                    rot0_candidate.score    = r0_best->score;
+                    rot0_candidate.box      = r0_best->box;
+                    rot0_candidate.keypoint = r0_best->keypoint;
+                    biggest         = &rot0_candidate;
+                    try_orient      = Orient::ROT_0;
+                    to_detect       = rot0_input;
+                    pending_orient  = Orient::ROT_0;
+                    pending_confirm = 0;
+                    // Fall through into the success path at ROT_0.
+                } else {
+                    // ROT_0 didn't have a confident upright hit, so
+                    // the rotated candidate stays a candidate. Restore
+                    // it (the detector's list got clobbered by the
+                    // verification run above) and run the original
+                    // two-frame confirmation gate.
+                    biggest = &saved_candidate;
+                    if (pending_orient == try_orient) {
+                        ++pending_confirm;
+                    } else {
+                        pending_orient  = try_orient;
+                        pending_confirm = 1;
+                    }
+                    if (pending_confirm < 2) {
+                        ESP_LOGD(TAG,
+                                 "non-ROT_0 lock confirm %d/2 at orient=%d score=%.2f",
+                                 pending_confirm, (int)try_orient,
+                                 (double)biggest->score);
+                        esp_camera_fb_return(fb);
+                        continue;
+                    }
                 }
             }
             // Detection succeeded in this orientation; lock it in (don't
