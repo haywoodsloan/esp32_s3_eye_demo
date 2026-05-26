@@ -594,6 +594,19 @@ namespace
     // directional lighting".
     std::atomic<int> g_last_luma_spread{0};
 
+    // Latest face-region mean luma, sampled from the locked face's
+    // bbox each frame the detector hits. -1 means "no recent face,
+    // fall back to global frame luma for AE decisions". Publishes
+    // its update time too so the AE loop can age it out: if no face
+    // has been seen for FACE_LUMA_STALE_MS we drop back to the
+    // whole-frame mean. This is the embedded-ISP "face-priority AE"
+    // pattern -- biases sensor exposure off the subject's skin tones
+    // instead of the background, which is the textbook fix for the
+    // "subject in shadow against a sunlit window" failure mode.
+    std::atomic<int>      g_last_face_luma{-1};
+    std::atomic<uint32_t> g_last_face_luma_ms{0};
+    constexpr uint32_t    FACE_LUMA_STALE_MS = 5000;
+
     // ---------------------------------------------------------------
     // Adaptive AE bias
     // ---------------------------------------------------------------
@@ -1254,6 +1267,106 @@ namespace
         }
     }
 
+    // --- Far-range upscale fallback --------------------------------
+    //
+    // Symmetric counterpart to the close-range padded fallback. The
+    // MSR+MNP cascade has a minimum face size baked into its anchor
+    // priors -- empirically anything smaller than ~50x50 in the
+    // 240x240 input slips below the smallest anchor and the detector
+    // returns nothing, even though the face is plainly visible to a
+    // human. Walking back from arm's length to ~6-8 ft typically
+    // pushes a face into this band.
+    //
+    // The trick mirrors the padded path: take the centred UPSCALE_CROP
+    // x UPSCALE_CROP region of the prepared detector buffer and
+    // nearest-neighbour resample it up to fill the full 240x240
+    // detector input. A small far face that was 40x40 in the centre
+    // of the source frame becomes 80x80 in the upscaled view --
+    // comfortably inside the model's anchor range. Detections that
+    // come back have their coords remapped to the source frame so
+    // the rest of the pipeline (orient unrotate, embedder, etc.)
+    // treats them like a regular hit.
+    //
+    // Cost is identical to padded (one extra detector run, ~80 ms),
+    // and the two paths run on opposite phases of the orient cycle
+    // (see padded_eligible / upscale_eligible) so total idle-loop
+    // cost stays bounded.
+
+    constexpr int UPSCALE_CROP    = 120;
+    constexpr int UPSCALE_BORDER  = (FRAME_DIM - UPSCALE_CROP) / 2;   // 60
+
+    __attribute__((hot))
+    void upscale_into_full(const uint16_t *src, uint16_t *dst) noexcept
+    {
+        // Nearest-neighbour 2x upscale of the centred UPSCALE_CROP region.
+        // The padded path takes 240->160 and pads with grey; this one
+        // takes 120->240 and fills the full buffer. Each dst row
+        // re-reads one src row; no border / margin to maintain.
+        for (int y = 0; y < FRAME_DIM; ++y) {
+            const int sy = UPSCALE_BORDER + (y * UPSCALE_CROP) / FRAME_DIM;
+            const uint16_t *srow = src + static_cast<size_t>(sy) * FRAME_DIM;
+            uint16_t       *drow = dst + static_cast<size_t>(y) * FRAME_DIM;
+            for (int x = 0; x < FRAME_DIM; ++x) {
+                const int sx = UPSCALE_BORDER + (x * UPSCALE_CROP) / FRAME_DIM;
+                drow[x] = srow[sx];
+            }
+        }
+    }
+
+    int remap_upscale_axis(int v) noexcept
+    {
+        v = std::clamp(v, 0, FRAME_DIM - 1);
+        // Inverse of the upscale: detector coord v in [0, FRAME_DIM)
+        // corresponds to source coord UPSCALE_BORDER + v * UPSCALE_CROP / FRAME_DIM.
+        return UPSCALE_BORDER + (v * UPSCALE_CROP) / FRAME_DIM;
+    }
+
+    void remap_upscale_result(dl::detect::result_t *r) noexcept
+    {
+        r->box[0] = remap_upscale_axis(r->box[0]);
+        r->box[1] = remap_upscale_axis(r->box[1]);
+        r->box[2] = remap_upscale_axis(r->box[2]);
+        r->box[3] = remap_upscale_axis(r->box[3]);
+        for (size_t i = 0; i + 1 < r->keypoint.size(); i += 2) {
+            r->keypoint[i]     = remap_upscale_axis(r->keypoint[i]);
+            r->keypoint[i + 1] = remap_upscale_axis(r->keypoint[i + 1]);
+        }
+    }
+
+    // Sub-sampled mean luma of the face bbox, used for face-priority
+    // AE. Stride 4 keeps the cost negligible (~ FACE_AREA / 16 G6
+    // reads per call) while still giving a stable mean. Operates on
+    // the same RGB565BE pixel layout as everything else.
+    int sample_face_luma(const uint16_t *fb, int img_w, int img_h,
+                         int x0, int y0, int x1, int y1) noexcept
+    {
+        x0 = std::clamp(x0, 0, img_w - 1);
+        y0 = std::clamp(y0, 0, img_h - 1);
+        x1 = std::clamp(x1, 0, img_w);
+        y1 = std::clamp(y1, 0, img_h);
+        if (x1 - x0 < 8 || y1 - y0 < 8) {
+            return -1;
+        }
+        const uint8_t *p8 = reinterpret_cast<const uint8_t *>(fb);
+        uint32_t sum = 0;
+        uint32_t n   = 0;
+        for (int y = y0; y < y1; y += 4) {
+            const int row_base = y * img_w;
+            for (int x = x0; x < x1; x += 4) {
+                const int     idx = (row_base + x) * 2;
+                const uint8_t hi  = p8[idx];
+                const uint8_t lo  = p8[idx + 1];
+                // G6 expanded to 8 bits = luma proxy, matching what
+                // apply_clahe() uses for g_last_mean_luma.
+                const uint8_t g6  = static_cast<uint8_t>(((hi & 0x07) << 3) |
+                                                         (lo >> 5));
+                sum += static_cast<uint32_t>((g6 << 2) | (g6 >> 4));
+                ++n;
+            }
+        }
+        return n ? static_cast<int>(sum / n) : -1;
+    }
+
     // Banner rotation = how the on-screen face is tilted relative to upright
     // in the *un-rotated* camera frame (which is what the user sees on the
     // LCD). If we rotated the image by N*90 deg CW to make the face upright
@@ -1733,8 +1846,23 @@ namespace
             // sits near a boundary.
             if (now_us >= ae_next_check_us)
             {
-                const int luma = g_last_mean_luma.load(
+                // Prefer face-region luma when we've seen a face
+                // recently; fall back to whole-frame mean when the
+                // room is empty (or the lock dropped long enough that
+                // the face-luma reading is stale). The face-priority
+                // path is what handles backlit subjects correctly --
+                // see g_last_face_luma's declaration block.
+                const int  global_luma = g_last_mean_luma.load(
                     std::memory_order_relaxed);
+                const int  face_lum    = g_last_face_luma.load(
+                    std::memory_order_relaxed);
+                const uint32_t face_ms = g_last_face_luma_ms.load(
+                    std::memory_order_relaxed);
+                const bool face_fresh =
+                    face_lum >= 0 &&
+                    (now_ms() - face_ms) < FACE_LUMA_STALE_MS;
+                const int  luma        = face_fresh ? face_lum
+                                                    : global_luma;
                 AEPreset next = ae_preset;
                 switch (ae_preset) {
                 case AEPreset::DIM:
@@ -1983,6 +2111,62 @@ namespace
                 }
             }
 
+            // Far-range upscale fallback. Fires on the opposite phase
+            // of the orient cycle from the close-range padded path
+            // (offset by ORIENT_STICKY_MISSES / 2 so the two retries
+            // are interleaved instead of stacking on the same frame),
+            // and reuses padded_scratch as scratch space since the
+            // two paths never run on the same frame. Recovers small
+            // / far faces (~25-50 px tall) that fall below the
+            // detector's smallest anchor at native scale.
+            dl::detect::result_t upscale_remap;
+            const bool upscale_eligible =
+                padded_scratch && !biggest &&
+                fb->width == FRAME_DIM && fb->height == FRAME_DIM &&
+                (consecutive_misses < OVERLAY_CLEAR_MISSES ||
+                 (consecutive_misses % ORIENT_STICKY_MISSES) ==
+                     (ORIENT_STICKY_MISSES / 2));
+            if (upscale_eligible)
+            {
+                upscale_into_full(to_detect, padded_scratch);
+
+                dl::image::img_t uimg = {};
+                uimg.data     = padded_scratch;
+                uimg.width    = FRAME_DIM;
+                uimg.height   = FRAME_DIM;
+                uimg.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565BE;
+
+                auto &udetections = detect->run(uimg);
+                const dl::detect::result_t *ubest = nullptr;
+                int ubest_area = 0;
+                for (const auto &d : udetections) {
+                    const int a = d.box_area();
+                    if (a > ubest_area) {
+                        ubest_area = a;
+                        ubest = &d;
+                    }
+                }
+                if (ubest && ubest->score >= min_detect_score_for(try_orient)) {
+                    upscale_remap.category = ubest->category;
+                    upscale_remap.score    = ubest->score;
+                    upscale_remap.box      = ubest->box;
+                    upscale_remap.keypoint = ubest->keypoint;
+                    remap_upscale_result(&upscale_remap);
+                    if (keypoints_look_upright(&upscale_remap)) {
+                        ESP_LOGI(TAG,
+                                 "upscale fallback hit: score=%.2f "
+                                 "(far-range face)",
+                                 (double)upscale_remap.score);
+                        biggest = &upscale_remap;
+                        s_score_sum += upscale_remap.score;
+                        ++s_score_n;
+                        // Bucketed under pad_hits in the stats line
+                        // -- both are exception-path recoveries.
+                        ++s_pad_hits;
+                    }
+                }
+            }
+
             const float score_floor = min_detect_score_for(try_orient);
             if (!biggest ||
                 biggest->score < score_floor ||
@@ -2140,6 +2324,31 @@ namespace
                 unknown_streak = 0; // blurry ⇒ not trustworthy evidence
                 esp_camera_fb_return(fb);
                 continue;
+            }
+
+            // Face-priority AE: sample mean luma from the bbox region
+            // and publish it so the AE preset cycle can bias sensor
+            // exposure on the subject's skin tones instead of the
+            // whole-frame mean. This is what closes the loop on
+            // "subject in shadow against a sunlit window" -- the
+            // global frame mean reads ~bright (because the window
+            // dominates) and the AE picks BRIGHT, but the face
+            // itself is dim and we actually want DIM (or at least
+            // MID) so CLAHE has room to lift it. Sampling on every
+            // successful detection keeps the value fresh; AE itself
+            // still runs on its own AE_CHECK_INTERVAL_MS cadence
+            // with hysteresis to avoid preset thrash.
+            {
+                const int face_lum = sample_face_luma(
+                    to_detect, fb->width, fb->height,
+                    biggest->box[0], biggest->box[1],
+                    biggest->box[2], biggest->box[3]);
+                if (face_lum >= 0) {
+                    g_last_face_luma.store(face_lum,
+                                           std::memory_order_relaxed);
+                    g_last_face_luma_ms.store(now_ms(),
+                                              std::memory_order_relaxed);
+                }
             }
 
             // Recognition cache: if the most recent identified face's
