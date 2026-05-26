@@ -1200,7 +1200,48 @@ namespace
                                       int n) noexcept
     {
         rotate_to_scratch(o, src, scratch, n);
+#if CONFIG_ESPDET_PICO_224_224_FACE || CONFIG_ESPDET_PICO_416_416_FACE
+        // ESPDet's single-stage anchor-free detector was trained on
+        // natural-image input statistics; our adaptive gamma + per-
+        // tile CLAHE preprocessing pushes pixel distributions far
+        // enough out of distribution that the model returns zero
+        // detections on a face that's plainly in frame. Skip the
+        // heavy preprocessing for ESPDet builds -- the ImagePre-
+        // processor inside the component handles its own [0..1]
+        // normalisation, and ESPDet's published mAP50-95 of 0.495
+        // already factors in robust handling of lighting variation.
+        //
+        // We still need to keep g_last_mean_luma fresh so the AE
+        // preset cycle works, so do a coarse mean-luma scan in
+        // place of apply_clahe's "free side effect" mean.
+        {
+            const uint8_t *p8 = reinterpret_cast<const uint8_t *>(scratch);
+            uint32_t sum = 0;
+            uint32_t cnt = 0;
+            for (int y = 0; y < FRAME_DIM; y += 8) {
+                const int row_base = y * FRAME_DIM;
+                for (int x = 0; x < FRAME_DIM; x += 8) {
+                    const int idx = (row_base + x) * 2;
+                    const uint8_t hi = p8[idx];
+                    const uint8_t lo = p8[idx + 1];
+                    const uint8_t g6 = static_cast<uint8_t>(
+                        ((hi & 0x07) << 3) | (lo >> 5));
+                    sum += static_cast<uint32_t>((g6 << 2) | (g6 >> 4));
+                    ++cnt;
+                }
+            }
+            if (cnt) {
+                g_last_mean_luma.store(static_cast<int>(sum / cnt),
+                                       std::memory_order_relaxed);
+            }
+            // No per-tile spread proxy here; CLAHE is disabled so
+            // the spread-adaptive clip-limit path is moot. Keep the
+            // atomic at zero so anyone reading it sees "flat".
+            g_last_luma_spread.store(0, std::memory_order_relaxed);
+        }
+#else
         apply_clahe(scratch);
+#endif
         return scratch;
     }
 
