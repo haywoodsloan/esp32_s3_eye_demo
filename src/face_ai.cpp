@@ -1097,27 +1097,91 @@ namespace
             return sum; // 0..252, lower = darker
         };
 
-        // Eye band: y in [bh*0.25, bh*0.50] (relative to bbox top).
-        const int eye_y0 = std::clamp(y0 + (bh * 25) / 100, 0, img_h - 1);
-        const int eye_y1 = std::clamp(y0 + (bh * 50) / 100, 0, img_h);
+        // Eye band: y in [bh*0.22, bh*0.55] (relative to bbox top).
+        // Widened from the original [0.25, 0.50] so a face that
+        // detects with a slightly-low or slightly-tall bbox still
+        // has both eye centres inside the search window. The eye-
+        // socket dark blob is robust enough that the extra noise
+        // from the wider band doesn't pull the centroid off the
+        // true eye centre.
+        const int eye_y0 = std::clamp(y0 + (bh * 22) / 100, 0, img_h - 1);
+        const int eye_y1 = std::clamp(y0 + (bh * 55) / 100, 0, img_h);
 
+        // Locate the eye centre in a (sx0..sx1, sy0..sy1) zone using a
+        // dark-weighted centroid of the darkest ~10 % of sampled
+        // pixels in the zone. Pure argmin (the previous behaviour)
+        // works for sharp, well-lit frames but fails when:
+        //   * Partial occlusion (hair, hand, side of the head)
+        //     leaves a small but very dark blob off-centre from the
+        //     true eye.
+        //   * Motion blur smears the eye into a 4-6 px wide line
+        //     and the argmin lands at one end of the line.
+        //   * Sensor noise on high gain creates a single 1-px dark
+        //     outlier that beats the real eye blob.
+        // A centroid of the darkest decile averages over the whole
+        // eye blob instead of picking a single point. ~ 200 us total
+        // for both eyes (negligible).
         auto find_dark_in = [&](int sx0, int sx1, int sy0, int sy1,
                                 int *out_x, int *out_y) {
-            int best_lum = INT_MAX;
-            int best_x = (sx0 + sx1) / 2;
-            int best_y = (sy0 + sy1) / 2;
+            // Pass 1: build a histogram of luma over the zone so we
+            // can find the threshold corresponding to the darkest
+            // ~10 % of samples. 13-bin histogram (each bin = 32 raw
+            // 4x4-summed units = 32/4/8 = 1 8-bit-luma unit) is
+            // plenty for selecting a decile cut-off.
+            constexpr int N_BINS = 32;
+            int hist[N_BINS] = {};
+            int total = 0;
+            for (int yy = sy0; yy < sy1; yy += 2) {
+                for (int xx = sx0; xx < sx1; xx += 2) {
+                    int lum = luma_at(xx, yy); // 0..252 in 4x g6 units
+                    // Quantise to N_BINS buckets.
+                    int b = (lum * N_BINS) / 256;
+                    if (b >= N_BINS) b = N_BINS - 1;
+                    ++hist[b];
+                    ++total;
+                }
+            }
+            int target  = std::max(1, total / 10);   // darkest decile
+            int running = 0;
+            int cut_bin = 0;
+            for (; cut_bin < N_BINS; ++cut_bin) {
+                running += hist[cut_bin];
+                if (running >= target) break;
+            }
+            const int cut_lum =
+                std::min(252, ((cut_bin + 1) * 256) / N_BINS);
+
+            // Pass 2: weighted centroid of pixels darker than cut_lum.
+            // Weight = (cut_lum - lum) so the darkest pixels pull the
+            // hardest. Falls back to plain argmin if for some reason
+            // no pixels qualify (shouldn't happen given pass 1).
+            double sum_x = 0, sum_y = 0, sum_w = 0;
+            int argmin_x = (sx0 + sx1) / 2;
+            int argmin_y = (sy0 + sy1) / 2;
+            int argmin_lum = INT_MAX;
             for (int yy = sy0; yy < sy1; yy += 2) {
                 for (int xx = sx0; xx < sx1; xx += 2) {
                     const int lum = luma_at(xx, yy);
-                    if (lum < best_lum) {
-                        best_lum = lum;
-                        best_x   = xx;
-                        best_y   = yy;
+                    if (lum < argmin_lum) {
+                        argmin_lum = lum;
+                        argmin_x = xx;
+                        argmin_y = yy;
+                    }
+                    if (lum < cut_lum) {
+                        const double w = static_cast<double>(cut_lum - lum) + 1.0;
+                        sum_w += w;
+                        sum_x += w * xx;
+                        sum_y += w * yy;
                     }
                 }
             }
-            *out_x = best_x;
-            *out_y = best_y;
+            if (sum_w > 0) {
+                *out_x = static_cast<int>(sum_x / sum_w + 0.5);
+                *out_y = static_cast<int>(sum_y / sum_w + 0.5);
+            } else {
+                *out_x = argmin_x;
+                *out_y = argmin_y;
+            }
         };
 
         // Left eye: x in [bw*0.10, bw*0.50].
@@ -1140,9 +1204,13 @@ namespace
         if (eye_dx < (bw * 18) / 100 || eye_dx > (bw * 65) / 100) {
             return false;
         }
-        if (std::abs(eye_dy) * 2 > eye_dx) {
-            // Eye line tilts > ~26 deg -- the orient cycle should
-            // have caught this. Bail to keep the affine well-conditioned.
+        if (std::abs(eye_dy) * 5 > eye_dx * 4) {
+            // Eye line tilts > ~38 deg -- almost always a mis-
+            // localisation (the orient cycle should have caught
+            // anything tilted further), so bail to keep the affine
+            // transform well-conditioned. Was previously 26 deg,
+            // widened so a real head tilt (e.g. shoulder-resting
+            // pose) doesn't drop into the bbox-center-crop fallback.
             return false;
         }
 
@@ -2375,24 +2443,51 @@ namespace
             // loop is at most MAX_KNOWN_FACES * FACE_MAX_TEMPLATES *
             // feat_len floats (~64 K FLOPs after SIMD), well under a
             // millisecond of critical section.
+            //
+            // Quality-weighted match score: each candidate template's
+            // raw cosine similarity is scaled by a function of its
+            // stored quality so low-quality templates have to clear a
+            // higher bar to win against higher-quality templates of a
+            // different identity. The weight is (Q_FLOOR + (1-Q_FLOOR)
+            // * sqrt(quality)) so even a quality=0 template stays at
+            // 0.5x (still meaningful, not zeroed out), and a perfect
+            // quality=1.0 template gets the full raw sim.
+            //
+            // This is the embedded variant of the InsightFace
+            // quality-aware matching idea (Boutros SER-FIQ 2020,
+            // MagFace 2021). With a single identity in the gallery
+            // it has no visible effect on `best_sim`; the value
+            // shows up once a second person is enrolled and the
+            // matcher needs to choose between identities of mixed
+            // gallery quality.
+            constexpr float QW_FLOOR = 0.5f;
+            auto sim_quality_weight = [](float quality) -> float {
+                const float q = std::clamp(quality, 0.0f, 1.0f);
+                return QW_FLOOR + (1.0f - QW_FLOOR) * std::sqrt(q);
+            };
             float best_sim = -2.f;
-            float best_template_sim = -2.f;  // best sim against the winning face's gallery
+            float best_sim_raw = -2.f;       // pre-quality-weight sim (for logging + novelty)
+            float best_template_sim_raw = -2.f;  // RAW sim of the winning template (novelty check)
             int   best_id = -1;
             int   best_template_idx = -1;
-            float second_best_sim = -2.f;    // best sim against any OTHER face
+            float second_best_sim = -2.f;    // best weighted sim against any OTHER face
             {
                 FaceDbLock lock;
                 for (size_t i = 0; i < g_known_faces.size(); ++i)
                 {
                     float face_best = -2.f;
+                    float face_best_raw = -2.f;
                     int   face_best_t = -1;
                     for (size_t t = 0; t < g_known_faces[i].feats.size(); ++t) {
-                        const float s = cosine_sim(raw_feat,
-                                                   g_known_faces[i].feats[t].feat.data(),
-                                                   feat_len);
+                        const float s_raw = cosine_sim(raw_feat,
+                                                       g_known_faces[i].feats[t].feat.data(),
+                                                       feat_len);
+                        const float s = s_raw *
+                            sim_quality_weight(g_known_faces[i].feats[t].quality);
                         if (s > face_best) {
-                            face_best   = s;
-                            face_best_t = (int)t;
+                            face_best     = s;
+                            face_best_raw = s_raw;
+                            face_best_t   = (int)t;
                         }
                     }
                     if (face_best > best_sim)
@@ -2401,10 +2496,11 @@ namespace
                         if (best_id > 0 && best_sim > second_best_sim) {
                             second_best_sim = best_sim;
                         }
-                        best_sim          = face_best;
-                        best_template_sim = face_best;
-                        best_template_idx = face_best_t;
-                        best_id           = (int)i + 1; // 1-based for logging niceness
+                        best_sim              = face_best;
+                        best_sim_raw          = face_best_raw;
+                        best_template_sim_raw = face_best_raw;
+                        best_template_idx     = face_best_t;
+                        best_id               = (int)i + 1; // 1-based for logging niceness
                     } else if (face_best > second_best_sim) {
                         second_best_sim = face_best;
                     }
@@ -2419,8 +2515,9 @@ namespace
                 ++s_recognised;
                 unknown_streak = 0;
                 ESP_LOGI(TAG,
-                         "known face: id=%d sim=%.3f (t=%d, 2nd=%.3f) focus=%d orient=%d",
-                         best_id, (double)best_sim, best_template_idx,
+                         "known face: id=%d sim=%.3f (raw=%.3f t=%d, 2nd=%.3f) focus=%d orient=%d",
+                         best_id, (double)best_sim, (double)best_sim_raw,
+                         best_template_idx,
                          (double)second_best_sim, focus, (int)locked_orient);
 
                 // Auto-augment the gallery for this face when the
@@ -2431,19 +2528,21 @@ namespace
                 // who happens to look similar to two people). The
                 // new embedding must also be meaningfully different
                 // from every existing template in this face's
-                // gallery (best_template_sim < FACE_AUGMENT_NOVEL),
-                // otherwise it's a near-duplicate that just wastes
-                // gallery slots and matcher cycles. The augment gate
-                // is intentionally *tighter* than the match gate;
-                // weakening recognition for off-angle faces happens
-                // exclusively through more templates, never through
-                // a lower match floor.
+                // gallery (best_template_sim_raw < FACE_AUGMENT_NOVEL,
+                // checked on the *raw* sim because near-duplicate
+                // detection is a property of the embedding alone,
+                // independent of template quality), otherwise it's
+                // a near-duplicate that just wastes gallery slots
+                // and matcher cycles. The augment gate is intentionally
+                // *tighter* than the match gate; weakening recognition
+                // for off-angle faces happens exclusively through
+                // more templates, never through a lower match floor.
                 const float augment_floor = g_tuning.match_thr +
                                             FACE_AUGMENT_MARGIN;
                 const bool augment_ok =
-                    best_sim          >= augment_floor &&
-                    best_template_sim <  FACE_AUGMENT_NOVEL &&
-                    second_best_sim   <  best_sim - FACE_AUGMENT_MARGIN;
+                    best_sim              >= augment_floor &&
+                    best_template_sim_raw <  FACE_AUGMENT_NOVEL &&
+                    second_best_sim       <  best_sim - FACE_AUGMENT_MARGIN;
                 if (augment_ok)
                 {
                     const float new_q = face_template_quality(
@@ -2465,7 +2564,7 @@ namespace
                                      (unsigned)(gallery.size() - 1),
                                      (double)new_q,
                                      (double)best_sim,
-                                     (double)best_template_sim);
+                                     (double)best_template_sim_raw);
                         } else {
                             // Gallery full: find the lowest-quality
                             // slot and evict it only if the incoming
@@ -2494,7 +2593,7 @@ namespace
                                          (double)new_q,
                                          (double)evicted_q,
                                          (double)best_sim,
-                                         (double)best_template_sim);
+                                         (double)best_template_sim_raw);
                             } else {
                                 ESP_LOGD(TAG,
                                          "gallery=: id=%d full and new q=%.2f "
