@@ -1,0 +1,16 @@
+# ESP32-S3-EYE 8 MB flash layout for the ESPDET_PICO_224_224_FACE build.
+#
+# Diff vs partitions.csv:
+#   * human_face_det grows 0x40000 (256 KB) -> 0x80000 (512 KB) so the
+#     espdet_pico_224 .espdl blob (~496 KB packed) actually fits.
+#
+# Everything else is identical to partitions.csv so the app, recognition
+# model, and SPIFFS data DB stay byte-compatible across builds.
+#
+# Name,            Type, SubType,  Offset,   Size
+nvs,               data, nvs,      0x9000,   0x6000
+phy_init,          data, phy,      0xf000,   0x1000
+factory,           app,  factory,  0x10000,  0x400000
+human_face_det,    data, spiffs,   ,         0x80000
+human_face_feat,   data, spiffs,   ,         0x180000
+storage,           data, spiffs,   ,         0x80000

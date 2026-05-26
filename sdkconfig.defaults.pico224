@@ -1,0 +1,15 @@
+# Overlay applied on top of sdkconfig.defaults for the
+# `esp32-s3-pico224` PlatformIO env. Only the model-selection and
+# partition-table settings differ from the main build.
+
+# Use the bigger 512 KB face-det partition table so the espdet_pico
+# 224x224 .espdl blob fits.
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.pico224.csv"
+
+# Replace MSR+MNP with ESPDET_PICO_224_224_FACE. Explicit "not set"
+# lines are required to defeat the defaults from sdkconfig.defaults.
+# CONFIG_FLASH_HUMAN_FACE_DETECT_MSRMNP_S8_V1 is not set
+# CONFIG_HUMAN_FACE_DETECT_MSRMNP_S8_V1 is not set
+CONFIG_FLASH_ESPDET_PICO_224_224_FACE=y
+CONFIG_ESPDET_PICO_224_224_FACE=y
+CONFIG_DEFAULT_HUMAN_FACE_DETECT_MODEL=1
