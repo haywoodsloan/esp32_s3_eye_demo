@@ -88,31 +88,38 @@ namespace
 
     // Minimum detector confidence for a result to be acted on at all.
     // Two floors, gated by the orient the detector ran in -- see the
-    // `Orient` enum + `min_detect_score_for()` further down:
+    // `Orient` enum + `min_detect_score_for()` further down.
     //
-    //   * `MIN_DETECT_SCORE_ROT0` is loose enough to admit detections
-    //     whose confidence drops a notch -- the common case being
-    //     glasses-wearers (lens reflections / refraction reliably
-    //     knock ~0.05 off the score in our experience), but also
-    //     low-light and close-range / out-of-distribution faces.
+    // Both floors were re-tuned for the ESPDET PICO 224 detector by
+    // sampling its actual per-frame score distribution. Real-face
+    // detections cluster tightly at 0.70-0.90 (mean ~0.81 in test
+    // runs); ESPDET's own postprocessor already discards anything
+    // below 0.50 before we see it, so app-level floors below 0.5 are
+    // no-ops. The previous values (0.35 / 0.55) were inherited from
+    // the MSR+MNP cascade, which had a much wider raw-score
+    // distribution (0.3-0.95) and needed the slack.
     //
-    //   * `MIN_DETECT_SCORE_ROTATED` is stricter, used for the three
-    //     non-default orients. The cost of accepting a weak detection
-    //     in a wrong orient is high (the cycle locks there and the
-    //     on-screen banner now reads upside-down or sideways relative
-    //     to the real head pose); the cost of demanding more evidence
-    //     is just one or two more cycles around the orient wheel.
+    //   * `MIN_DETECT_SCORE_ROT0` admits the lowest-score real faces
+    //     (close-range padded fallback, partial occlusion, harsh
+    //     side-lighting can pull legitimate scores down to ~0.55).
+    //     Set just below the lowest observed real-face score.
+    //
+    //   * `MIN_DETECT_SCORE_ROTATED` is stricter -- the cost of
+    //     accepting a weak detection at a non-default orient is high
+    //     (the cycle locks there and the on-screen banner reads
+    //     wrong-side-up); the cost of demanding more evidence is
+    //     just one or two more cycles around the orient wheel.
     //     Legitimate rotated detections (user holding the device
-    //     sideways) routinely score 0.7-0.9 so this floor doesn't
-    //     gate genuine use.
+    //     sideways) score 0.70+ so a floor of 0.65 doesn't gate
+    //     genuine use.
     //
     // The orient cycle's other gates -- the 2-frame non-ROT_0 lock
     // confirmation, the ROT_0 cross-check, and the IoU recognition
     // cache -- catch the remaining false-positive classes (single-
     // frame fluky lock at the wrong orient, blob misfires on
     // textured backgrounds).
-    constexpr float MIN_DETECT_SCORE_ROT0    = 0.35f;
-    constexpr float MIN_DETECT_SCORE_ROTATED = 0.55f;
+    constexpr float MIN_DETECT_SCORE_ROT0    = 0.50f;
+    constexpr float MIN_DETECT_SCORE_ROTATED = 0.65f;
 
     // Recognition cache. The embedder is the most expensive single
     // stage in the pipeline (~50 ms / call on the S8 model), and when
@@ -1532,13 +1539,27 @@ namespace
         // the same place we treat consecutive detections as the same
         // identity and skip the embedder + cosine sweep. See
         // RECOG_CACHE_MS / RECOG_IOU_PCT.
+        //
+        // last_sim is an EMA of the matched identity's similarity
+        // across consecutive same-track recognitions. The matcher's
+        // raw per-frame sim jitters ~0.05-0.10 because of MFN's
+        // sensitivity to alignment / lighting microvariation; the
+        // EMA gives downstream consumers (match floor, augment gate,
+        // logs) a track-level confidence number that doesn't bounce
+        // with single-frame noise. Cleared whenever the track itself
+        // breaks (bbox moves out of IoU, orient changes, age expires,
+        // identity changes), so a new face / new track always starts
+        // from scratch and can't inherit confidence from the previous
+        // person.
         struct {
             bool     valid       = false;
             int      box[4]      = {0, 0, 0, 0};   // detection-frame coords
             Orient   orient      = Orient::ROT_0;  // bbox is only comparable in same orient
             uint32_t stamp_ms    = 0;
             int      matched_id  = 0;              // 1-based DB id; 0 = nothing matched
+            float    last_sim    = 0.0f;           // EMA of recent same-track weighted sim
         } recog_cache;
+        constexpr float RECOG_SIM_EMA_ALPHA = 0.6f; // weight on previous EMA value
 
         // Name-banner state: tracks what we last asked banner_render_name
         // to draw so we don't re-rasterise unchanged content every frame.
@@ -1831,6 +1852,7 @@ namespace
                     std::memory_order_acquire)) {
                 recog_cache.valid        = false;
                 recog_cache.matched_id   = 0;
+                recog_cache.last_sim     = 0.0f;
                 name_banner_cache.name[0] = '\0';
                 name_banner_cache.angle_bucket = -999;
             }
@@ -2507,7 +2529,21 @@ namespace
                 }
             }
 
-            if (best_id > 0 && best_sim >= g_tuning.match_thr)
+            // Track-level EMA over the weighted sim. When this frame
+            // looks like a continuation of the previously-matched
+            // identity (same recog_cache row), blend with the cached
+            // EMA so downstream gates see a smoothed track confidence
+            // instead of single-frame jitter. New tracks (cache empty
+            // or matched a different identity than before) start
+            // from the raw value.
+            float sim_track = best_sim;
+            if (recog_cache.valid && recog_cache.matched_id == best_id)
+            {
+                sim_track = RECOG_SIM_EMA_ALPHA * recog_cache.last_sim +
+                            (1.0f - RECOG_SIM_EMA_ALPHA) * best_sim;
+            }
+
+            if (best_id > 0 && sim_track >= g_tuning.match_thr)
             {
                 // Recognised — no enroll, no banner. We removed the
                 // "OH... IT'S YOU" path: recognition is now silent so
@@ -2515,32 +2551,35 @@ namespace
                 ++s_recognised;
                 unknown_streak = 0;
                 ESP_LOGI(TAG,
-                         "known face: id=%d sim=%.3f (raw=%.3f t=%d, 2nd=%.3f) focus=%d orient=%d",
-                         best_id, (double)best_sim, (double)best_sim_raw,
+                         "known face: id=%d sim=%.3f (frame=%.3f raw=%.3f t=%d, 2nd=%.3f) focus=%d orient=%d",
+                         best_id, (double)sim_track,
+                         (double)best_sim, (double)best_sim_raw,
                          best_template_idx,
                          (double)second_best_sim, focus, (int)locked_orient);
 
                 // Auto-augment the gallery for this face when the
-                // match is *comfortably* above the threshold (so we
-                // know it's the same person) AND no other enrolled
-                // face came within FACE_AUGMENT_MARGIN of the winner
-                // (so we can't be appending a template from someone
-                // who happens to look similar to two people). The
-                // new embedding must also be meaningfully different
-                // from every existing template in this face's
-                // gallery (best_template_sim_raw < FACE_AUGMENT_NOVEL,
-                // checked on the *raw* sim because near-duplicate
-                // detection is a property of the embedding alone,
-                // independent of template quality), otherwise it's
-                // a near-duplicate that just wastes gallery slots
-                // and matcher cycles. The augment gate is intentionally
-                // *tighter* than the match gate; weakening recognition
-                // for off-angle faces happens exclusively through
-                // more templates, never through a lower match floor.
+                // track-smoothed match is *comfortably* above the
+                // threshold (so we know it's the same person across
+                // multiple frames, not a single fluky hit) AND no
+                // other enrolled face came within FACE_AUGMENT_MARGIN
+                // of the winner (so we can't be appending a template
+                // from someone who happens to look similar to two
+                // people). The new embedding must also be meaningfully
+                // different from every existing template in this
+                // face's gallery (best_template_sim_raw <
+                // FACE_AUGMENT_NOVEL, checked on the *raw* sim because
+                // near-duplicate detection is a property of the
+                // embedding alone, independent of template quality),
+                // otherwise it's a near-duplicate that just wastes
+                // gallery slots and matcher cycles. The augment gate
+                // is intentionally *tighter* than the match gate;
+                // weakening recognition for off-angle faces happens
+                // exclusively through more templates, never through
+                // a lower match floor.
                 const float augment_floor = g_tuning.match_thr +
                                             FACE_AUGMENT_MARGIN;
                 const bool augment_ok =
-                    best_sim              >= augment_floor &&
+                    sim_track             >= augment_floor &&
                     best_template_sim_raw <  FACE_AUGMENT_NOVEL &&
                     second_best_sim       <  best_sim - FACE_AUGMENT_MARGIN;
                 if (augment_ok)
@@ -2614,6 +2653,7 @@ namespace
                 recog_cache.orient     = locked_orient;
                 recog_cache.stamp_ms   = now_ms();
                 recog_cache.matched_id = best_id;
+                recog_cache.last_sim   = sim_track;
 
                 // Show the navy name banner along the bottom of the
                 // preview if this face has been named in the web UI.
@@ -2693,6 +2733,7 @@ namespace
                 // pull the name out of the DB without needing to run
                 // the embedder again.
                 recog_cache.matched_id = static_cast<int>(new_count);
+                recog_cache.last_sim   = 0.0f;  // brand-new identity, no EMA history
 
                 // Only (re)render the banner if one isn't already on
                 // screen: we want the text orientation to reflect the
