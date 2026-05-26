@@ -602,13 +602,29 @@ namespace
 
     enum class AEPreset { DIM, MID, BRIGHT };
 
-    constexpr int      AE_CHECK_INTERVAL_MS = 3000;   // min seconds between transitions
+    constexpr int      AE_CHECK_INTERVAL_MS = 3000;
+    // Cooldown after any preset change: ignore further transitions
+    // for this long so the sensor's internal AE has time to actually
+    // settle on the new preset's metering target before we evaluate
+    // the resulting luma. The presets differ by ~8x in gain ceiling
+    // and ~3 stops in metering bias, so the scene luma swings ~80
+    // units in the seconds following a transition -- without this
+    // cooldown we end up chasing the sensor's own AE response and
+    // ping-pong the preset every 3 s. 8 s is empirically enough for
+    // the OV2640's metering loop to stabilise even on big jumps.
+    constexpr int      AE_TRANSITION_COOLDOWN_MS = 8000;
+    // Hysteresis band widths chosen so the steady-state luma each
+    // preset produces (~ 100-130 in BRIGHT, ~150-200 in MID, ~200+
+    // in DIM) sits comfortably inside the band: the dead-zone has
+    // to be wider than the sensor's own response to a preset change
+    // or the bands themselves become the oscillator.
+    //
     // Up-transitions (scene got brighter than current preset assumes):
-    constexpr int      AE_DIM_TO_MID_LUMA   = 120;
-    constexpr int      AE_MID_TO_BRIGHT_LUMA = 185;
+    constexpr int      AE_DIM_TO_MID_LUMA    = 180;
+    constexpr int      AE_MID_TO_BRIGHT_LUMA = 215;
     // Down-transitions (scene got dimmer than current preset assumes):
-    constexpr int      AE_BRIGHT_TO_MID_LUMA = 150;
-    constexpr int      AE_MID_TO_DIM_LUMA    = 85;
+    constexpr int      AE_BRIGHT_TO_MID_LUMA = 85;
+    constexpr int      AE_MID_TO_DIM_LUMA    = 55;
 
     // Matching / preprocessing parameters that move with the AE
     // preset. Same idea as apply_ae_preset() but for the AI side of
@@ -1592,9 +1608,17 @@ namespace
                              luma);
                     apply_ae_preset(next);
                     ae_preset = next;
+                    // Lock further transitions out for a cooldown window
+                    // so the sensor's internal metering can settle on
+                    // the new preset before we re-evaluate. Without this
+                    // the next check would read luma that's still in
+                    // transit and likely flip us back.
+                    ae_next_check_us = now_us +
+                        (int64_t)AE_TRANSITION_COOLDOWN_MS * 1000;
+                } else {
+                    ae_next_check_us = now_us +
+                        (int64_t)AE_CHECK_INTERVAL_MS * 1000;
                 }
-                ae_next_check_us = now_us +
-                    (int64_t)AE_CHECK_INTERVAL_MS * 1000;
             }
 
             if (now_us >= stats_next_us)
