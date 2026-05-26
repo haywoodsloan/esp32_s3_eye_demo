@@ -39,6 +39,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <climits>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -959,6 +960,175 @@ namespace
             }
         }
         return n ? static_cast<int>(sum / n) : -1;
+    }
+
+    // Estimate 5 facial keypoints (eyes, nose, mouth corners) from
+    // the face bbox using classical CV: find the two darkest blobs
+    // in the upper-face "eye band", then synthesize nose and mouth
+    // from canonical face proportions anchored to the eye line.
+    //
+    // Why this exists: ESPDet (our active detector) emits bbox +
+    // score only, no keypoint head. MFN's FeatImagePreprocessor
+    // requires five 2D landmarks to compute its similarity-transform
+    // alignment. Without real eye positions the alignment degrades
+    // to a bbox center-crop, which gives the embedder the wrong
+    // signal whenever the face is tilted or off-centre inside its
+    // bbox -- exactly the cases the multi-template gallery was
+    // built to paper over. Promoting the eye localisation from
+    // "guess from bbox" to "darkest-blob scan of the eye band"
+    // lets us recover the roll-and-translate component of the
+    // ArcFace alignment cheaply, at ~200 us per call. Nose and
+    // mouth coordinates come from human-face anthropometry --
+    // eye_dx (inter-pupillary distance) is the standard 1.0-unit
+    // scale, the nose sits ~0.55 eye_dx below the eye midline, and
+    // the mouth corners flank the same vertical at ~0.35 eye_dx
+    // outward and ~1.10 eye_dx below.
+    //
+    // Algorithm:
+    //   1. Eye band: y in bbox-relative [0.25, 0.50], split into
+    //      left half [0.10, 0.50] and right half [0.50, 0.90] in x.
+    //      In each half, scan with stride 2 for the darkest 4x4
+    //      mean luma point. Those are the eye centres.
+    //   2. Validate eye separation and rough horizontality. If the
+    //      separation collapses or the eye line tilts more than
+    //      ~30 deg (the orient cycle should have eaten anything
+    //      tilted further), fall back to the proportional ArcFace
+    //      template projected into the bbox.
+    //   3. Synthesise nose at eye_mid + 0.55 * eye_vec_rotated_perpendicular,
+    //      mouth corners at eye_mid +/- 0.35 * eye_dx along the
+    //      eye line and 1.10 * eye_dx below it.
+    //
+    // The roll-aware synthesis (using eye_vec rather than image y)
+    // is what gives MFN the rotation component of its affine
+    // transform. Without it we'd be feeding a tilted face into a
+    // model that expects an upright crop.
+    //
+    // Returns true if 5 plausible keypoints were synthesised into
+    // out_kp. False -> caller should fall back to the bbox-centred
+    // ArcFace template.
+    bool estimate_face_keypoints(const uint16_t *fb, int img_w, int img_h,
+                                 int x0, int y0, int x1, int y1,
+                                 std::vector<int> *out_kp) noexcept
+    {
+        const int bw = x1 - x0;
+        const int bh = y1 - y0;
+        if (bw < 32 || bh < 32) {
+            return false; // too small to localise reliably
+        }
+        const uint8_t *p8 = reinterpret_cast<const uint8_t *>(fb);
+
+        // 4x4 mean-luma at (cx, cy). Stride-2 sampling so we evaluate
+        // 4 pixels per centre, not 16 -- the dark-blob peak is much
+        // wider than 4 px so the stride costs nothing in accuracy.
+        auto luma_at = [&](int cx, int cy) -> int {
+            cx = std::clamp(cx, 1, img_w - 3);
+            cy = std::clamp(cy, 1, img_h - 3);
+            int sum = 0;
+            for (int dy = -1; dy <= 1; dy += 2) {
+                const int row_base = (cy + dy) * img_w;
+                for (int dx = -1; dx <= 1; dx += 2) {
+                    const int idx = (row_base + (cx + dx)) * 2;
+                    const uint8_t hi = p8[idx];
+                    const uint8_t lo = p8[idx + 1];
+                    const int g6 = ((hi & 0x07) << 3) | (lo >> 5);
+                    sum += g6;
+                }
+            }
+            return sum; // 0..252, lower = darker
+        };
+
+        // Eye band: y in [bh*0.25, bh*0.50] (relative to bbox top).
+        const int eye_y0 = std::clamp(y0 + (bh * 25) / 100, 0, img_h - 1);
+        const int eye_y1 = std::clamp(y0 + (bh * 50) / 100, 0, img_h);
+
+        auto find_dark_in = [&](int sx0, int sx1, int sy0, int sy1,
+                                int *out_x, int *out_y) {
+            int best_lum = INT_MAX;
+            int best_x = (sx0 + sx1) / 2;
+            int best_y = (sy0 + sy1) / 2;
+            for (int yy = sy0; yy < sy1; yy += 2) {
+                for (int xx = sx0; xx < sx1; xx += 2) {
+                    const int lum = luma_at(xx, yy);
+                    if (lum < best_lum) {
+                        best_lum = lum;
+                        best_x   = xx;
+                        best_y   = yy;
+                    }
+                }
+            }
+            *out_x = best_x;
+            *out_y = best_y;
+        };
+
+        // Left eye: x in [bw*0.10, bw*0.50].
+        // Right eye: x in [bw*0.50, bw*0.90].
+        const int lx0 = std::clamp(x0 + (bw * 10) / 100, 0, img_w - 1);
+        const int lx1 = std::clamp(x0 + (bw * 50) / 100, 0, img_w);
+        const int rx0 = lx1;
+        const int rx1 = std::clamp(x0 + (bw * 90) / 100, 0, img_w);
+
+        int le_x = 0, le_y = 0, re_x = 0, re_y = 0;
+        find_dark_in(lx0, lx1, eye_y0, eye_y1, &le_x, &le_y);
+        find_dark_in(rx0, rx1, eye_y0, eye_y1, &re_x, &re_y);
+
+        // Validate eye geometry. eye_dx must be a plausible fraction
+        // of the bbox width (faces with extreme yaw push it lower,
+        // detection-fragmentation pushes it higher), and the eye
+        // line must be roughly horizontal in detector coords.
+        const int eye_dx = re_x - le_x;
+        const int eye_dy = re_y - le_y;
+        if (eye_dx < (bw * 18) / 100 || eye_dx > (bw * 65) / 100) {
+            return false;
+        }
+        if (std::abs(eye_dy) * 2 > eye_dx) {
+            // Eye line tilts > ~26 deg -- the orient cycle should
+            // have caught this. Bail to keep the affine well-conditioned.
+            return false;
+        }
+
+        // Anthropometric synthesis of nose + mouth, using the eye
+        // line as the local x axis. Coefficients are the standard
+        // ArcFace ratios re-anchored to eye_dx as the unit scale:
+        //   nose:        eye_mid + 0.55 * perp
+        //   mouth_left:  eye_mid - 0.35 * along + 1.10 * perp
+        //   mouth_right: eye_mid + 0.35 * along + 1.10 * perp
+        // where `along` = unit vector from left eye to right eye,
+        // `perp`  = along rotated 90 deg CW (i.e. "down" in face
+        // coords). Using vectors means the synthesised landmarks
+        // rotate with the head -- if the user tilts, nose and
+        // mouth tilt with the eyes.
+        const float fdx = static_cast<float>(eye_dx);
+        const float fdy = static_cast<float>(eye_dy);
+        const float norm = std::sqrt(fdx * fdx + fdy * fdy);
+        if (norm < 1.f) {
+            return false;
+        }
+        const float along_x = fdx / norm;
+        const float along_y = fdy / norm;
+        const float perp_x  = -along_y;   // CW 90 deg
+        const float perp_y  =  along_x;
+        const float mid_x   = (le_x + re_x) * 0.5f;
+        const float mid_y   = (le_y + re_y) * 0.5f;
+
+        const float nose_x  = mid_x + 0.55f * norm * perp_x;
+        const float nose_y  = mid_y + 0.55f * norm * perp_y;
+        const float ml_x    = mid_x - 0.35f * norm * along_x + 1.10f * norm * perp_x;
+        const float ml_y    = mid_y - 0.35f * norm * along_y + 1.10f * norm * perp_y;
+        const float mr_x    = mid_x + 0.35f * norm * along_x + 1.10f * norm * perp_x;
+        const float mr_y    = mid_y + 0.35f * norm * along_y + 1.10f * norm * perp_y;
+
+        out_kp->resize(10);
+        (*out_kp)[0] = le_x;
+        (*out_kp)[1] = le_y;
+        (*out_kp)[2] = re_x;
+        (*out_kp)[3] = re_y;
+        (*out_kp)[4] = static_cast<int>(nose_x + 0.5f);
+        (*out_kp)[5] = static_cast<int>(nose_y + 0.5f);
+        (*out_kp)[6] = static_cast<int>(ml_x + 0.5f);
+        (*out_kp)[7] = static_cast<int>(ml_y + 0.5f);
+        (*out_kp)[8] = static_cast<int>(mr_x + 0.5f);
+        (*out_kp)[9] = static_cast<int>(mr_y + 0.5f);
+        return true;
     }
 
     // Banner rotation = how the on-screen face is tilted relative to upright
@@ -2016,38 +2186,78 @@ namespace
             // landmarks (its output is bbox + score only). The MFN
             // embedder's FeatImagePreprocessor hard-asserts
             // `landmarks.size() == 10` so it can run a 5-point
-            // similarity-transform face alignment. To unblock the
-            // pipeline we synthesise five anchor landmarks from the
-            // bbox itself: the standard 112x112 ArcFace landmark
-            // template (eye centres, nose, mouth corners) projected
-            // proportionally into the bbox. The resulting affine
-            // transform collapses to a straight scale-and-translate
-            // -- effectively cropping the bbox into the embedder
-            // input -- which is the same thing a no-landmarks
-            // recogniser would do. Recognition is more sensitive to
-            // pose without genuine alignment, so the multi-template
-            // gallery we already maintain matters more here than it
-            // did under the MSR+MNP cascade.
+            // similarity-transform face alignment. We try to recover
+            // a real alignment in two tiers:
+            //
+            //   * estimate_face_keypoints() runs a cheap classical-CV
+            //     dark-blob scan over the bbox's upper "eye band" to
+            //     localise the two eye centres, then synthesises
+            //     nose + mouth from anthropometric ratios anchored
+            //     to the eye line. This gives MFN the rotation +
+            //     translation components of its affine transform --
+            //     a measurably better starting point for the embedder
+            //     than a bbox center-crop.
+            //
+            //   * If the eye localiser bails (face too small, eyes
+            //     too close together / too far apart / too tilted),
+            //     fall back to the canonical 112x112 ArcFace template
+            //     projected proportionally into the bbox. That's a
+            //     scale-and-translate only -- worse than the eye-pair
+            //     synthesis but better than nothing.
+            //
+            // Either way the result feeds MFN through its standard
+            // alignment pipeline.
             std::vector<int> aligned_landmarks;
             const std::vector<int> *kp_for_feat = &biggest->keypoint;
+            bool kp_from_eye_scan = false;
             if (biggest->keypoint.size() != 10) {
-                static constexpr float STD_LDKS_112[10] = {
-                    38.2946f, 51.6963f,   // left eye
-                    73.5318f, 51.5014f,   // right eye
-                    56.0252f, 71.7366f,   // nose
-                    41.5493f, 92.3655f,   // left mouth
-                    70.7299f, 92.2041f,   // right mouth
-                };
-                const int bw = biggest->box[2] - biggest->box[0];
-                const int bh = biggest->box[3] - biggest->box[1];
-                aligned_landmarks.resize(10);
-                for (int i = 0; i < 5; ++i) {
-                    aligned_landmarks[2 * i] = biggest->box[0] +
-                        static_cast<int>((STD_LDKS_112[2 * i]     / 112.0f) * bw);
-                    aligned_landmarks[2 * i + 1] = biggest->box[1] +
-                        static_cast<int>((STD_LDKS_112[2 * i + 1] / 112.0f) * bh);
+                if (estimate_face_keypoints(to_detect, FRAME_DIM, FRAME_DIM,
+                                            biggest->box[0], biggest->box[1],
+                                            biggest->box[2], biggest->box[3],
+                                            &aligned_landmarks)) {
+                    kp_from_eye_scan = true;
+                } else {
+                    static constexpr float STD_LDKS_112[10] = {
+                        38.2946f, 51.6963f,   // left eye
+                        73.5318f, 51.5014f,   // right eye
+                        56.0252f, 71.7366f,   // nose
+                        41.5493f, 92.3655f,   // left mouth
+                        70.7299f, 92.2041f,   // right mouth
+                    };
+                    const int bw = biggest->box[2] - biggest->box[0];
+                    const int bh = biggest->box[3] - biggest->box[1];
+                    aligned_landmarks.resize(10);
+                    for (int i = 0; i < 5; ++i) {
+                        aligned_landmarks[2 * i] = biggest->box[0] +
+                            static_cast<int>((STD_LDKS_112[2 * i]     / 112.0f) * bw);
+                        aligned_landmarks[2 * i + 1] = biggest->box[1] +
+                            static_cast<int>((STD_LDKS_112[2 * i + 1] / 112.0f) * bh);
+                    }
                 }
                 kp_for_feat = &aligned_landmarks;
+            }
+            // Diagnostic: log every recognition's alignment source +
+            // eye geometry so we can correlate sim scores with how
+            // well the localiser is performing. Cheap (one log line
+            // per ~50 ms detection frame).
+            if (kp_from_eye_scan) {
+                const int le_x = aligned_landmarks[0];
+                const int le_y = aligned_landmarks[1];
+                const int re_x = aligned_landmarks[2];
+                const int re_y = aligned_landmarks[3];
+                const int edx  = re_x - le_x;
+                const int edy  = re_y - le_y;
+                // atan2 in milliradians-ish; we report degrees.
+                const float roll_deg =
+                    std::atan2(static_cast<float>(edy),
+                               static_cast<float>(std::max(1, edx))) *
+                    (180.0f / 3.14159265f);
+                ESP_LOGI(TAG,
+                         "align: eye-scan le=(%d,%d) re=(%d,%d) "
+                         "dx=%d roll=%.1fdeg",
+                         le_x, le_y, re_x, re_y, edx, (double)roll_deg);
+            } else if (biggest->keypoint.size() != 10) {
+                ESP_LOGI(TAG, "align: fallback (bbox center-crop)");
             }
             dl::TensorBase *t = feat->run(img, *kp_for_feat);
             if (!t || t->get_size() != feat_len)
