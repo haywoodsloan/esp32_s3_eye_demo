@@ -224,20 +224,64 @@ namespace
     // so a marginal match never seeds the gallery -- the gallery only
     // grows from matches that are unambiguous on the front-on
     // template, which keeps false-match rate from creeping up.
+    //
+    // Each template carries a *quality* score in [0, 1] computed at
+    // ingest time from (detection_score * focus * bbox_area).
+    // Quality drives slot eviction once the gallery is full: a new
+    // augment candidate displaces the lowest-quality existing slot
+    // only if its own quality is higher. This is the embedded variant
+    // of the InsightFace / MagFace "quality-aware gallery" pattern --
+    // we get to keep the best representative templates for each
+    // identity instead of locking in whatever the first four high-
+    // confidence frames happened to capture.
     constexpr size_t FACE_MAX_TEMPLATES   = 4;
     constexpr float  FACE_AUGMENT_MARGIN  = 0.10f;  // above match_thr
     constexpr float  FACE_AUGMENT_NOVEL   = 0.90f;  // template counts as new if best-existing-sim < this
+    // Reference values for the quality-score normalisations. Scores
+    // beyond these saturate at 1.0. Chosen so a "good" enrolment
+    // frame -- score ~0.9, focus ~120, 130 x 130 face -- lands at
+    // quality ~0.9.
+    constexpr int    FACE_QUALITY_FOCUS_REF = 100;
+    constexpr int    FACE_QUALITY_AREA_REF  = 120 * 120;
+
+    struct FaceTemplate
+    {
+        std::vector<float> feat;
+        float              quality = 0.0f;
+    };
+
     struct KnownFace
     {
-        // Gallery of L2-normalised embeddings. feats[0] is the
-        // enrolment template; feats[1..] are auto-augmented templates
-        // captured from high-confidence matches at different head
-        // poses. feat_len is invariant across the gallery.
-        std::vector<std::vector<float>> feats;
-        std::vector<uint16_t> thumb;        // FACE_THUMB_DIM^2 RGB565BE pixels
-        char                  name[FACE_NAME_MAX] = {0};
-        uint32_t              enrolled_ms = 0;
+        // Gallery of L2-normalised embeddings + quality scores.
+        // feats[0] is the enrolment template; feats[1..] are auto-
+        // augmented templates captured from high-confidence matches
+        // at different head poses. feat_len is invariant across
+        // the gallery.
+        std::vector<FaceTemplate> feats;
+        std::vector<uint16_t>     thumb;        // FACE_THUMB_DIM^2 RGB565BE pixels
+        char                      name[FACE_NAME_MAX] = {0};
+        uint32_t                  enrolled_ms = 0;
     };
+
+    // Combined quality for a freshly-captured face. Each factor is
+    // clamped to [0, 1] and they multiply, so any single weakness
+    // (very low confidence, blurry, small) drags the overall score
+    // down -- exactly the behaviour we want when ranking templates
+    // for gallery retention.
+    static inline float face_template_quality(float det_score,
+                                              int focus,
+                                              int bbox_w,
+                                              int bbox_h) noexcept
+    {
+        const float s_n = std::clamp(det_score, 0.0f, 1.0f);
+        const float f_n = std::clamp(
+            static_cast<float>(focus) /
+            static_cast<float>(FACE_QUALITY_FOCUS_REF), 0.0f, 1.0f);
+        const float a_n = std::clamp(
+            static_cast<float>(bbox_w * bbox_h) /
+            static_cast<float>(FACE_QUALITY_AREA_REF), 0.0f, 1.0f);
+        return s_n * f_n * a_n;
+    }
     std::vector<KnownFace> g_known_faces;
     SemaphoreHandle_t      g_db_mux = nullptr;
 
@@ -1639,15 +1683,26 @@ namespace
                 const bool face_lum_fresh =
                     cur_face_luma >= 0 &&
                     (now_ms() - face_lum_ms) < FACE_LUMA_STALE_MS;
-                size_t   db_size       = 0;
-                unsigned total_tpls    = 0;
+                size_t   db_size    = 0;
+                unsigned total_tpls = 0;
+                float    q_min      = 1.0f;
+                float    q_max      = 0.0f;
+                float    q_sum      = 0.0f;
                 {
                     FaceDbLock lock;
                     db_size = g_known_faces.size();
                     for (const auto &kf : g_known_faces) {
                         total_tpls += static_cast<unsigned>(kf.feats.size());
+                        for (const auto &tpl : kf.feats) {
+                            if (tpl.quality < q_min) q_min = tpl.quality;
+                            if (tpl.quality > q_max) q_max = tpl.quality;
+                            q_sum += tpl.quality;
+                        }
                     }
                 }
+                const float q_avg = total_tpls
+                    ? (q_sum / static_cast<float>(total_tpls)) : 0.0f;
+                if (total_tpls == 0) { q_min = 0.0f; }
                 static const char *AE_NAMES[] = { "DIM", "MID", "BRIGHT" };
                 char face_lum_buf[8];
                 if (face_lum_fresh) {
@@ -1661,7 +1716,7 @@ namespace
                 ESP_LOGI(TAG,
                          "1s: frame=%u skip=%u raw=%u pad=%u kept=%u score_avg=%.2f "
                          "| rej:score=%u small=%u blurry=%u "
-                         "| known=%u new=%u (db=%u tpl=%u) "
+                         "| known=%u new=%u (db=%u tpl=%u q=%.2f/%.2f/%.2f) "
                          "| ae=%s luma=%d/%s try=%d lock=%d "
                          "(misses=%d pend=%d/2)",
                          (unsigned)s_frames,
@@ -1676,6 +1731,7 @@ namespace
                          (unsigned)s_recognised, (unsigned)s_enrolled,
                          (unsigned)db_size,
                          total_tpls,
+                         (double)q_min, (double)q_avg, (double)q_max,
                          AE_NAMES[(int)ae_preset],
                          cur_mean_luma,
                          face_lum_buf,
@@ -2332,7 +2388,7 @@ namespace
                     int   face_best_t = -1;
                     for (size_t t = 0; t < g_known_faces[i].feats.size(); ++t) {
                         const float s = cosine_sim(raw_feat,
-                                                   g_known_faces[i].feats[t].data(),
+                                                   g_known_faces[i].feats[t].feat.data(),
                                                    feat_len);
                         if (s > face_best) {
                             face_best   = s;
@@ -2390,19 +2446,62 @@ namespace
                     second_best_sim   <  best_sim - FACE_AUGMENT_MARGIN;
                 if (augment_ok)
                 {
+                    const float new_q = face_template_quality(
+                        biggest->score, focus, bw, bh);
                     FaceDbLock lock;
                     const size_t idx = (size_t)(best_id - 1);
-                    if (idx < g_known_faces.size() &&
-                        g_known_faces[idx].feats.size() < FACE_MAX_TEMPLATES)
+                    if (idx < g_known_faces.size())
                     {
-                        g_known_faces[idx].feats.emplace_back(
-                            raw_feat, raw_feat + feat_len);
-                        ESP_LOGI(TAG,
-                                 "gallery+: id=%d now has %u templates (added sim=%.3f, novel=%.3f)",
-                                 best_id,
-                                 (unsigned)g_known_faces[idx].feats.size(),
-                                 (double)best_sim,
-                                 (double)best_template_sim);
+                        auto &gallery = g_known_faces[idx].feats;
+                        if (gallery.size() < FACE_MAX_TEMPLATES) {
+                            // Free slot -- straight append.
+                            FaceTemplate tpl;
+                            tpl.feat.assign(raw_feat, raw_feat + feat_len);
+                            tpl.quality = new_q;
+                            gallery.emplace_back(std::move(tpl));
+                            ESP_LOGI(TAG,
+                                     "gallery+: id=%d slot=%u q=%.2f (added sim=%.3f, novel=%.3f)",
+                                     best_id,
+                                     (unsigned)(gallery.size() - 1),
+                                     (double)new_q,
+                                     (double)best_sim,
+                                     (double)best_template_sim);
+                        } else {
+                            // Gallery full: find the lowest-quality
+                            // slot and evict it only if the incoming
+                            // template is genuinely higher quality.
+                            // Refuses to evict slot 0 (the original
+                            // enrolment template) so the user-facing
+                            // thumbnail's identity stays anchored even
+                            // after several auto-augments.
+                            int   worst_slot = -1;
+                            float worst_q    = new_q;
+                            for (size_t t = 1; t < gallery.size(); ++t) {
+                                if (gallery[t].quality < worst_q) {
+                                    worst_q    = gallery[t].quality;
+                                    worst_slot = (int)t;
+                                }
+                            }
+                            if (worst_slot >= 0) {
+                                const float evicted_q =
+                                    gallery[worst_slot].quality;
+                                gallery[worst_slot].feat.assign(
+                                    raw_feat, raw_feat + feat_len);
+                                gallery[worst_slot].quality = new_q;
+                                ESP_LOGI(TAG,
+                                         "gallery~: id=%d slot=%d q=%.2f evict@q=%.2f (sim=%.3f, novel=%.3f)",
+                                         best_id, worst_slot,
+                                         (double)new_q,
+                                         (double)evicted_q,
+                                         (double)best_sim,
+                                         (double)best_template_sim);
+                            } else {
+                                ESP_LOGD(TAG,
+                                         "gallery=: id=%d full and new q=%.2f "
+                                         "below all existing slots, skipped",
+                                         best_id, (double)new_q);
+                            }
+                        }
                     }
                 }
 
@@ -2456,7 +2555,11 @@ namespace
                     hit_cap = true;
                 } else {
                     KnownFace entry;
-                    entry.feats.emplace_back(raw_feat, raw_feat + feat_len);
+                    FaceTemplate tpl;
+                    tpl.feat.assign(raw_feat, raw_feat + feat_len);
+                    tpl.quality = face_template_quality(
+                        biggest->score, focus, bw, bh);
+                    entry.feats.emplace_back(std::move(tpl));
                     crop_face_thumb(src, biggest, locked_orient, &entry.thumb);
                     entry.name[0]    = '\0';
                     entry.enrolled_ms = now_ms();
