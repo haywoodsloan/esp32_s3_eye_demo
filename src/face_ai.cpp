@@ -1742,8 +1742,19 @@ namespace
             uint32_t stamp_ms    = 0;
             int      matched_id  = 0;              // 1-based DB id; 0 = nothing matched
             float    last_sim    = 0.0f;           // EMA of recent same-track weighted sim
+            // Test #9: per-track EMA of the query embedding itself.
+            // Smoothing the embedding (not just the resulting sim)
+            // gives the matcher a more stable point in feature
+            // space across consecutive frames, which damps the
+            // MFN sensitivity to micro-misalignment / blur / focus
+            // jitter that survives both the bbox luma normalisation
+            // (Test #5) and the sim EMA (Test #7). Cleared on track
+            // break to avoid leaking one identity's embedding into
+            // the next.
+            std::vector<float> ema_feat;
         } recog_cache;
-        constexpr float RECOG_SIM_EMA_ALPHA = 0.6f; // weight on previous EMA value
+        constexpr float RECOG_SIM_EMA_ALPHA  = 0.6f; // weight on previous sim EMA
+        constexpr float RECOG_FEAT_EMA_ALPHA = 0.5f; // weight on new raw embedding
 
         // Name-banner state: tracks what we last asked banner_render_name
         // to draw so we don't re-rasterise unchanged content every frame.
@@ -2038,6 +2049,7 @@ namespace
                 recog_cache.valid        = false;
                 recog_cache.matched_id   = 0;
                 recog_cache.last_sim     = 0.0f;
+                recog_cache.ema_feat.clear();
                 name_banner_cache.name[0] = '\0';
                 name_banner_cache.angle_bucket = -999;
             }
@@ -2654,7 +2666,42 @@ namespace
             }
             const float *raw_feat = t->get_element_ptr<float>();
 
-            // Compare against every stored embedding. Per face we
+            // Test #9: query-side embedding EMA. When this detection
+            // is a spatial continuation of the previous frame's
+            // recog_cache hit, blend the current MFN embedding with
+            // the cached EMA and L2-renormalise. Both inputs are
+            // unit-norm so the average lies in the unit ball; the
+            // renorm projects it back onto the unit sphere so cosine
+            // sim stays in [-1, 1]. On a new track (cache empty,
+            // stale, wrong orient, or low IoU) we seed with the raw
+            // embedding -- never blend across identity boundaries.
+            std::vector<float> query_feat(raw_feat, raw_feat + feat_len);
+            const bool feat_ema_same_track =
+                recog_cache.valid &&
+                recog_cache.orient == locked_orient &&
+                recog_cache.matched_id > 0 &&
+                static_cast<int>(recog_cache.ema_feat.size()) == feat_len &&
+                (now_ms() - recog_cache.stamp_ms) < RECOG_CACHE_MS &&
+                iou_pct(biggest->box.data(), recog_cache.box) >=
+                    RECOG_IOU_PCT;
+            if (feat_ema_same_track) {
+                const float a = RECOG_FEAT_EMA_ALPHA;
+                const float b = 1.0f - a;
+                double sumsq = 0.0;
+                for (int i = 0; i < feat_len; ++i) {
+                    const float v = a * raw_feat[i] +
+                                    b * recog_cache.ema_feat[i];
+                    query_feat[i] = v;
+                    sumsq += static_cast<double>(v) * static_cast<double>(v);
+                }
+                if (sumsq > 0.0) {
+                    const float inv_n = static_cast<float>(
+                        1.0 / std::sqrt(sumsq));
+                    for (int i = 0; i < feat_len; ++i) {
+                        query_feat[i] *= inv_n;
+                    }
+                }
+            }
             // take the MAX cosine similarity across its template
             // gallery, so off-angle / profile templates can rescue a
             // match that the front-on template alone would miss. We
@@ -2699,7 +2746,7 @@ namespace
                     float face_best_raw = -2.f;
                     int   face_best_t = -1;
                     for (size_t t = 0; t < g_known_faces[i].feats.size(); ++t) {
-                        const float s_raw = cosine_sim(raw_feat,
+                        const float s_raw = cosine_sim(query_feat.data(),
                                                        g_known_faces[i].feats[t].feat.data(),
                                                        feat_len);
                         const float s = s_raw *
@@ -2929,6 +2976,9 @@ namespace
                 recog_cache.stamp_ms   = now_ms();
                 recog_cache.matched_id = best_id;
                 recog_cache.last_sim   = sim_track;
+                // Persist the (possibly blended) query embedding so
+                // next frame's same-track check can keep smoothing.
+                recog_cache.ema_feat   = query_feat;
 
                 // Show the navy name banner along the bottom of the
                 // preview if this face has been named in the web UI.
