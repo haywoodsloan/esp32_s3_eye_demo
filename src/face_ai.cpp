@@ -1299,6 +1299,155 @@ namespace
         return true;
     }
 
+    // ---- Per-bbox luminance normalisation (percentile stretch + gamma) ----
+    //
+    // ESP-DL's FeatImagePreprocessor crops + warps from the raw RGB565
+    // frame straight into MFN's 112x112 input. If the face is
+    // significantly dark (backlit) or blown out relative to the
+    // global AE-controlled scene, the warp inherits that bias and
+    // MFN sees an embedding-shifted face, hurting both enrolment
+    // quality and recognition cosine sim.
+    //
+    // We normalise the bbox region of `to_detect` IN-PLACE before
+    // calling feat->run. Strategy:
+    //   1. Walk bbox pixels, build a 256-bin Y luma histogram.
+    //   2. Find P2 / P98 from the histogram -> [lo, hi] dynamic range.
+    //   3. Compute the post-stretch mean by summing hist[i] * stretch(i).
+    //   4. Pick a gamma to nudge the post-stretch mean toward TARGET=128:
+    //        gamma = log(TARGET/255) / log(mean/255)
+    //      clamped to [0.6, 1.6] so we never over-correct.
+    //   5. Build a single LUT that maps raw Y -> stretched+gamma Y.
+    //   6. Re-walk bbox pixels; for each one decode RGB565BE, compute
+    //      Y, look up the new Y, scale all channels by new_Y/Y to
+    //      preserve chroma, repack to RGB565BE, write back.
+    //
+    // This runs once per detected face (per frame), and is repeated
+    // implicitly for the hflip TTA pass because that pass copies
+    // from to_detect AFTER normalisation. Cost is O(bbox_area) twice
+    // (~30 ms worst case for a 140x140 bbox on a 240 MHz LX7), kept
+    // cheap by avoiding float math in the hot loops.
+    //
+    // We deliberately leave the original frame buffer (`src`) alone --
+    // crop_face_thumb() runs on `src`, not `to_detect`, so the thumb
+    // remains photographically faithful.
+    bool normalize_face_bbox(uint16_t *to_detect_be, int frame_dim,
+                              int x0, int y0, int x1, int y1) noexcept
+    {
+        x0 = std::max(0, x0);
+        y0 = std::max(0, y0);
+        x1 = std::min(frame_dim - 1, x1);
+        y1 = std::min(frame_dim - 1, y1);
+        if (x1 <= x0 + 4 || y1 <= y0 + 4) {
+            return false;
+        }
+
+        // Pass 1: histogram of Y over bbox.
+        uint32_t hist[256] = {0};
+        uint32_t total = 0;
+        for (int y = y0; y <= y1; ++y) {
+            const uint16_t *row = to_detect_be + y * frame_dim;
+            for (int x = x0; x <= x1; ++x) {
+                const uint16_t be = row[x];
+                const uint16_t p  = static_cast<uint16_t>((be >> 8) |
+                                                          (be << 8));
+                const int r = ((p >> 11) & 0x1F) << 3;
+                const int g = ((p >> 5)  & 0x3F) << 2;
+                const int b = ( p        & 0x1F) << 3;
+                const int yl = (77 * r + 150 * g + 29 * b) >> 8;
+                ++hist[yl & 0xFF];
+                ++total;
+            }
+        }
+        if (total < 256) {
+            return false;
+        }
+
+        // Pass 2: find P2, P98.
+        const uint32_t p_lo_target = total * 2u  / 100u;
+        const uint32_t p_hi_target = total * 98u / 100u;
+        int lo = 0, hi = 255;
+        uint32_t acc = 0;
+        for (int i = 0; i < 256; ++i) {
+            acc += hist[i];
+            if (acc >= p_lo_target) { lo = i; break; }
+        }
+        acc = 0;
+        for (int i = 0; i < 256; ++i) {
+            acc += hist[i];
+            if (acc >= p_hi_target) { hi = i; break; }
+        }
+        if (hi - lo < 12) {
+            // Too little dynamic range -- the face is so flat any
+            // stretch would just amplify noise. Skip.
+            return false;
+        }
+
+        // Estimate post-stretch mean luma to choose gamma.
+        const float inv_span = 255.0f / static_cast<float>(hi - lo);
+        double sum_stretched = 0.0;
+        for (int i = lo; i <= hi; ++i) {
+            const float v = (i - lo) * inv_span;
+            sum_stretched += static_cast<double>(hist[i]) * v;
+        }
+        // Pixels below lo clamp to 0; pixels above hi clamp to 255.
+        for (int i = hi + 1; i < 256; ++i) sum_stretched += hist[i] * 255.0;
+        const float mean_stretched = static_cast<float>(
+            sum_stretched / static_cast<double>(total));
+
+        constexpr float TARGET = 128.0f;
+        float gamma = 1.0f;
+        if (mean_stretched > 1.0f && mean_stretched < 254.0f) {
+            const float ln_mean = std::log(mean_stretched / 255.0f);
+            const float ln_tgt  = std::log(TARGET         / 255.0f);
+            if (std::fabs(ln_mean) > 1e-3f) {
+                gamma = ln_tgt / ln_mean;
+            }
+        }
+        gamma = std::clamp(gamma, 0.6f, 1.6f);
+
+        // Build LUT: in_luma -> out_luma (stretch + gamma).
+        uint8_t lut[256];
+        for (int i = 0; i < 256; ++i) {
+            float v;
+            if (i <= lo) {
+                v = 0.0f;
+            } else if (i >= hi) {
+                v = 1.0f;
+            } else {
+                v = (i - lo) * inv_span * (1.0f / 255.0f);
+            }
+            const float vg = std::pow(v, gamma);
+            const int   out = static_cast<int>(vg * 255.0f + 0.5f);
+            lut[i] = static_cast<uint8_t>(std::clamp(out, 0, 255));
+        }
+
+        // Pass 3: rewrite bbox pixels using the LUT, preserving chroma
+        // by scaling RGB by new_Y / Y.
+        for (int y = y0; y <= y1; ++y) {
+            uint16_t *row = to_detect_be + y * frame_dim;
+            for (int x = x0; x <= x1; ++x) {
+                const uint16_t be = row[x];
+                const uint16_t p  = static_cast<uint16_t>((be >> 8) |
+                                                          (be << 8));
+                int r = ((p >> 11) & 0x1F) << 3;
+                int g = ((p >> 5)  & 0x3F) << 2;
+                int b = ( p        & 0x1F) << 3;
+                int yl = (77 * r + 150 * g + 29 * b) >> 8;
+                if (yl < 1) yl = 1;
+                const int new_y = lut[yl & 0xFF];
+                r = std::clamp((r * new_y) / yl, 0, 255);
+                g = std::clamp((g * new_y) / yl, 0, 255);
+                b = std::clamp((b * new_y) / yl, 0, 255);
+                const uint16_t out =
+                    static_cast<uint16_t>(((r & 0xF8) << 8) |
+                                          ((g & 0xFC) << 3) |
+                                          ( b >> 3));
+                row[x] = static_cast<uint16_t>((out >> 8) | (out << 8));
+            }
+        }
+        return true;
+    }
+
     // Banner rotation = how the on-screen face is tilted relative to upright
     // in the *un-rotated* camera frame (which is what the user sees on the
     // LCD). If we rotated the image by N*90 deg CW to make the face upright
@@ -2483,6 +2632,19 @@ namespace
             } else if (biggest->keypoint.size() != 10) {
                 ESP_LOGI(TAG, "align: fallback (bbox center-crop)");
             }
+            // Per-bbox luminance normalisation (Test #5): stretch
+            // [P2,P98] -> [0,255] and apply a mild gamma to pull the
+            // face's average luma toward 128. Done in-place on
+            // to_detect just before the embedder runs, so both the
+            // straight pass and the hflip TTA pass see consistent
+            // exposure. Safe to skip silently if the bbox is too
+            // small or already too flat -- normalize_face_bbox()
+            // returns false in those cases.
+            const bool norm_applied = normalize_face_bbox(
+                const_cast<uint16_t *>(to_detect), FRAME_DIM,
+                biggest->box[0], biggest->box[1],
+                biggest->box[2], biggest->box[3]);
+            (void)norm_applied;
             dl::TensorBase *t = feat->run(img, *kp_for_feat);
             if (!t || t->get_size() != feat_len)
             {
