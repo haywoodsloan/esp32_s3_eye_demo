@@ -138,6 +138,39 @@ namespace
     constexpr uint32_t RECOG_CACHE_MS = 1500;
     constexpr int      RECOG_IOU_PCT  = 55;
 
+    // Spatial-track continuation. When the matcher returns "unknown"
+    // but we very recently recognised someone whose bbox is still
+    // roughly where the current bbox is, treat the current frame as
+    // a continuation of that same identity rather than enrolling a
+    // new one. This is the embedded variant of the DeepSORT pattern
+    // (Wojke et al. 2017): spatial proximity is a more reliable
+    // same-track signal than embedding similarity across short
+    // timescales -- particularly when the user rotates the device
+    // (the embedding shifts substantially across orients before the
+    // gallery has a template for the new pose).
+    //
+    // SPATIAL_TRACK_MS is wider than RECOG_CACHE_MS so the override
+    // can rescue frames that already missed the cache's IoU gate;
+    // SPATIAL_TRACK_IOU_PCT is loose enough that an orient swap or
+    // a half-frame head turn still passes; SPATIAL_TRACK_SIM_FLOOR
+    // is a sanity check against the edge case where a different
+    // person happens to land at the same bbox -- random face
+    // embeddings sit around cosine 0.0, real same-person across
+    // poses is reliably > 0.20 even at extreme angles.
+    constexpr uint32_t SPATIAL_TRACK_MS         = 3000;
+    constexpr int      SPATIAL_TRACK_IOU_PCT    = 30;
+    constexpr float    SPATIAL_TRACK_SIM_FLOOR  = 0.20f;
+
+    // Quality floor that a candidate enrolment frame must clear
+    // before being committed to the DB. Below this, we silently
+    // discard the candidate rather than seeding the gallery with a
+    // low-quality template that subsequent across-pose detections
+    // can't match -- which is the failure mode the spatial-track
+    // continuation above is the second line of defence against.
+    // 0.55 corresponds to roughly: detection score >= 0.75, focus
+    // >= 75, and bbox area >= 90 x 90, all factored together.
+    constexpr float    FACE_ENROL_MIN_QUALITY   = 0.55f;
+
     // Sharpness gate — average per-sample (|dx| + |dy|) on the green channel
     // inside the face bbox. Kept fairly permissive because the OV2640
     // is fixed-focus around ~30 cm: faces inside that range are genuinely
@@ -1527,6 +1560,8 @@ namespace
         uint32_t s_too_blurry = 0;    // biggest rejected for focus
         uint32_t s_recognised = 0;    // matched an existing enrollment
         uint32_t s_enrolled = 0;      // new face added
+        uint32_t s_spatial_track = 0; // spatial-track override fired
+        uint32_t s_enrol_q_skip = 0;  // enrolment blocked by quality floor
         // Running best-score totals so the heartbeat can show
         // average detector confidence even when our gates reject.
         float    s_score_sum = 0.f;
@@ -1805,7 +1840,7 @@ namespace
                 ESP_LOGI(TAG,
                          "1s: frame=%u skip=%u raw=%u pad=%u kept=%u score_avg=%.2f "
                          "| rej:score=%u small=%u blurry=%u "
-                         "| known=%u new=%u (db=%u tpl=%u q=%.2f/%.2f/%.2f) "
+                         "| known=%u new=%u sp=%u qskip=%u (db=%u tpl=%u q=%.2f/%.2f/%.2f) "
                          "| ae=%s luma=%d/%s try=%d lock=%d "
                          "(misses=%d pend=%d/2)",
                          (unsigned)s_frames,
@@ -1818,6 +1853,7 @@ namespace
                          (unsigned)s_too_small,
                          (unsigned)s_too_blurry,
                          (unsigned)s_recognised, (unsigned)s_enrolled,
+                         (unsigned)s_spatial_track, (unsigned)s_enrol_q_skip,
                          (unsigned)db_size,
                          total_tpls,
                          (double)q_min, (double)q_avg, (double)q_max,
@@ -1830,7 +1866,7 @@ namespace
                          pending_confirm);
                 s_frames = s_motion_skip = s_raw_dets = s_pad_hits = s_detections =
                     s_rej_score = s_too_small = s_too_blurry =
-                    s_recognised = s_enrolled = 0;
+                    s_recognised = s_enrolled = s_spatial_track = s_enrol_q_skip = 0;
                 s_score_sum = 0.f;
                 s_score_n = 0;
                 stats_next_us = now_us + STATS_PERIOD_US;
@@ -2543,7 +2579,84 @@ namespace
                             (1.0f - RECOG_SIM_EMA_ALPHA) * best_sim;
             }
 
-            if (best_id > 0 && sim_track >= g_tuning.match_thr)
+            // Spatial-track continuation override. When the matcher
+            // would otherwise treat this frame as "unknown" but the
+            // current bbox is still spatially close to a face we
+            // recognised within the last few seconds, force-match
+            // against that prior identity instead of starting an
+            // enrolment cascade. Common case: user turns the device
+            // sideways, the embedding shifts across orient before
+            // the gallery has a template at the new pose, and
+            // without this branch we'd enrol a fresh "person" every
+            // time the orient cycle ratchets to a new lock.
+            //
+            // The SPATIAL_TRACK_SIM_FLOOR guard is a same-face sanity
+            // check on the *raw* sim against the tracked identity's
+            // gallery -- random embeddings hover around 0.0, so any
+            // value above 0.2 strongly implies it's still the same
+            // person. Below that, we let enrolment proceed normally
+            // (a genuinely different person at the same bbox should
+            // get their own id).
+            bool spatial_track_overrode = false;
+            if (sim_track < g_tuning.match_thr &&
+                recog_cache.valid &&
+                recog_cache.matched_id > 0 &&
+                (now_ms() - recog_cache.stamp_ms) < SPATIAL_TRACK_MS &&
+                iou_pct(biggest->box.data(), recog_cache.box) >=
+                    SPATIAL_TRACK_IOU_PCT)
+            {
+                // Re-score this frame against the tracked identity's
+                // gallery only. The general matcher loop above already
+                // computed this for the tracked id when it iterated --
+                // but it picked the winner by *weighted* sim across
+                // all identities. Here we want the *raw* sim against
+                // the tracked id specifically so we can decide if it's
+                // plausibly the same person (vs a different person who
+                // happened to walk into the same bbox).
+                float track_raw = -2.f;
+                int   track_t   = -1;
+                float track_q   = 0.f;
+                {
+                    FaceDbLock lock;
+                    const size_t idx = (size_t)(recog_cache.matched_id - 1);
+                    if (idx < g_known_faces.size()) {
+                        for (size_t t = 0; t < g_known_faces[idx].feats.size(); ++t) {
+                            const float s = cosine_sim(
+                                raw_feat,
+                                g_known_faces[idx].feats[t].feat.data(),
+                                feat_len);
+                            if (s > track_raw) {
+                                track_raw = s;
+                                track_t   = (int)t;
+                                track_q   = g_known_faces[idx].feats[t].quality;
+                            }
+                        }
+                    }
+                }
+                if (track_raw >= SPATIAL_TRACK_SIM_FLOOR)
+                {
+                    const float qw = 0.5f + 0.5f * std::sqrt(track_q);
+                    best_id               = recog_cache.matched_id;
+                    best_sim_raw          = track_raw;
+                    best_sim              = track_raw * qw;
+                    best_template_idx     = track_t;
+                    best_template_sim_raw = track_raw;
+                    sim_track             = RECOG_SIM_EMA_ALPHA * recog_cache.last_sim +
+                                            (1.0f - RECOG_SIM_EMA_ALPHA) * best_sim;
+                    spatial_track_overrode = true;
+                    ++s_spatial_track;
+                    ESP_LOGI(TAG,
+                             "spatial-track continue: id=%d iou=%d%% "
+                             "raw=%.3f track_sim=%.3f (was best_sim=%.3f)",
+                             best_id,
+                             iou_pct(biggest->box.data(), recog_cache.box),
+                             (double)track_raw, (double)sim_track,
+                             (double)(best_sim));
+                }
+            }
+
+            if (best_id > 0 &&
+                (sim_track >= g_tuning.match_thr || spatial_track_overrode))
             {
                 // Recognised — no enroll, no banner. We removed the
                 // "OH... IT'S YOU" path: recognition is now silent so
@@ -2680,6 +2793,29 @@ namespace
                 continue;
             }
 
+            // Enrolment quality floor. Refuse to seed the DB with a
+            // template that's below FACE_ENROL_MIN_QUALITY -- a low-
+            // quality first template (small bbox, blurry, low detection
+            // score) makes the gallery brittle to pose changes and
+            // bootstraps the multi-enrolment cascade the spatial-track
+            // continuation above is the second line of defence against.
+            // The frame still tracks normally; we just don't commit it
+            // to the DB. unknown_streak is preserved so a subsequent
+            // higher-quality frame can still enrol immediately.
+            const float candidate_q = face_template_quality(
+                biggest->score, focus, bw, bh);
+            if (candidate_q < FACE_ENROL_MIN_QUALITY) {
+                ++s_enrol_q_skip;
+                ESP_LOGD(TAG,
+                         "skip enroll: q=%.2f below %.2f floor "
+                         "(score=%.2f focus=%d bbox=%dx%d)",
+                         (double)candidate_q,
+                         (double)FACE_ENROL_MIN_QUALITY,
+                         (double)biggest->score, focus, bw, bh);
+                esp_camera_fb_return(fb);
+                continue;
+            }
+
             // Commit the enrollment. Copy the float* into the known list
             // (the source buffer is recycled by the model on the next run).
             // Every successful enrollment fires the "NEW FACE DETECTED"
@@ -2696,8 +2832,7 @@ namespace
                     KnownFace entry;
                     FaceTemplate tpl;
                     tpl.feat.assign(raw_feat, raw_feat + feat_len);
-                    tpl.quality = face_template_quality(
-                        biggest->score, focus, bw, bh);
+                    tpl.quality = candidate_q;
                     entry.feats.emplace_back(std::move(tpl));
                     crop_face_thumb(src, biggest, locked_orient, &entry.thumb);
                     entry.name[0]    = '\0';
