@@ -2868,7 +2868,19 @@ namespace
                 // pull the name out of the DB without needing to run
                 // the embedder again.
                 recog_cache.matched_id = static_cast<int>(new_count);
-                recog_cache.last_sim   = 0.0f;  // brand-new identity, no EMA history
+                // Seed the per-track sim EMA at the augment floor
+                // (match_thr + FACE_AUGMENT_MARGIN) instead of zero
+                // so the very first post-enrolment frame doesn't dip
+                // below match_thr just because the EMA hadn't built
+                // any history. With seed=0 the first frame's
+                // sim_track collapses to 0.4*best_sim, which can land
+                // at ~0.29 (below the 0.38 MID floor) for an
+                // otherwise-high-quality match -- and we'd lean on
+                // the spatial-track override to rescue it. Seeding at
+                // the augment floor matches what we'd compute if the
+                // matcher had already considered this identity "just
+                // recognised at the floor".
+                recog_cache.last_sim   = g_tuning.match_thr + FACE_AUGMENT_MARGIN;
 
                 // Only (re)render the banner if one isn't already on
                 // screen: we want the text orientation to reflect the
