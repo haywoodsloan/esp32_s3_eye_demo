@@ -2822,6 +2822,93 @@ namespace
             // overlay, refreshing both the deadline and the rotation angle
             // so the text always reads upright relative to the current
             // face pose.
+            //
+            // Horizontal-flip TTA on the enrolment template only.
+            // Standard pattern from FaceNet 2015 onwards (used by
+            // InsightFace, Google Coral demo, OAK-D pipelines etc.):
+            // embed the frame, then embed its horizontal mirror, then
+            // average + L2-renormalise. The resulting "anchor"
+            // template is meaningfully more pose-symmetric than a
+            // single forward pass, which especially helps when the
+            // enrolment pose is slightly off-centre (head turned a
+            // few degrees) -- the flipped version balances out the
+            // bias. Cost: one extra MFN inference per enrolment
+            // (~50 ms, paid exactly once per identity).
+            //
+            // Falls back to the straight `raw_feat` if `padded_scratch`
+            // failed to allocate at startup, or if the embedder's
+            // second call doesn't produce the expected tensor.
+            std::vector<float> enrol_feat(raw_feat, raw_feat + feat_len);
+            bool tta_applied = false;
+            if (padded_scratch && kp_for_feat &&
+                kp_for_feat->size() == 10)
+            {
+                // 1. Hflip image: dst[y][x] = src[y][N-1-x].
+                const uint16_t *src16 = to_detect;
+                uint16_t       *dst16 = padded_scratch;
+                for (int y = 0; y < FRAME_DIM; ++y) {
+                    const size_t row_base = static_cast<size_t>(y) * FRAME_DIM;
+                    for (int x = 0; x < FRAME_DIM; ++x) {
+                        dst16[row_base + x] =
+                            src16[row_base + (FRAME_DIM - 1 - x)];
+                    }
+                }
+                // 2. Hflip landmarks: swap LE<->RE and LM<->RM (their
+                //    "left vs right" labels in our (x-low, x-high) sense
+                //    invert when the image flips), flip the x of nose.
+                //    Layout: [LE.x, LE.y, RE.x, RE.y, N.x, N.y, LM.x,
+                //    LM.y, RM.x, RM.y].
+                const int N1 = FRAME_DIM - 1;
+                const std::vector<int> &kp = *kp_for_feat;
+                std::vector<int> flipped_kp(10);
+                flipped_kp[0] = N1 - kp[2];   // was RE
+                flipped_kp[1] = kp[3];
+                flipped_kp[2] = N1 - kp[0];   // was LE
+                flipped_kp[3] = kp[1];
+                flipped_kp[4] = N1 - kp[4];   // nose, x flipped
+                flipped_kp[5] = kp[5];
+                flipped_kp[6] = N1 - kp[8];   // was RM
+                flipped_kp[7] = kp[9];
+                flipped_kp[8] = N1 - kp[6];   // was LM
+                flipped_kp[9] = kp[7];
+
+                // 3. Run the embedder again on the flipped frame.
+                //    NOTE: this invalidates `raw_feat` (the original
+                //    tensor is recycled by MFN's postprocessor on the
+                //    next call), so we copied it into enrol_feat above.
+                dl::image::img_t flip_img = img;
+                flip_img.data = padded_scratch;
+                dl::TensorBase *t2 = feat->run(flip_img, flipped_kp);
+                if (t2 && t2->get_size() == feat_len) {
+                    const float *flip_feat = t2->get_element_ptr<float>();
+                    // 4. Average + L2-renormalise. Both embeddings are
+                    //    already unit-norm so the average sits inside
+                    //    the unit ball; we re-project to the unit
+                    //    sphere so cosine sim against gallery templates
+                    //    stays bounded in [-1, 1].
+                    double sumsq = 0.0;
+                    for (int i = 0; i < feat_len; ++i) {
+                        enrol_feat[i] = 0.5f * (enrol_feat[i] + flip_feat[i]);
+                        sumsq += static_cast<double>(enrol_feat[i]) *
+                                 static_cast<double>(enrol_feat[i]);
+                    }
+                    if (sumsq > 0.0) {
+                        const float inv_norm = static_cast<float>(
+                            1.0 / std::sqrt(sumsq));
+                        for (int i = 0; i < feat_len; ++i) {
+                            enrol_feat[i] *= inv_norm;
+                        }
+                        tta_applied = true;
+                    }
+                }
+            }
+            if (!tta_applied) {
+                ESP_LOGD(TAG,
+                         "enrol: hflip TTA skipped (padded_scratch=%p, kp.size=%u)",
+                         (const void *)padded_scratch,
+                         (unsigned)(kp_for_feat ? kp_for_feat->size() : 0));
+            }
+
             bool hit_cap = false;
             size_t new_count = 0;
             {
@@ -2831,7 +2918,7 @@ namespace
                 } else {
                     KnownFace entry;
                     FaceTemplate tpl;
-                    tpl.feat.assign(raw_feat, raw_feat + feat_len);
+                    tpl.feat = std::move(enrol_feat);
                     tpl.quality = candidate_q;
                     entry.feats.emplace_back(std::move(tpl));
                     crop_face_thumb(src, biggest, locked_orient, &entry.thumb);
@@ -2901,19 +2988,21 @@ namespace
                                             std::memory_order_relaxed);
 
                     ESP_LOGI(TAG,
-                             "NEW face enrolled id=%u (total=%u, bbox=%dx%d, focus=%d, orient=%d, roll=%.0fdeg)",
+                             "NEW face enrolled id=%u (total=%u, bbox=%dx%d, focus=%d, q=%.2f, orient=%d, roll=%.0fdeg, tta=%s)",
                              (unsigned)new_count,
                              (unsigned)new_count,
-                             bw, bh, focus, (int)locked_orient,
-                             (double)(roll * 180.f / 3.14159265f));
+                             bw, bh, focus, (double)candidate_q, (int)locked_orient,
+                             (double)(roll * 180.f / 3.14159265f),
+                             tta_applied ? "yes" : "no");
                 }
                 else
                 {
                     ESP_LOGI(TAG,
-                             "supplementary enrol id=%u (banner already up; total=%u, bbox=%dx%d, focus=%d)",
+                             "supplementary enrol id=%u (banner already up; total=%u, bbox=%dx%d, focus=%d, q=%.2f, tta=%s)",
                              (unsigned)new_count,
                              (unsigned)new_count,
-                             bw, bh, focus);
+                             bw, bh, focus, (double)candidate_q,
+                             tta_applied ? "yes" : "no");
                 }
             }
             unknown_streak = 0;
