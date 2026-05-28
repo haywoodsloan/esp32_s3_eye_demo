@@ -1638,7 +1638,39 @@ namespace
         // that we apply MIN_DETECT_SCORE_ROT0 / MIN_DETECT_SCORE_ROTATED
         // at the app level to gate orient-cycle locks against the
         // few low-confidence rotated false-positives that slip past.
-        auto      feat     = std::make_unique<HumanFaceFeat>();
+        // Test #14 (feat root-cause audit): instead of letting
+        // HumanFaceFeat default to lazy_load=true (model is loaded on
+        // first call to feat->run inside the loop, which hides cost
+        // and timing), force the load at task init and bracket it
+        // with heap + wall-clock probes. ESP-DL's Model ctor defaults
+        // to param_copy=true which is meant to copy the ~1.3 MB of
+        // MFN_S8_V1 weights from the human_face_feat flash partition
+        // into PSRAM (octal @ 80 MHz, ~4x faster than flash). If the
+        // PSRAM free count doesn't drop by ~1.3 MB across this call,
+        // param_copy silently failed and inference is streaming
+        // weights from flash on every layer -- that would directly
+        // explain why feat->run takes ~975 ms vs the official 254 ms
+        // S3 benchmark.
+        const size_t psram_before  = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        const size_t intern_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        const int64_t feat_load_t0 = esp_timer_get_time();
+        auto      feat     = std::make_unique<HumanFaceFeat>(
+            static_cast<HumanFaceFeat::model_type_t>(CONFIG_DEFAULT_HUMAN_FACE_FEAT_MODEL),
+            /*lazy_load=*/false);
+        const int64_t feat_load_us = esp_timer_get_time() - feat_load_t0;
+        const size_t psram_after   = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        const size_t intern_after  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        // Test #14 confirmed model loads cleanly into PSRAM
+        // (~2 MB consumed) + 71 KB internal. We keep this one-shot
+        // log because it's useful to confirm after any model swap
+        // that placement still works the way we expect.
+        ESP_LOGI(TAG,
+                 "feat load: %u ms | PSRAM used=%u KB (free %u -> %u) | INTERNAL used=%u KB (free %u -> %u)",
+                 (unsigned)(feat_load_us / 1000),
+                 (unsigned)((psram_before  - psram_after)  / 1024),
+                 (unsigned)psram_before,  (unsigned)psram_after,
+                 (unsigned)((intern_before - intern_after) / 1024),
+                 (unsigned)intern_before, (unsigned)intern_after);
         const int feat_len = feat->get_feat_len();
 
         // Scratch buffer for orientation-rotated frames. Prefer
@@ -1704,6 +1736,33 @@ namespace
 
         // Counters for the per-second heartbeat.
         int64_t stats_next_us = esp_timer_get_time() + STATS_PERIOD_US;
+
+        // Test #16: PSRAM-contention experiment. Inference variance
+        // (~25% across consecutive frames) plus published 248 ms vs
+        // our 1100 ms feat:model time both pointed at the LCD render
+        // task pulling 240x240x2 = 115 KB per render frame out of
+        // octal PSRAM while MFN's weight streaming is trying to use
+        // the same bus. We pause the render task around every
+        // feat->run call to free the PSRAM bus for MFN, then resume.
+        //
+        // The handle is looked up lazily because main.cpp creates
+        // the render task after face_ai_init; first lookup may fail
+        // if face_ai_task races ahead. We retry until it succeeds
+        // (typically the first time we have a face).
+        TaskHandle_t render_task_handle = nullptr;
+        auto render_suspend = [&]() {
+            if (!render_task_handle) {
+                render_task_handle = xTaskGetHandle("render");
+            }
+            if (render_task_handle) {
+                vTaskSuspend(render_task_handle);
+            }
+        };
+        auto render_resume = [&]() {
+            if (render_task_handle) {
+                vTaskResume(render_task_handle);
+            }
+        };
 
         // Test #10: per-stage timing instrumentation. Wraps the hot
         // calls in esp_timer_get_time() bookends and accumulates
@@ -2749,7 +2808,9 @@ namespace
             (void)norm_applied;
             record_stage(ST_NORMALIZE, esp_timer_get_time() - _t_norm0);
             const int64_t _t_feat0 = esp_timer_get_time();
+            render_suspend();
             dl::TensorBase *t = feat->run(img, *kp_for_feat);
+            render_resume();
             record_stage(ST_FEAT, esp_timer_get_time() - _t_feat0);
             if (!t || t->get_size() != feat_len)
             {
@@ -3187,7 +3248,9 @@ namespace
                 //    next call), so we copied it into enrol_feat above.
                 dl::image::img_t flip_img = img;
                 flip_img.data = padded_scratch;
+                render_suspend();
                 dl::TensorBase *t2 = feat->run(flip_img, flipped_kp);
+                render_resume();
                 if (t2 && t2->get_size() == feat_len) {
                     const float *flip_feat = t2->get_element_ptr<float>();
                     // 4. Average + L2-renormalise. Both embeddings are
