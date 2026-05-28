@@ -176,6 +176,26 @@ static void render_task(void *arg)
     int64_t  window_us = esp_timer_get_time();
 
     for (;;) {
+        // Test #17: render-throttle during inference. The face_ai
+        // task sets g_inference_busy true around each detect->run /
+        // feat->run; while that flag is up, we drop the in-flight fb
+        // back to the camera pool (so the camera DMA keeps draining)
+        // and short-sleep without touching the LCD. Skipping the
+        // display_draw_rgb565() call -- which pulls 240x240x2 = 115 KB
+        // out of octal PSRAM per push -- is what frees the PSRAM bus
+        // for the inference. Visible effect: the preview pauses on
+        // the last-pushed frame for ~250 ms per detect cycle and
+        // ~660 ms per recognition; restored to full rate the moment
+        // the inference finishes.
+        if (face_ai_inference_busy()) [[unlikely]] {
+            if (in_flight) {
+                esp_camera_fb_return(in_flight);
+                in_flight = NULL;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
         // Stream live frames to the panel every iteration; when the
         // banner is active we composite "NEW FACE DETECTED" on top of
         // the frame in-place before pushing it to the LCD. This replaces

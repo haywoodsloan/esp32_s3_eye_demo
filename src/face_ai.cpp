@@ -232,6 +232,15 @@ namespace
     // headroom from boot, well past any plausible session lifetime.
     std::atomic<uint32_t> g_banner_until_ms{0};
 
+    // Test #17: render-throttle flag. The face_ai task sets this true
+    // around each detect->run / feat->run (the two ESP-DL inferences),
+    // and the render task polls it in its main loop and skips the
+    // PSRAM-heavy display_draw_rgb565() call while set. The flag-vs-
+    // suspend approach lets the render task stay scheduled (so it can
+    // wake up to drop the in-flight frame buffer back to the camera
+    // pool) without consuming PSRAM bus bandwidth for the LCD push.
+    std::atomic<bool> g_inference_busy{false};
+
     // Name-banner deadline: navy-blue banner along the bottom of the
     // LCD showing the recognised person's name. Refreshed every frame
     // that the matcher (or its IoU cache) returns a known face whose
@@ -1750,18 +1759,12 @@ namespace
         // if face_ai_task races ahead. We retry until it succeeds
         // (typically the first time we have a face).
         TaskHandle_t render_task_handle = nullptr;
+        (void)render_task_handle;  // retained for opt-in suspend testing
         auto render_suspend = [&]() {
-            if (!render_task_handle) {
-                render_task_handle = xTaskGetHandle("render");
-            }
-            if (render_task_handle) {
-                vTaskSuspend(render_task_handle);
-            }
+            g_inference_busy.store(true, std::memory_order_release);
         };
         auto render_resume = [&]() {
-            if (render_task_handle) {
-                vTaskResume(render_task_handle);
-            }
+            g_inference_busy.store(false, std::memory_order_release);
         };
 
         // Test #10: per-stage timing instrumentation. Wraps the hot
@@ -2255,7 +2258,14 @@ namespace
             img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565BE;
 
             const int64_t _t_det0 = esp_timer_get_time();
+            // Test #18: free the PSRAM bus from LCD-SPI contention
+            // during the detector pass too, not just the embedder.
+            // detect->run is ~215 ms and runs every frame (whereas
+            // feat->run only runs on recognition frames), so the
+            // aggregate savings are large.
+            render_suspend();
             std::list<dl::detect::result_t> &detections = detect->run(img);
+            render_resume();
             record_stage(ST_DETECT, esp_timer_get_time() - _t_det0);
             if (!detections.empty())
             {
@@ -3412,6 +3422,11 @@ bool face_ai_banner_active(void)
 bool face_ai_name_banner_active(void)
 {
     return g_name_banner_until_ms.load(std::memory_order_relaxed) > now_ms();
+}
+
+bool face_ai_inference_busy(void)
+{
+    return g_inference_busy.load(std::memory_order_relaxed);
 }
 
 void face_ai_get_overlay(face_overlay_t *out)

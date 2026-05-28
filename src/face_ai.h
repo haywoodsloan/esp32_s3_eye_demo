@@ -27,6 +27,13 @@ bool face_ai_banner_active(void);
 // render frame.
 bool face_ai_name_banner_active(void);
 
+// True while the face_ai task is currently inside a heavy ESP-DL
+// inference (detector or feature model). Render task should throttle
+// itself when this returns true so the LCD-SPI -> octal-PSRAM read
+// traffic doesn't contend with the inference's weight-streaming bus
+// pressure. Cheap atomic load -- safe to poll every render frame.
+bool face_ai_inference_busy(void);
+
 // Snapshot of the most recent successful face detection, transformed
 // back into camera (display) frame coordinates so the render loop can
 // draw the bbox + 5 keypoints directly on top of the live preview.
