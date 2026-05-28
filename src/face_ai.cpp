@@ -47,6 +47,17 @@
 #include <memory>
 #include <vector>
 
+// Test #11 (low-level perf pass): kick this entire translation unit up
+// to -O3 with loop unrolling. The IDF default for our build is -O2
+// (CONFIG_COMPILER_OPTIMIZATION_PERF=y); applying -O3 only here keeps
+// the heavyweight ESP-DL and esp32-camera components compiled with
+// their own validated flags while still letting GCC aggressively
+// unroll our tight per-pixel loops (normalize_face_bbox, the bbox
+// luma sample, the hflip TTA copy, etc.).
+#pragma GCC push_options
+#pragma GCC optimize ("O3")
+#pragma GCC optimize ("unroll-loops")
+
 namespace
 {
 
@@ -1109,6 +1120,10 @@ namespace
     bool estimate_face_keypoints(const uint16_t *fb, int img_w, int img_h,
                                  int x0, int y0, int x1, int y1,
                                  std::vector<int> *out_kp) noexcept
+        __attribute__((hot));
+    bool estimate_face_keypoints(const uint16_t *fb, int img_w, int img_h,
+                                 int x0, int y0, int x1, int y1,
+                                 std::vector<int> *out_kp) noexcept
     {
         const int bw = x1 - x0;
         const int bh = y1 - y0;
@@ -1330,6 +1345,9 @@ namespace
     // We deliberately leave the original frame buffer (`src`) alone --
     // crop_face_thumb() runs on `src`, not `to_detect`, so the thumb
     // remains photographically faithful.
+    bool normalize_face_bbox(uint16_t *to_detect_be, int frame_dim,
+                              int x0, int y0, int x1, int y1) noexcept
+        __attribute__((hot));
     bool normalize_face_bbox(uint16_t *to_detect_be, int frame_dim,
                               int x0, int y0, int x1, int y1) noexcept
     {
@@ -1831,9 +1849,14 @@ namespace
                 std::strcmp(name_banner_cache.name, local_name) != 0) {
                 banner_render_name(local_name,
                                    static_cast<float>(bucket) * quarter);
-                std::strncpy(name_banner_cache.name, local_name,
-                             FACE_NAME_MAX - 1);
-                name_banner_cache.name[FACE_NAME_MAX - 1] = '\0';
+                // memcpy + explicit null term (rather than strncpy) so
+                // -O3 doesn't trip its stringop-truncation analysis,
+                // which can't see that local_name is already guaranteed
+                // < FACE_NAME_MAX by the source it was copied from.
+                const size_t n = std::min(std::strlen(local_name),
+                                          (size_t)(FACE_NAME_MAX - 1));
+                std::memcpy(name_banner_cache.name, local_name, n);
+                name_banner_cache.name[n] = '\0';
                 name_banner_cache.angle_bucket = bucket;
             }
             g_name_banner_until_ms.store(
@@ -3416,3 +3439,6 @@ bool face_db_delete(int idx)
     g_recog_cache_invalidate.store(true, std::memory_order_release);
     return true;
 }
+
+// Close out the Test #11 -O3 + unroll-loops scope.
+#pragma GCC pop_options
