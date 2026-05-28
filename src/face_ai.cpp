@@ -1687,6 +1687,36 @@ namespace
         // Counters for the per-second heartbeat.
         int64_t stats_next_us = esp_timer_get_time() + STATS_PERIOD_US;
 
+        // Test #10: per-stage timing instrumentation. Wraps the hot
+        // calls in esp_timer_get_time() bookends and accumulates
+        // sum/max/count over the 1 s heartbeat window. Logged as a
+        // second "1s timing:" line alongside the existing stats. The
+        // wall-clock cost of esp_timer_get_time() is ~0.5 us, dwarfed
+        // by every stage we measure here, so the instrumentation is
+        // effectively free.
+        enum StageIdx {
+            ST_PREP = 0,   // prep_detect_input (rotate + luma subsample)
+            ST_DETECT,     // detect->run (main pass only)
+            ST_NORMALIZE,  // normalize_face_bbox (Test #5 stretch + gamma)
+            ST_FEAT,       // feat->run (MFN embedding, straight pass)
+            ST_QEMA,       // query EMA blend + L2-renorm (Test #9)
+            ST_COSINE,     // gallery cosine_sim sweep under db mutex
+            ST_COUNT
+        };
+        static const char *ST_NAMES[ST_COUNT] = {
+            "prep", "detect", "norm", "feat", "qema", "cos"
+        };
+        uint64_t st_sum_us[ST_COUNT] = {0};
+        uint32_t st_max_us[ST_COUNT] = {0};
+        uint32_t st_n[ST_COUNT]      = {0};
+        auto record_stage = [&](int idx, int64_t dt_us) {
+            if (dt_us < 0) dt_us = 0;
+            const uint32_t dt = static_cast<uint32_t>(dt_us);
+            st_sum_us[idx] += dt;
+            if (dt > st_max_us[idx]) st_max_us[idx] = dt;
+            ++st_n[idx];
+        };
+
         // Adaptive AE state. Initialised to MID because camera.cpp
         // applied the MID preset at boot. The face_ai loop checks
         // mean luma every AE_CHECK_INTERVAL_MS and shifts presets
@@ -2029,6 +2059,38 @@ namespace
                     s_recognised = s_enrolled = s_spatial_track = s_enrol_q_skip = 0;
                 s_score_sum = 0.f;
                 s_score_n = 0;
+
+                // Test #10: per-stage timing breakdown. Prints avg/max
+                // microseconds and sample count for each instrumented
+                // stage. Stages with no samples in this window are
+                // omitted from the line.
+                {
+                    char tbuf[256];
+                    int  pos = 0;
+                    for (int s = 0; s < ST_COUNT; ++s) {
+                        if (st_n[s] == 0) continue;
+                        const uint32_t avg = static_cast<uint32_t>(
+                            st_sum_us[s] / st_n[s]);
+                        const int written = std::snprintf(
+                            tbuf + pos, sizeof(tbuf) - pos,
+                            " %s=%u/%uus(n=%u)",
+                            ST_NAMES[s], (unsigned)avg,
+                            (unsigned)st_max_us[s], (unsigned)st_n[s]);
+                        if (written <= 0 ||
+                            pos + written >= (int)sizeof(tbuf)) {
+                            break;
+                        }
+                        pos += written;
+                    }
+                    if (pos > 0) {
+                        ESP_LOGI(TAG, "1s timing:%s", tbuf);
+                    }
+                }
+                for (int s = 0; s < ST_COUNT; ++s) {
+                    st_sum_us[s] = 0;
+                    st_max_us[s] = 0;
+                    st_n[s]      = 0;
+                }
                 stats_next_us = now_us + STATS_PERIOD_US;
             }
 
@@ -2096,8 +2158,10 @@ namespace
             const uint16_t *to_detect = src;
             if (fb->width == FRAME_DIM && fb->height == FRAME_DIM)
             {
+                const int64_t _t0 = esp_timer_get_time();
                 to_detect = prep_detect_input(try_orient, src, scratch,
                                               FRAME_DIM);
+                record_stage(ST_PREP, esp_timer_get_time() - _t0);
             }
 
             dl::image::img_t img = {};
@@ -2108,7 +2172,9 @@ namespace
             // preprocessor consumes that format directly.
             img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565BE;
 
+            const int64_t _t_det0 = esp_timer_get_time();
             std::list<dl::detect::result_t> &detections = detect->run(img);
+            record_stage(ST_DETECT, esp_timer_get_time() - _t_det0);
             if (!detections.empty())
             {
                 ++s_raw_dets;
@@ -2652,12 +2718,16 @@ namespace
             // exposure. Safe to skip silently if the bbox is too
             // small or already too flat -- normalize_face_bbox()
             // returns false in those cases.
+            const int64_t _t_norm0 = esp_timer_get_time();
             const bool norm_applied = normalize_face_bbox(
                 const_cast<uint16_t *>(to_detect), FRAME_DIM,
                 biggest->box[0], biggest->box[1],
                 biggest->box[2], biggest->box[3]);
             (void)norm_applied;
+            record_stage(ST_NORMALIZE, esp_timer_get_time() - _t_norm0);
+            const int64_t _t_feat0 = esp_timer_get_time();
             dl::TensorBase *t = feat->run(img, *kp_for_feat);
+            record_stage(ST_FEAT, esp_timer_get_time() - _t_feat0);
             if (!t || t->get_size() != feat_len)
             {
                 ESP_LOGW(TAG, "feat model returned unexpected tensor");
@@ -2676,6 +2746,7 @@ namespace
             // stale, wrong orient, or low IoU) we seed with the raw
             // embedding -- never blend across identity boundaries.
             std::vector<float> query_feat(raw_feat, raw_feat + feat_len);
+            const int64_t _t_qema0 = esp_timer_get_time();
             const bool feat_ema_same_track =
                 recog_cache.valid &&
                 recog_cache.orient == locked_orient &&
@@ -2702,6 +2773,7 @@ namespace
                     }
                 }
             }
+            record_stage(ST_QEMA, esp_timer_get_time() - _t_qema0);
             // take the MAX cosine similarity across its template
             // gallery, so off-angle / profile templates can rescue a
             // match that the front-on template alone would miss. We
@@ -2738,6 +2810,7 @@ namespace
             int   best_id = -1;
             int   best_template_idx = -1;
             float second_best_sim = -2.f;    // best weighted sim against any OTHER face
+            const int64_t _t_cos0 = esp_timer_get_time();
             {
                 FaceDbLock lock;
                 for (size_t i = 0; i < g_known_faces.size(); ++i)
@@ -2773,6 +2846,7 @@ namespace
                     }
                 }
             }
+            record_stage(ST_COSINE, esp_timer_get_time() - _t_cos0);
 
             // Track-level EMA over the weighted sim. When this frame
             // looks like a continuation of the previously-matched
