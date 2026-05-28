@@ -1862,6 +1862,13 @@ namespace
         // identity and skip the embedder + cosine sweep. See
         // RECOG_CACHE_MS / RECOG_IOU_PCT.
         //
+        // Single-writer invariant: this struct is read AND written
+        // exclusively from face_ai_task. The only cross-task signal
+        // affecting it is `g_recog_cache_invalidate` (set with
+        // release ordering from face_db_delete()); we drain that
+        // atomic at the top of every loop iteration on this task,
+        // before any reads of recog_cache fields. No lock needed.
+        //
         // last_sim is an EMA of the matched identity's similarity
         // across consecutive same-track recognitions. The matcher's
         // raw per-frame sim jitters ~0.05-0.10 because of MFN's
