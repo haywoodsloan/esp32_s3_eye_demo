@@ -50,17 +50,12 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
 # Optimise for performance over size
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 
-# Test #11 (low-level perf pass): bump L1 caches to their maximums.
-# Defaults are 16 KB I-cache / 32 KB D-cache with 32-byte lines; the
-# S3 supports 32 KB / 64 KB with 64-byte lines, and the bigger cache +
-# wider line significantly improves hit rate for ESP-DL's streaming
-# reads of MFN / ESPDET weights out of octal PSRAM. This is the only
-# single sdkconfig knob that meaningfully affects the inference cost
-# of the prebuilt model components (the ones we can't recompile).
-CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
-CONFIG_ESP32S3_INSTRUCTION_CACHE_LINE_64B=y
-CONFIG_ESP32S3_DATA_CACHE_64KB=y
-CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
+# Test #11 (low-level perf pass): bumped L1 cache sizes/line widths
+# were attempted here but bricked boot -- the larger D-cache eats
+# into internal SRAM that the camera HAL / display front buffer
+# require. Keep defaults (16 KB I / 32 KB D, 32-byte lines). The
+# -O3 + unroll-loops + hot attributes inside face_ai.cpp itself
+# remain in effect via #pragma in that translation unit.
 
 # Pin the camera capture task to core 0; the render task runs on core 1.
 CONFIG_CAMERA_CORE0=y
