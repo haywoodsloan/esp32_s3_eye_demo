@@ -23,8 +23,8 @@
 #include "wifi.h"
 
 #include <algorithm>
-#include <math.h>
-#include <stdint.h>
+#include <cmath>
+#include <cstdint>
 
 static const char *TAG = "app";
 

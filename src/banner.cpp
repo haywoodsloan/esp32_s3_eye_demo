@@ -6,10 +6,10 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 
-#include <math.h>
-#include <stddef.h>
-#include <stdint.h>
-#include <string.h>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 
 static const char *TAG = "banner";
 

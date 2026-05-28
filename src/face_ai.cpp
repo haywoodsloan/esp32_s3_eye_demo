@@ -453,6 +453,14 @@ namespace
         ROT_180 = 2,
         ROT_270_CW = 3
     };
+    // The orient-cycle advance code at face_ai_task uses `(int)try_orient + 1) & 0x3`
+    // to round-robin through the four orientations. That trick only
+    // works if the enum's underlying values are exactly {0,1,2,3}
+    // and contiguous; lock that invariant in at compile time.
+    static_assert(static_cast<int>(Orient::ROT_0)      == 0, "Orient enum order is load-bearing");
+    static_assert(static_cast<int>(Orient::ROT_90_CW)  == 1, "Orient enum order is load-bearing");
+    static_assert(static_cast<int>(Orient::ROT_180)    == 2, "Orient enum order is load-bearing");
+    static_assert(static_cast<int>(Orient::ROT_270_CW) == 3, "Orient enum order is load-bearing");
 
     // See `MIN_DETECT_SCORE_ROT0` / `MIN_DETECT_SCORE_ROTATED` above
     // for the rationale behind the two-tier floor. Selector lives
@@ -1746,20 +1754,17 @@ namespace
         // Counters for the per-second heartbeat.
         int64_t stats_next_us = esp_timer_get_time() + STATS_PERIOD_US;
 
-        // Test #16: PSRAM-contention experiment. Inference variance
-        // (~25% across consecutive frames) plus published 248 ms vs
-        // our 1100 ms feat:model time both pointed at the LCD render
-        // task pulling 240x240x2 = 115 KB per render frame out of
-        // octal PSRAM while MFN's weight streaming is trying to use
-        // the same bus. We pause the render task around every
-        // feat->run call to free the PSRAM bus for MFN, then resume.
-        //
-        // The handle is looked up lazily because main.cpp creates
-        // the render task after face_ai_init; first lookup may fail
-        // if face_ai_task races ahead. We retry until it succeeds
-        // (typically the first time we have a face).
-        TaskHandle_t render_task_handle = nullptr;
-        (void)render_task_handle;  // retained for opt-in suspend testing
+        // Render-throttle helpers (PSRAM-contention mitigation).
+        // Inference variance of ~25% across consecutive frames plus
+        // published 248 ms vs our 1100 ms feat:model time both
+        // pointed at the LCD render task pulling 240x240x2 = 115 KB
+        // per render frame out of octal PSRAM while MFN's weight
+        // streaming was trying to use the same bus. We raise this
+        // flag around every feat->run call so the render task drops
+        // its display_draw_rgb565() until inference completes, then
+        // we drop it. Wraps only feat->run, not detect->run, because
+        // detect fires every frame and the resulting per-frame LCD
+        // stutter wasn't worth the ~20 ms detect:model saving.
         auto render_suspend = [&]() {
             g_inference_busy.store(true, std::memory_order_release);
         };
@@ -1767,7 +1772,7 @@ namespace
             g_inference_busy.store(false, std::memory_order_release);
         };
 
-        // Test #10: per-stage timing instrumentation. Wraps the hot
+        // Per-stage timing instrumentation. Wraps the hot calls in
         // calls in esp_timer_get_time() bookends and accumulates
         // sum/max/count over the 1 s heartbeat window. Logged as a
         // second "1s timing:" line alongside the existing stats. The
@@ -2803,20 +2808,20 @@ namespace
             } else if (biggest->keypoint.size() != 10) {
                 ESP_LOGI(TAG, "align: fallback (bbox center-crop)");
             }
-            // Per-bbox luminance normalisation (Test #5): stretch
-            // [P2,P98] -> [0,255] and apply a mild gamma to pull the
-            // face's average luma toward 128. Done in-place on
-            // to_detect just before the embedder runs, so both the
-            // straight pass and the hflip TTA pass see consistent
-            // exposure. Safe to skip silently if the bbox is too
-            // small or already too flat -- normalize_face_bbox()
-            // returns false in those cases.
+            // Per-bbox luminance normalisation: stretch [P2,P98] ->
+            // [0,255] and apply a mild gamma to pull the face's
+            // average luma toward 128. Done in-place on to_detect
+            // just before the embedder runs so both the straight
+            // pass and the hflip TTA pass see consistent exposure.
+            // normalize_face_bbox() returns false (silently) if the
+            // bbox is too small or its dynamic range is already too
+            // flat for stretching to help; the return value is
+            // diagnostic only.
             const int64_t _t_norm0 = esp_timer_get_time();
-            const bool norm_applied = normalize_face_bbox(
+            [[maybe_unused]] const bool norm_applied = normalize_face_bbox(
                 const_cast<uint16_t *>(to_detect), FRAME_DIM,
                 biggest->box[0], biggest->box[1],
                 biggest->box[2], biggest->box[3]);
-            (void)norm_applied;
             record_stage(ST_NORMALIZE, esp_timer_get_time() - _t_norm0);
             const int64_t _t_feat0 = esp_timer_get_time();
             render_suspend();

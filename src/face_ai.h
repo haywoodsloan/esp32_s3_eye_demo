@@ -11,7 +11,7 @@
 // The task pulls its own frames from the camera; it does not interfere
 // with the render task. The known-face list is held in memory and is
 // reset on every boot. Returns ESP_OK on success.
-esp_err_t face_ai_init(void);
+[[nodiscard]] esp_err_t face_ai_init(void);
 
 // True while the "NEW FACE DETECTED" banner should be composited onto
 // the camera stream on the LCD. Cheap (single atomic load) — safe to
@@ -58,8 +58,13 @@ void face_ai_get_overlay(face_overlay_t *out);
 // The web UI consumes the accessors below to render the gallery and
 // to PATCH the names.
 
-#define FACE_THUMB_DIM 64    // thumbnails are FACE_THUMB_DIM x FACE_THUMB_DIM, RGB565BE
-#define FACE_NAME_MAX  32
+// Thumbnail dimensions and name buffer length are part of the public
+// ABI (web UI + REST API both read FACE_THUMB_DIM*FACE_THUMB_DIM
+// pixels). Declared as `static constexpr int` (not `#define`) so
+// header consumers get type-safety and so the values appear in the
+// debug symbol table.
+static constexpr int FACE_THUMB_DIM = 64;
+static constexpr int FACE_NAME_MAX  = 32;
 
 typedef struct {
     int      idx;                 // 0-based position in the face DB
