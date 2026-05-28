@@ -473,6 +473,29 @@ namespace
                                     : MIN_DETECT_SCORE_ROTATED;
     }
 
+    // Pick the largest-area detection from the detector's result
+    // list. Returns nullptr if the list is empty. We act on the
+    // largest box only (rather than the highest-confidence one) to
+    // bias toward whoever is closest to the camera and to avoid
+    // cross-enrolling a second person standing further back in the
+    // same frame. Used in the primary detector pass, the padded
+    // close-range fallback, the upscale far-range fallback, and the
+    // ROT_0 cross-check pass -- one helper, four call sites.
+    const dl::detect::result_t *largest_detection(
+        const std::list<dl::detect::result_t> &dets) noexcept
+    {
+        const dl::detect::result_t *best = nullptr;
+        int best_area = 0;
+        for (const auto &d : dets) {
+            const int a = d.box_area();
+            if (a > best_area) {
+                best_area = a;
+                best      = &d;
+            }
+        }
+        return best;
+    }
+
     constexpr int FRAME_DIM = 240; // OV2640 is configured for 240x240 RGB565.
 
     // ---------------------------------------------------------------
@@ -2281,17 +2304,7 @@ namespace
             // Act only on the largest-area detection. Avoids cross-enrolling
             // two people in frame and biases toward whoever is closest to
             // the camera.
-            const dl::detect::result_t *biggest = nullptr;
-            int best_area = 0;
-            for (const auto &d : detections)
-            {
-                const int a = d.box_area();
-                if (a > best_area)
-                {
-                    best_area = a;
-                    biggest = &d;
-                }
-            }
+            const dl::detect::result_t *biggest = largest_detection(detections);
             if (biggest) {
                 s_score_sum += biggest->score;
                 ++s_score_n;
@@ -2357,23 +2370,13 @@ namespace
                 pimg.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565BE;
 
                 auto &pdetections = detect->run(pimg);
-                const dl::detect::result_t *pbest = nullptr;
-                int pbest_area = 0;
-                for (const auto &d : pdetections) {
-                    const int a = d.box_area();
-                    if (a > pbest_area) {
-                        pbest_area = a;
-                        pbest = &d;
-                    }
-                }
+                const dl::detect::result_t *pbest = largest_detection(pdetections);
                 if (pbest && pbest->score >= min_detect_score_for(try_orient)) {
                     // Deep-copy into a local result we own, since the
                     // detector reuses its internal list on the next
-                    // call.
-                    padded_remap.category = pbest->category;
-                    padded_remap.score    = pbest->score;
-                    padded_remap.box      = pbest->box;
-                    padded_remap.keypoint = pbest->keypoint;
+                    // call. result_t's default copy-assign deep-copies
+                    // the std::vector box / keypoint members.
+                    padded_remap = *pbest;
                     remap_padded_result(&padded_remap);
                     ESP_LOGI(TAG,
                              "padded fallback hit: score=%.2f "
@@ -2412,20 +2415,9 @@ namespace
                 uimg.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565BE;
 
                 auto &udetections = detect->run(uimg);
-                const dl::detect::result_t *ubest = nullptr;
-                int ubest_area = 0;
-                for (const auto &d : udetections) {
-                    const int a = d.box_area();
-                    if (a > ubest_area) {
-                        ubest_area = a;
-                        ubest = &d;
-                    }
-                }
+                const dl::detect::result_t *ubest = largest_detection(udetections);
                 if (ubest && ubest->score >= min_detect_score_for(try_orient)) {
-                    upscale_remap.category = ubest->category;
-                    upscale_remap.score    = ubest->score;
-                    upscale_remap.box      = ubest->box;
-                    upscale_remap.keypoint = ubest->keypoint;
+                    upscale_remap = *ubest;
                     remap_upscale_result(&upscale_remap);
                     ESP_LOGI(TAG,
                              "upscale fallback hit: score=%.2f "
@@ -2535,11 +2527,9 @@ namespace
             {
                 // Deep-copy the non-ROT_0 candidate before the
                 // verification run clobbers the detector's internal
-                // list.
-                saved_candidate.category = biggest->category;
-                saved_candidate.score    = biggest->score;
-                saved_candidate.box      = biggest->box;
-                saved_candidate.keypoint = biggest->keypoint;
+                // list. result_t's default copy-assign deep-copies
+                // its std::vector box / keypoint members.
+                saved_candidate = *biggest;
 
                 const uint16_t *rot0_input = prep_detect_input(
                     Orient::ROT_0, src, scratch, FRAME_DIM);
@@ -2550,15 +2540,7 @@ namespace
                 r0img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565BE;
 
                 auto &r0_dets = detect->run(r0img);
-                const dl::detect::result_t *r0_best = nullptr;
-                int r0_best_area = 0;
-                for (const auto &d : r0_dets) {
-                    const int a = d.box_area();
-                    if (a > r0_best_area) {
-                        r0_best_area = a;
-                        r0_best = &d;
-                    }
-                }
+                const dl::detect::result_t *r0_best = largest_detection(r0_dets);
                 const bool rot0_wins =
                     r0_best &&
                     r0_best->score >= MIN_DETECT_SCORE_ROT0;
@@ -2571,10 +2553,7 @@ namespace
                              (double)r0_best->score,
                              (int)try_orient,
                              (double)saved_candidate.score);
-                    rot0_candidate.category = r0_best->category;
-                    rot0_candidate.score    = r0_best->score;
-                    rot0_candidate.box      = r0_best->box;
-                    rot0_candidate.keypoint = r0_best->keypoint;
+                    rot0_candidate  = *r0_best;
                     biggest         = &rot0_candidate;
                     try_orient      = Orient::ROT_0;
                     to_detect       = rot0_input;
