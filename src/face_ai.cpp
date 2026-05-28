@@ -2258,14 +2258,15 @@ namespace
             img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565BE;
 
             const int64_t _t_det0 = esp_timer_get_time();
-            // Test #18: free the PSRAM bus from LCD-SPI contention
-            // during the detector pass too, not just the embedder.
-            // detect->run is ~215 ms and runs every frame (whereas
-            // feat->run only runs on recognition frames), so the
-            // aggregate savings are large.
-            render_suspend();
+            // Note: detect->run is NOT wrapped in render_suspend /
+            // render_resume. Test #18 confirmed it would shave ~20 ms
+            // off detect:model (from 220 ms to 200 ms) but detect
+            // fires every frame, so the LCD would stutter at the
+            // detect cadence even when no face is present. Reserve
+            // the throttle for feat->run (recognition-frame only)
+            // where the savings dominate (440 ms saved per call)
+            // and the visible pause is rare and motivated.
             std::list<dl::detect::result_t> &detections = detect->run(img);
-            render_resume();
             record_stage(ST_DETECT, esp_timer_get_time() - _t_det0);
             if (!detections.empty())
             {
