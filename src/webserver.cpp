@@ -120,8 +120,17 @@ static void bmp_pack_row(const uint16_t *src, int width, uint8_t *dst)
 
 static esp_err_t handle_root(httpd_req_t *req)
 {
+    // The page is embedded as a pre-gzipped blob (see
+    // scripts/embed_web_html.py and src/web/index_html_data.h). Every
+    // browser we target accepts gzip; the IDF httpd is too minimal to do
+    // content negotiation and we ship no plaintext fallback. If a future
+    // client without gzip support shows up, sniff Accept-Encoding here
+    // and decompress before sending.
     httpd_resp_set_type(req, "text/html; charset=utf-8");
-    return httpd_resp_send(req, web::index_html, web::index_html_len);
+    httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+    return httpd_resp_send(req,
+                           reinterpret_cast<const char *>(web::index_html_gz),
+                           web::index_html_gz_len);
 }
 
 static esp_err_t handle_faces_list(httpd_req_t *req)
@@ -133,13 +142,14 @@ static esp_err_t handle_faces_list(httpd_req_t *req)
     size_t pos = 0;
     pos += std::snprintf(buf + pos, sizeof(buf) - pos, "[");
 
-    const int n = face_db_count();
-    bool      first = true;
+    // Snapshot under a single lock so a concurrent DELETE can't shift
+    // the gallery underneath us mid-loop (which would skip entries or
+    // emit a stale name for a freshly-deleted id).
+    face_db_entry_t entries[MAX_KNOWN_FACES];
+    const int       n = face_db_snapshot(entries, MAX_KNOWN_FACES);
+    bool            first = true;
     for (int i = 0; i < n; ++i) {
-        face_db_entry_t e;
-        if (!face_db_get_entry(i, &e)) {
-            continue;
-        }
+        const face_db_entry_t &e = entries[i];
         // Escape backslash and double quote in the name; everything
         // else 7-bit ASCII passes through. We don't expect non-ASCII
         // from the form input, but truncate to FACE_NAME_MAX-1 above
@@ -177,6 +187,35 @@ static esp_err_t handle_face_thumb(httpd_req_t *req)
         return httpd_resp_send_404(req);
     }
 
+    // Peek the face's enrolled_ms so we can build a strong ETag without
+    // touching the thumbnail bytes yet. enrolled_ms is set at enrol
+    // time and never mutated, so it uniquely identifies the thumb
+    // contents at this slot.
+    face_db_entry_t meta;
+    if (!face_db_get_entry(id, &meta)) {
+        return httpd_resp_send_404(req);
+    }
+    char etag[40];
+    std::snprintf(etag, sizeof(etag), "\"i%d-e%u\"",
+                  id, (unsigned)meta.enrolled_ms);
+
+    // If the client already has this thumb cached, short-circuit before
+    // doing the heap-alloc + DB lock + BMP encode. IDF's httpd treats a
+    // missing header as ESP_ERR_NOT_FOUND, so a fresh client (no
+    // If-None-Match) falls through to the full-body path. RFC 7232
+    // allows comma-separated lists in the header; we don't bother
+    // parsing -- in practice browsers send a single value matching the
+    // last ETag we returned.
+    char inm[64];
+    if (httpd_req_get_hdr_value_str(req, "If-None-Match",
+                                    inm, sizeof(inm)) == ESP_OK &&
+        std::strcmp(inm, etag) == 0) {
+        httpd_resp_set_status(req, "304 Not Modified");
+        httpd_resp_set_hdr(req, "ETag", etag);
+        httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+        return httpd_resp_send(req, nullptr, 0);
+    }
+
     static constexpr int W = FACE_THUMB_DIM;
     static constexpr int H = FACE_THUMB_DIM;
     static constexpr int ROW_BYTES = ((W * 3 + 3) / 4) * 4;
@@ -190,8 +229,18 @@ static esp_err_t handle_face_thumb(httpd_req_t *req)
     // browser. unique_ptr keeps the cleanup automatic on every exit
     // path (success, copy_thumb failure, or chunk-send abort).
     auto thumb = std::make_unique<uint16_t[]>(static_cast<size_t>(W) * H);
-    if (!face_db_copy_thumb(id, thumb.get(), static_cast<size_t>(W) * H)) {
+    uint32_t fresh_enrolled_ms = 0;
+    if (!face_db_copy_thumb(id, thumb.get(), static_cast<size_t>(W) * H,
+                            &fresh_enrolled_ms)) {
         return httpd_resp_send_404(req);
+    }
+    // If a delete+re-enrol slipped into this slot between the ETag
+    // peek above and this copy, the bytes we just read belong to a
+    // different face. Refresh the ETag so the client's next If-None-
+    // Match reflects what we're actually serving.
+    if (fresh_enrolled_ms != meta.enrolled_ms) {
+        std::snprintf(etag, sizeof(etag), "\"i%d-e%u\"",
+                      id, (unsigned)fresh_enrolled_ms);
     }
 
     // BMP file + DIB header. Hand-packed little-endian so we don't
@@ -219,6 +268,7 @@ static esp_err_t handle_face_thumb(httpd_req_t *req)
     put_u32(hdr + 34, PIX_BYTES);
 
     httpd_resp_set_type(req, "image/bmp");
+    httpd_resp_set_hdr(req, "ETag", etag);
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     httpd_resp_send_chunk(req, (const char *)hdr, sizeof(hdr));
 

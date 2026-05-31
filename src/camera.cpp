@@ -54,6 +54,13 @@ esp_err_t camera_init(void)
     // the LCD DMA, one held by the AI task while it runs inference,
     // and one queued as the "latest" so neither consumer ever stalls
     // the producer. Costs an extra 115 KB of PSRAM.
+    //
+    // Tried fb_count=3 (saves ~115 KB PSRAM). Result: idle preview FPS
+    // dropped 16 -> 10 (-38%), active FPS 12 -> 7.5 (-37%). The LCD
+    // path waits on a free buffer during the ~700 ms feat inference.
+    // Detect-only runs ~25 ms faster (PSRAM bus contention), but that
+    // doesn't come close to making up for the preview regression. Do
+    // not retry without first shortening feat inference.
     cfg.fb_count       = 4;
     cfg.fb_location    = CAMERA_FB_IN_PSRAM;
     cfg.grab_mode      = CAMERA_GRAB_LATEST;

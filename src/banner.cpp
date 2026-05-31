@@ -5,6 +5,8 @@
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #include <cmath>
 #include <cstddef>
@@ -85,6 +87,21 @@ struct BannerBounds {
 };
 static BannerBounds s_green_bounds = { BANNER_H, -1 };
 static BannerBounds s_name_bounds  = { BANNER_H, -1 };
+
+/* Per-banner mutex guarding {alpha buffer, outline buffer, bounds} as
+   a single coherent unit. The writer (face_ai task on core 1, calling
+   banner_render / banner_render_name) takes the lock blocking; the
+   reader (render task on core 0, calling banner_compose_*) tries the
+   lock non-blocking and skips the compose on contention. Without this
+   the reader can sample a half-rasterised alpha mask plus the writer's
+   freshly-zeroed bounds, producing torn glyphs or a one-frame banner
+   blank. The reader-side try-and-skip means an unlucky frame at the
+   moment of re-rasterise simply has no banner -- inaudible at 60 Hz
+   given the writer fires at most once per ~5 s (green) or once per
+   recognised-name change (name). Blocking the reader instead would
+   stall an LCD frame for the ~2-5 ms rasterise -- visible stutter. */
+static SemaphoreHandle_t s_green_mux = nullptr;
+static SemaphoreHandle_t s_name_mux  = nullptr;
 
 /* Banner foreground: dark green. Readable against a wide range of skin
    / room tones; the black outline added by s_outline keeps it legible
@@ -400,6 +417,15 @@ esp_err_t banner_init(void)
         return ESP_OK;
     }
 
+    /* Create the per-banner mutexes before any allocation so the early-
+       return branches below can't leave us with allocated buffers but
+       missing locks (which would let the renderer touch them unprotected
+       on subsequent calls). */
+    s_green_mux = xSemaphoreCreateMutex();
+    ESP_RETURN_ON_FALSE(s_green_mux, ESP_ERR_NO_MEM, TAG, "alloc green banner mutex");
+    s_name_mux = xSemaphoreCreateMutex();
+    ESP_RETURN_ON_FALSE(s_name_mux, ESP_ERR_NO_MEM, TAG, "alloc name banner mutex");
+
     const size_t alpha_bytes = (size_t)BANNER_W * BANNER_H;
     s_alpha = (uint8_t *)heap_caps_aligned_alloc(
         16, alpha_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -436,15 +462,17 @@ esp_err_t banner_init(void)
 
 void banner_render(float angle_rad)
 {
-    if (!s_alpha || !s_outline) {
+    if (!s_alpha || !s_outline || !s_green_mux) {
         return;
     }
     /* Green banner: two lines, line 0 along the top edge, line 1 along
        the bottom. Together they form the "NEW FACE / DETECTED"
        enrollment overlay. */
     static const int signs[s_line_count] = { -1, +1 };
+    xSemaphoreTake(s_green_mux, portMAX_DELAY);
     render_lines_into(s_alpha, s_outline, &s_green_bounds, s_lines, signs,
                       s_line_count, angle_rad);
+    xSemaphoreGive(s_green_mux);
 }
 
 /* Map an arbitrary input character to a glyph we know how to render.
@@ -497,25 +525,42 @@ void banner_render_name(const char *name, float angle_rad)
 
     const char *const lines[1] = { filtered };
     const int         signs[1] = { +1 };          /* bottom edge */
+    if (!s_name_mux) {
+        return;
+    }
+    xSemaphoreTake(s_name_mux, portMAX_DELAY);
     render_lines_into(s_name_alpha, s_name_outline, &s_name_bounds,
                       lines, signs, 1, angle_rad);
+    xSemaphoreGive(s_name_mux);
 }
 
 void banner_compose_overlay(uint16_t *frame, int width, int height)
 {
-    if (!s_alpha || !s_outline || !frame) {
+    if (!s_alpha || !s_outline || !frame || !s_green_mux) {
+        return;
+    }
+    /* Try-lock with zero timeout: if the writer is mid-rasterise we
+       drop this frame's banner draw rather than stall the LCD push
+       for the ~2-5 ms render. The writer fires at most once per
+       BANNER_HOLD_MS so the next frame will re-include the banner. */
+    if (xSemaphoreTake(s_green_mux, 0) != pdTRUE) {
         return;
     }
     compose_with(frame, width, height, s_alpha, s_outline, s_green_bounds,
                  BANNER_FG_R5, BANNER_FG_G6, BANNER_FG_B5);
+    xSemaphoreGive(s_green_mux);
 }
 
 void banner_compose_name_overlay(uint16_t *frame, int width, int height)
 {
-    if (!s_name_alpha || !s_name_outline || !frame) {
+    if (!s_name_alpha || !s_name_outline || !frame || !s_name_mux) {
+        return;
+    }
+    if (xSemaphoreTake(s_name_mux, 0) != pdTRUE) {
         return;
     }
     compose_with(frame, width, height, s_name_alpha, s_name_outline,
                  s_name_bounds,
                  NAME_FG_R5, NAME_FG_G6, NAME_FG_B5);
+    xSemaphoreGive(s_name_mux);
 }

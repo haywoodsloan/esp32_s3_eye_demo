@@ -88,3 +88,15 @@ CONFIG_ESP_BROWNOUT_DET_LVL_SEL_7=n
 CONFIG_ESP_BROWNOUT_DET_LVL_SEL_4=y
 CONFIG_ESP_BROWNOUT_DET_LVL=4
 
+# Bump the LWIP TCP receive window from the IDF default (5760 B == 4 MSS)
+# to 16384 B (~11 MSS). The webserver task ships ~70 KB of gzipped HTML
+# plus per-frame JPEG snapshots and thumb pulls; with a 5760-byte window
+# the sender stalls after every burst waiting for an ACK round-trip on
+# the wifi link (~3-6 ms RTT), capping throughput at well under what the
+# stack can actually push. 16 KB is the largest window that comfortably
+# fits in the default LWIP per-PCB buffer pool without bumping
+# CONFIG_LWIP_TCP_RECVMBOX_SIZE / mem regions. Matching SND_BUF too so
+# the loopback side of any local profiling stays symmetric.
+CONFIG_LWIP_TCP_WND_DEFAULT=16384
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=16384
+

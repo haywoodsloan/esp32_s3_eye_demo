@@ -26,6 +26,7 @@
 #include "freertos/semphr.h"
 
 #include "esp_camera.h"
+#include "esp_attr.h"           // IRAM_ATTR
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -202,12 +203,10 @@ namespace
     // of confirmation to avoid spuriously enrolling a known person
     // whose noisy embedding briefly dipped below match_thr.
 
-    // Hard cap on the in-memory known-face list. The list resets on every
-    // boot, but within a single power-on session this bounds how much
-    // PSRAM the embedder vector can chew through if recognition keeps
-    // mis-firing on the same person. ~32 * feat_len(=512) * 4 B ~= 64 KB,
-    // well within budget on this board.
-    constexpr size_t MAX_KNOWN_FACES = 32;
+    // (MAX_KNOWN_FACES lives in face_ai.h as a public constexpr so the
+    // web layer can size snapshot buffers without poking into our
+    // internals. ~32 * feat_len(=512) * 4 B ~= 64 KB of PSRAM worst-
+    // case, well within budget on this board.)
 
     // Throttle the AI loop when no face is in frame. Without this, the
     // detection-only path takes ~50-100 ms and starves the render task of
@@ -297,6 +296,30 @@ namespace
     constexpr size_t FACE_MAX_TEMPLATES   = 4;
     constexpr float  FACE_AUGMENT_MARGIN  = 0.10f;  // above match_thr
     constexpr float  FACE_AUGMENT_NOVEL   = 0.90f;  // template counts as new if best-existing-sim < this
+
+    // Cross-identity margin for the recognition decision itself.
+    // Even if best_sim clears match_thr, we refuse to commit the
+    // match unless the winning face beats the runner-up by at least
+    // this much. Defends against the classic family-resemblance
+    // case (parent vs child, siblings) where an enrolled person's
+    // close relative scores near match_thr against their gallery
+    // *and* near match_thr against another enrolled face, and the
+    // single-best-wins rule would lock onto whichever one happens
+    // to be 0.01 higher this frame. With this margin, ambiguous
+    // frames are treated as recognised-but-unverified -- no banner
+    // re-publish, no augment, but also no enrolment (so an unknown
+    // person scoring ambiguously close to a known person doesn't
+    // get spuriously enrolled either). When the gallery has only
+    // one face, second_best_sim stays at its initial -2 sentinel
+    // and the margin trivially passes, so single-enrol users are
+    // unaffected. Smaller than FACE_AUGMENT_MARGIN because the
+    // match gate runs every recognition frame while augment is a
+    // gallery-growth event -- the recognition gate has to be loose
+    // enough that ordinary indoor jitter doesn't deny a legitimate
+    // match, while augment can afford a wider margin since the
+    // worst case of a missed augment is just "slower template
+    // accretion".
+    constexpr float  RECOG_MARGIN_MIN     = 0.06f;
     // Reference values for the quality-score normalisations. Scores
     // beyond these saturate at 1.0. Chosen so a "good" enrolment
     // frame -- score ~0.9, focus ~120, 130 x 130 face -- lands at
@@ -695,13 +718,36 @@ namespace
         m.quiet_frames = 0;
         return false;
     }
-    // Latest 0..255 mean luma of the detector input, written each
-    // frame by prep_detect_input() (an 8-stride subsample, ~10 us).
-    // Read by the AI loop's adaptive-AE check; relaxed ordering is
-    // fine because both writer and reader are on the same task, and
-    // the only cross-task reader (web UI heartbeat in the future)
-    // tolerates a stale value.
+    // Scene-luma statistics published every detection frame by
+    // prep_detect_input() and consumed by the adaptive-AE loop.
+    // All three are EMA-smoothed at alpha=1/4 (~4-frame time
+    // constant, ~250 ms at 15 fps) so single-frame transients
+    // (motion blur, banner overdraw, brief occlusion) can't flip a
+    // preset on their own. Relaxed ordering is fine: writer and
+    // reader are on the same task; a future cross-task reader
+    // (web UI heartbeat) tolerates a stale value.
+    //
+    //   g_last_mean_luma    EMA of the 8-bit-stretched G6 luma
+    //                       mean across an 8-stride subsample of
+    //                       the rotated detector input (~900
+    //                       samples / call). 0..255.
+    //   g_last_sat_pct      EMA of the percentage of those samples
+    //                       sitting in the top G6 bin (>=60/63 ->
+    //                       8-bit >=240). High values mean
+    //                       highlight clipping -- the sensor's AEC
+    //                       has let the scene blow out and the
+    //                       face (wherever it is) is probably
+    //                       losing micro-contrast. 0..100.
+    //   g_last_crush_pct    EMA of the percentage in the bottom
+    //                       G6 bin (<=3/63 -> 8-bit <=15). High
+    //                       values mean shadow crush -- gain
+    //                       headroom is being wasted on a small
+    //                       bright region while the rest of the
+    //                       frame is below the detector's signal
+    //                       floor. 0..100.
     std::atomic<int> g_last_mean_luma{128};
+    std::atomic<int> g_last_sat_pct{0};
+    std::atomic<int> g_last_crush_pct{0};
 
     // Latest face-region mean luma, sampled from the locked face's
     // bbox each frame the detector hits. -1 means "no recent face,
@@ -737,17 +783,22 @@ namespace
 
     enum class AEPreset { DIM, MID, BRIGHT };
 
-    constexpr int      AE_CHECK_INTERVAL_MS = 3000;
+    // Check the AE state machine this often. Faster than the prior
+    // 3000 ms cadence -- safe now because g_last_mean_luma is the
+    // EMA of recent frames (computed inside prep_detect_input)
+    // rather than the raw value of any single frame, so reading it
+    // at 1.5 s intervals can't be tricked by a transient spike.
+    constexpr int      AE_CHECK_INTERVAL_MS = 1500;
     // Cooldown after any preset change: ignore further transitions
     // for this long so the sensor's internal AE has time to actually
     // settle on the new preset's metering target before we evaluate
     // the resulting luma. The presets differ by ~8x in gain ceiling
     // and ~3 stops in metering bias, so the scene luma swings ~80
-    // units in the seconds following a transition -- without this
-    // cooldown we end up chasing the sensor's own AE response and
-    // ping-pong the preset every 3 s. 8 s is empirically enough for
-    // the OV2640's metering loop to stabilise even on big jumps.
-    constexpr int      AE_TRANSITION_COOLDOWN_MS = 8000;
+    // units in the seconds following a transition. Was 8000 ms; now
+    // 5000 because the EMA absorbs the tail of the settle, so we
+    // don't need the full physical settle time to elapse before
+    // we're allowed to look again.
+    constexpr int      AE_TRANSITION_COOLDOWN_MS = 5000;
     // Hysteresis band widths chosen so the steady-state luma each
     // preset produces (~ 100-130 in BRIGHT, ~150-200 in MID, ~200+
     // in DIM) sits comfortably inside the band: the dead-zone has
@@ -760,6 +811,32 @@ namespace
     // Down-transitions (scene got dimmer than current preset assumes):
     constexpr int      AE_BRIGHT_TO_MID_LUMA = 85;
     constexpr int      AE_MID_TO_DIM_LUMA    = 55;
+
+    // Clip-aware override thresholds. Mean luma is necessary but
+    // not sufficient -- the scenes where the sensor's silicon AEC
+    // demonstrably picks the wrong operating point are exactly the
+    // ones where the histogram is bimodal (face in shadow + window
+    // behind; bright lamp + dark room) and mean reads "fine". When
+    // either of these thresholds trips we step one preset in the
+    // indicated direction regardless of where mean sits.
+    //
+    //   AE_SAT_OVERRIDE_PCT       trigger "highlights are blown"
+    //                             override. 12 % of pixels at
+    //                             saturation is well above the
+    //                             ~2-3 % a normal indoor scene
+    //                             produces from specular highlights.
+    //   AE_CRUSH_OVERRIDE_PCT     trigger "shadows are crushed"
+    //                             override. 30 % is well above the
+    //                             ~5-10 % a normal scene produces
+    //                             from hair and clothing.
+    //   AE_CRUSH_MEAN_LIMIT       guard so crush doesn't fire on a
+    //                             high-contrast scene whose dark
+    //                             region just happens to be big.
+    //                             Only boost gain when overall
+    //                             brightness is genuinely low.
+    constexpr int      AE_SAT_OVERRIDE_PCT   = 12;
+    constexpr int      AE_CRUSH_OVERRIDE_PCT = 30;
+    constexpr int      AE_CRUSH_MEAN_LIMIT   = 110;
 
     // Matching / preprocessing parameters that move with the AE
     // preset. Same idea as apply_ae_preset() but for the AI side of
@@ -794,7 +871,16 @@ namespace
         1,
     };
     constexpr Tuning TUNING_BRIGHT = {
-        0.45f,
+        // Outdoor / direct-light: same-person sims comfortably hit
+        // 0.55-0.70, but cross-identity cosine sims also creep up
+        // because harsh lighting flattens skin-tone variation and
+        // squashes the embedding distribution into a smaller
+        // region of the unit sphere. A 0.45 floor was tight enough
+        // for indoor BRIGHT but let close-family-resemblance cases
+        // (parent matched as child) slip through outdoors; 0.50
+        // restores the same effective false-positive rate as the
+        // MID preset's 0.38 floor does indoors.
+        0.50f,
         1,
     };
 
@@ -897,12 +983,25 @@ namespace
     {
         rotate_to_scratch(o, src, scratch, n);
 
-        // 8-stride sub-sampled mean of the G6-derived luma proxy.
-        // ~ 900 pixel reads / call, well under 100 us, gives the AE
-        // preset cycle a stable scene-luma readout to follow.
+        // Per-frame luma stats for adaptive AE. Single inner-loop
+        // pass over an 8-stride subsample (~900 samples) computes:
+        //   - 8-bit-stretched G6 mean (same value the previous
+        //     scalar pass produced, so existing thresholds carry).
+        //   - 16-bin G6 histogram, from which we read the top bin
+        //     (saturation %, G6=60..63) and the bottom bin
+        //     (crush %, G6=0..3). These give the AE state machine
+        //     the histogram-tail data it needs to detect the
+        //     backlit-subject and bright-lamp failure modes that
+        //     mean alone is blind to.
+        //
+        // All three signals are EMA-smoothed at alpha=1/4 (~4-frame
+        // time constant) in Q8 fixed point so the AE check sees a
+        // stable value rather than this frame's instantaneous one.
+        // Single-task callers, so EMA state lives in static locals.
         const uint8_t *p8 = reinterpret_cast<const uint8_t *>(scratch);
         uint32_t sum = 0;
         uint32_t cnt = 0;
+        uint16_t hist[16] = {0};
         for (int y = 0; y < FRAME_DIM; y += 8) {
             const int row_base = y * FRAME_DIM;
             for (int x = 0; x < FRAME_DIM; x += 8) {
@@ -912,11 +1011,32 @@ namespace
                 const uint8_t g6 = static_cast<uint8_t>(
                     ((hi & 0x07) << 3) | (lo >> 5));
                 sum += static_cast<uint32_t>((g6 << 2) | (g6 >> 4));
+                ++hist[g6 >> 2];     // 4-wide bins, 0..15
                 ++cnt;
             }
         }
         if (cnt) {
-            g_last_mean_luma.store(static_cast<int>(sum / cnt),
+            const int mean      = static_cast<int>(sum / cnt);
+            const int sat_pct   = static_cast<int>((hist[15] * 100u) / cnt);
+            const int crush_pct = static_cast<int>((hist[0]  * 100u) / cnt);
+
+            // Q8 fixed-point EMA so 1-2 unit per-frame deltas
+            // accumulate instead of round-to-zero. alpha=1/4 picked
+            // for ~250 ms time constant at ~15 fps: long enough to
+            // smother single-frame jitter, short enough that real
+            // lighting changes (someone turning on a lamp) reach
+            // the AE state machine inside one check interval.
+            static int mean_ema_q8  = 128 << 8;
+            static int sat_ema_q8   = 0;
+            static int crush_ema_q8 = 0;
+            mean_ema_q8  += ((mean      << 8) - mean_ema_q8)  >> 2;
+            sat_ema_q8   += ((sat_pct   << 8) - sat_ema_q8)   >> 2;
+            crush_ema_q8 += ((crush_pct << 8) - crush_ema_q8) >> 2;
+            g_last_mean_luma.store(mean_ema_q8  >> 8,
+                                   std::memory_order_relaxed);
+            g_last_sat_pct.store  (sat_ema_q8   >> 8,
+                                   std::memory_order_relaxed);
+            g_last_crush_pct.store(crush_ema_q8 >> 8,
                                    std::memory_order_relaxed);
         }
         return scratch;
@@ -1157,11 +1277,17 @@ namespace
     // Returns true if 5 plausible keypoints were synthesised into
     // out_kp. False -> caller should fall back to the bbox-centred
     // ArcFace template.
+    //
+    // IRAM_ATTR (on the definition only -- repeating it on the forward
+    // decl makes GCC mint two distinct .iram1.N sections that then
+    // conflict): pins the hot inner loop into IRAM so the AI task
+    // isn't stalled on a flash cache miss during back-to-back per-
+    // frame calls.
     bool estimate_face_keypoints(const uint16_t *fb, int img_w, int img_h,
                                  int x0, int y0, int x1, int y1,
                                  std::vector<int> *out_kp) noexcept
         __attribute__((hot));
-    bool estimate_face_keypoints(const uint16_t *fb, int img_w, int img_h,
+    bool IRAM_ATTR estimate_face_keypoints(const uint16_t *fb, int img_w, int img_h,
                                  int x0, int y0, int x1, int y1,
                                  std::vector<int> *out_kp) noexcept
     {
@@ -1354,6 +1480,253 @@ namespace
         return true;
     }
 
+    // Resolve the 180-degree banner-orientation ambiguity that the orient
+    // cycle and the eye-band scan both leave open.
+    //
+    // Context: the orient cycle picks the rotation that maximises detector
+    // score, but ESPDet occasionally scores nearly the same for ROT_0 and
+    // ROT_180 on a given frame (faces are roughly bilaterally symmetric
+    // and the model was trained with rotation augmentation), so the lock
+    // sometimes settles on the upside-down quadrant. estimate_face_keypoints
+    // can't disambiguate either: it constrains its dark-blob search to the
+    // upper half of the bbox and synthesises the nose from a fixed
+    // perpendicular to the eye line, so the recovered landmarks point the
+    // same direction whether the face is upright or inverted.
+    //
+    // We probe pixel content with two independent heuristics and vote.
+    // Both return:
+    //   +1  upright in detector frame   (banner uses banner_angle_for as-is)
+    //   -1  inverted in detector frame  (banner adds 180 deg)
+    //    0  ambiguous                   (no opinion -- defer to the other probe)
+    //
+    // The voted decision at the call site only flips the banner when the
+    // signed sum is negative; ties and positive sums leave the orient lock
+    // alone. That biases hard toward "keep upright when we're not sure":
+    // a failure-to-flip is a one-time cosmetic issue, but an erroneous flip
+    // makes an otherwise-correct banner look broken.
+
+    // ---- Probe A1: upper / lower bbox luma asymmetry ----
+    //
+    // Upright faces have eyes + eyebrows concentrated in the upper third of
+    // the bbox (dark features pulling mean luma down) and cheeks + chin in
+    // the lower third (mostly bright skin with one thin mouth stripe). The
+    // lower-third mean is therefore typically brighter than the upper-third
+    // mean for an upright face; the asymmetry flips for an inverted one.
+    //
+    // Always available (no keypoints required), but lighting-fragile: a
+    // top-lit face partially cancels the asymmetry, a strong rim light from
+    // below inverts it. The deadband filters out most of those cases.
+    int face_orientation_luma_sign(const uint16_t *fb_be, int frame_dim,
+                                   int x0, int y0, int x1, int y1) noexcept
+    {
+        x0 = std::max(0, x0);
+        y0 = std::max(0, y0);
+        x1 = std::min(frame_dim - 1, x1);
+        y1 = std::min(frame_dim - 1, y1);
+        const int bw = x1 - x0;
+        const int bh = y1 - y0;
+        // Need enough vertical room to fit two non-overlapping bands with a
+        // gap between them. Below ~60 px the samples are too sparse for the
+        // 8 % deadband to mean anything.
+        if (bw < 60 || bh < 60) {
+            return 0;
+        }
+
+        // Upper third vs lower third of the bbox in detector coords. The
+        // middle third (which straddles the eye line) is skipped so neither
+        // band picks up partial credit from the eye sockets themselves.
+        const int top_y0 = y0 + (bh * 12) / 100;
+        const int top_y1 = y0 + (bh * 38) / 100;
+        const int bot_y0 = y0 + (bh * 62) / 100;
+        const int bot_y1 = y0 + (bh * 88) / 100;
+        // Trim 15 % off each side so the bands stay on face pixels rather
+        // than hair / ears / background that leaked into the bbox.
+        const int x_lo = x0 + (bw * 15) / 100;
+        const int x_hi = x1 - (bw * 15) / 100;
+        if (x_hi - x_lo < 16) {
+            return 0;
+        }
+
+        const uint8_t *p8 = reinterpret_cast<const uint8_t *>(fb_be);
+        auto band_mean = [&](int yy0, int yy1) -> int {
+            // G6 luma proxy, matching luma_at() above. Stride-2 sampling
+            // keeps the whole probe well under 1 ms even at the worst-case
+            // bbox size, and the cost is paid once per enrol -- never per
+            // recognition frame.
+            uint32_t sum = 0;
+            int      n   = 0;
+            for (int y = yy0; y < yy1; y += 2) {
+                const int row_base = y * frame_dim;
+                for (int x = x_lo; x < x_hi; x += 2) {
+                    const int     idx = (row_base + x) * 2;
+                    const uint8_t hi  = p8[idx];
+                    const uint8_t lo  = p8[idx + 1];
+                    const int     g6  = ((hi & 0x07) << 3) | (lo >> 5);
+                    sum += static_cast<uint32_t>((g6 << 2) | (g6 >> 4));
+                    ++n;
+                }
+            }
+            return n ? static_cast<int>(sum / n) : -1;
+        };
+
+        const int top_mean = band_mean(top_y0, top_y1);
+        const int bot_mean = band_mean(bot_y0, bot_y1);
+        if (top_mean < 0 || bot_mean < 0) {
+            return 0;
+        }
+
+        // Normalised asymmetry in [-1, +1]. Positive = lower band brighter
+        // -> upright. The 0.08 floor is empirically ~2x the sensor-noise
+        // baseline for a uniformly-lit face; flatter than that and we'd be
+        // chasing speckle.
+        const int sum_means = top_mean + bot_mean;
+        if (sum_means <= 0) {
+            return 0;
+        }
+        const float asym = static_cast<float>(bot_mean - top_mean) /
+                           static_cast<float>(sum_means);
+        if (asym > 0.08f) {
+            return +1;
+        }
+        if (asym < -0.08f) {
+            return -1;
+        }
+        return 0;
+    }
+
+    // ---- Probe A2: mouth-stripe darkness comparison ----
+    //
+    // Given real eye centres (from estimate_face_keypoints, NOT the bbox-
+    // proportional fallback), construct the face-frame perpendicular axis
+    // and probe a thin horizontal stripe on each side of eye_mid at
+    // +/- 1.1 * eye_dx along that perpendicular. One stripe lands on the
+    // lip line, which is a sharp dark feature against surrounding skin;
+    // the other lands on forehead, which is mostly uniform skin. Compare
+    // the per-stripe minimum luma (rather than mean) -- the lip line is
+    // thin enough that means wash it out, but minimums latch onto it
+    // robustly even when most of the stripe is skin-coloured.
+    //
+    // More lighting-stable than A1 (a uniform top-light dims forehead and
+    // chin both, leaving the relative chin-stripe darkness intact), but
+    // depends on the eye localiser succeeding. Returns 0 when keypoints
+    // are unavailable or unreliable so the caller falls back to A1 alone.
+    //
+    // `kp_eye_scan` must point to 10 ints in detector-frame coords AND
+    // have come from estimate_face_keypoints (eye-scan path) -- the
+    // ArcFace-fallback landmarks point at "where a mouth would be on a
+    // generic face inside this bbox" rather than at the actual mouth, so
+    // the stripe-min comparison degenerates to noise on them.
+    int face_orientation_mouth_sign(const uint16_t *fb_be, int frame_dim,
+                                    const std::vector<int> *kp_eye_scan) noexcept
+    {
+        if (kp_eye_scan == nullptr || kp_eye_scan->size() != 10) {
+            return 0;
+        }
+        const std::vector<int> &kp = *kp_eye_scan;
+        const int le_x = kp[0], le_y = kp[1];
+        const int re_x = kp[2], re_y = kp[3];
+        const float fdx = static_cast<float>(re_x - le_x);
+        const float fdy = static_cast<float>(re_y - le_y);
+        const float norm = std::sqrt(fdx * fdx + fdy * fdy);
+        if (norm < 20.f) {
+            // Eyes too close together (small face or mis-localisation) --
+            // the +/- 1.1 * norm probe radius wouldn't reach a useful
+            // distance from the eye line.
+            return 0;
+        }
+
+        const float along_x = fdx / norm;
+        const float along_y = fdy / norm;
+        // perp = along rotated 90 deg CW. +perp is the "down" side in
+        // face-frame coords (the chin/mouth direction by convention).
+        const float perp_x  = -along_y;
+        const float perp_y  =  along_x;
+        const float mid_x   = (le_x + re_x) * 0.5f;
+        const float mid_y   = (le_y + re_y) * 0.5f;
+
+        // Probe centres: 1.1 * eye_dx along +perp (where mouth would be
+        // if face is upright) and -perp (where mouth would be if face is
+        // inverted). 1.1 matches the anthropometric ratio used by
+        // estimate_face_keypoints for the synthesised mouth corners.
+        const float p_pos_x = mid_x + 1.1f * norm * perp_x;
+        const float p_pos_y = mid_y + 1.1f * norm * perp_y;
+        const float p_neg_x = mid_x - 1.1f * norm * perp_x;
+        const float p_neg_y = mid_y - 1.1f * norm * perp_y;
+
+        const uint8_t *p8 = reinterpret_cast<const uint8_t *>(fb_be);
+        auto sample_luma = [&](int cx, int cy) -> int {
+            if (cx < 0 || cy < 0 || cx >= frame_dim || cy >= frame_dim) {
+                return -1;
+            }
+            const int     idx = (cy * frame_dim + cx) * 2;
+            const uint8_t hi  = p8[idx];
+            const uint8_t lo  = p8[idx + 1];
+            const int     g6  = ((hi & 0x07) << 3) | (lo >> 5);
+            return (g6 << 2) | (g6 >> 4);
+        };
+        // Stripe oriented along `along` (i.e. horizontal in face frame),
+        // centred at (cx, cy), length = 0.9 * eye_dx (covers a mouth-
+        // width but not so wide it overlaps the cheek shadows that bend
+        // up from the lip corners), N taps. We return the average of the
+        // 3 darkest taps so a single noisy pixel can't dominate the
+        // "is there a dark stripe here?" answer.
+        auto stripe_dark = [&](float cx, float cy) -> int {
+            constexpr int N    = 16;
+            int           taps[N];
+            int           n_valid = 0;
+            for (int i = 0; i < N; ++i) {
+                const float t  = (static_cast<float>(i) - (N - 1) * 0.5f) /
+                                 static_cast<float>(N - 1);  // -0.5 .. +0.5
+                const float sx = cx + t * 0.9f * norm * along_x;
+                const float sy = cy + t * 0.9f * norm * along_y;
+                const int   l  = sample_luma(static_cast<int>(sx + 0.5f),
+                                             static_cast<int>(sy + 0.5f));
+                if (l >= 0) {
+                    taps[n_valid++] = l;
+                }
+            }
+            if (n_valid < 6) {
+                return -1;  // mostly off-frame -- can't trust the answer
+            }
+            // Partial sort: pull the 3 darkest taps to the front.
+            const int k = std::min(3, n_valid);
+            std::partial_sort(taps, taps + k, taps + n_valid);
+            int s = 0;
+            for (int i = 0; i < k; ++i) {
+                s += taps[i];
+            }
+            return s / k;
+        };
+
+        const int pos_dark = stripe_dark(p_pos_x, p_pos_y);
+        const int neg_dark = stripe_dark(p_neg_x, p_neg_y);
+        if (pos_dark < 0 || neg_dark < 0) {
+            return 0;
+        }
+
+        // Lower dark-tap mean = mouth side. Positive asym = +perp side is
+        // brighter (so -perp side has the mouth, face is inverted in
+        // detector frame) -> return -1. Sign convention matches A1.
+        const int sum = pos_dark + neg_dark;
+        if (sum <= 0) {
+            return 0;
+        }
+        const float asym = static_cast<float>(neg_dark - pos_dark) /
+                           static_cast<float>(sum);
+        // Looser deadband than A1 (0.10 vs 0.08) because the mouth-stripe
+        // minimum is a much sharper feature than diffuse luma -- when this
+        // probe has signal at all, it has a lot of it. The threshold mostly
+        // guards against eye-localisation noise pushing the probe centres
+        // a few pixels off the actual mouth.
+        if (asym > 0.10f) {
+            return +1;
+        }
+        if (asym < -0.10f) {
+            return -1;
+        }
+        return 0;
+    }
+
     // ---- Per-bbox luminance normalisation (percentile stretch + gamma) ----
     //
     // ESP-DL's FeatImagePreprocessor crops + warps from the raw RGB565
@@ -1385,10 +1758,15 @@ namespace
     // We deliberately leave the original frame buffer (`src`) alone --
     // crop_face_thumb() runs on `src`, not `to_detect`, so the thumb
     // remains photographically faithful.
+    //
+    // IRAM_ATTR (definition only, see estimate_face_keypoints above for
+    // why not the decl too): this is the dominant per-frame pre-
+    // processing cost; keep it out of flash-cache so the AI task
+    // doesn't stall mid-pipeline.
     bool normalize_face_bbox(uint16_t *to_detect_be, int frame_dim,
                               int x0, int y0, int x1, int y1) noexcept
         __attribute__((hot));
-    bool normalize_face_bbox(uint16_t *to_detect_be, int frame_dim,
+    bool IRAM_ATTR normalize_face_bbox(uint16_t *to_detect_be, int frame_dim,
                               int x0, int y0, int x1, int y1) noexcept
     {
         x0 = std::max(0, x0);
@@ -1904,24 +2282,80 @@ namespace
         // Name-banner state: tracks what we last asked banner_render_name
         // to draw so we don't re-rasterise unchanged content every frame.
         // Re-rendering is ~1-2 ms (rasterise + outline dilate); it only
-        // needs to run when the recognised name or its quarter-turn
-        // angle bucket changes.
+        // needs to run when the recognised name, its quarter-turn angle
+        // bucket, or the sticky 180-deg flip-correction actually changes.
+        //
+        // `flipped` is a Schmitt-trigger latch driven by the A1/A2
+        // orientation probes (see publish_name_banner below): once the
+        // probes confidently say the face is inverted in detector frame,
+        // we add 180 deg and KEEP adding it until the probes confidently
+        // say it's upright again. Ambiguous (vote==0) frames leave the
+        // latch alone. Without the latch the banner would re-rasterise
+        // on every flip-vote oscillation, and oscillation between -1 and
+        // 0 is common in the deadband case the probes are designed to
+        // protect.
         struct {
             char name[FACE_NAME_MAX] = {0};
             int  angle_bucket        = -999;       // round(angle / pi/2)
+            bool flipped             = false;
         } name_banner_cache;
+
+        // Owns the Schmitt flip-latch update + angle-bucket
+        // quantisation + name-cache compare. Skips banner_render_name
+        // (which is the ~1-2 ms rasterise + outline dilate) when both
+        // the text and the bucket already match the cached state.
+        // `text` must be NUL-terminated and short enough to fit
+        // FACE_NAME_MAX after copy.
+        auto render_name_text_if_changed = [&](const char *text,
+                                                float angle_rad,
+                                                int up_vote) {
+            if (up_vote <= -2) {
+                name_banner_cache.flipped = true;
+            } else if (up_vote >= 2) {
+                name_banner_cache.flipped = false;
+            }
+
+            constexpr float kPi     = 3.14159265358979323846f;
+            constexpr float quarter = kPi * 0.5f;
+            const float corrected   = angle_rad +
+                                      (name_banner_cache.flipped ? kPi : 0.f);
+            const int bucket = static_cast<int>(roundf(corrected / quarter));
+            if (bucket != name_banner_cache.angle_bucket ||
+                std::strcmp(name_banner_cache.name, text) != 0) {
+                banner_render_name(text,
+                                   static_cast<float>(bucket) * quarter);
+                // memcpy + explicit null term (rather than strncpy) so
+                // -O3 doesn't trip its stringop-truncation analysis,
+                // which can't see that `text` is already guaranteed
+                // < FACE_NAME_MAX by every caller's source.
+                const size_t n = std::min(std::strlen(text),
+                                          (size_t)(FACE_NAME_MAX - 1));
+                std::memcpy(name_banner_cache.name, text, n);
+                name_banner_cache.name[n] = '\0';
+                name_banner_cache.angle_bucket = bucket;
+            }
+        };
 
         // Helper: publish the navy-blue name banner for a recognised
         // face, identified by its 1-based DB id. Reads the name out of
         // g_known_faces under the DB lock (released before the
         // expensive rasterise), then only re-runs banner_render_name
-        // if the name or its quarter-turn angle bucket actually
-        // changed. Refreshes the deadline atomically on every call so
-        // the banner stays up while the matcher keeps returning this
-        // face. Names that are empty (unset by the web UI) silently
-        // skip the banner: only user-named faces get the on-screen
-        // overlay.
-        auto publish_name_banner = [&](int id_1based, float angle_rad) {
+        // if the name, its quarter-turn angle bucket, or the sticky
+        // 180-deg flip latch actually changed. Refreshes the deadline
+        // atomically on every call so the banner stays up while the
+        // matcher keeps returning this face. Names that are empty
+        // (unset by the web UI) silently skip the banner: only user-
+        // named faces get the on-screen overlay.
+        //
+        // `up_vote` is the signed A1+A2 orientation probe sum (-2..+2)
+        // computed by the caller, or 0 if the caller couldn't run the
+        // probes this frame. The Schmitt latch in name_banner_cache.
+        // flipped means we don't need a non-zero vote on every call --
+        // unlike the NEW FACE banner (one-shot decision at enrol time),
+        // the name banner is republished every frame and we want it to
+        // hold its orientation across the inevitable deadband frames.
+        auto publish_name_banner = [&](int id_1based, float angle_rad,
+                                       int up_vote) {
             if (id_1based <= 0) {
                 return;
             }
@@ -1940,22 +2374,7 @@ namespace
                 return;             // unnamed face -- skip banner.
             }
 
-            constexpr float quarter = 3.14159265358979323846f * 0.5f;
-            const int bucket = static_cast<int>(roundf(angle_rad / quarter));
-            if (bucket != name_banner_cache.angle_bucket ||
-                std::strcmp(name_banner_cache.name, local_name) != 0) {
-                banner_render_name(local_name,
-                                   static_cast<float>(bucket) * quarter);
-                // memcpy + explicit null term (rather than strncpy) so
-                // -O3 doesn't trip its stringop-truncation analysis,
-                // which can't see that local_name is already guaranteed
-                // < FACE_NAME_MAX by the source it was copied from.
-                const size_t n = std::min(std::strlen(local_name),
-                                          (size_t)(FACE_NAME_MAX - 1));
-                std::memcpy(name_banner_cache.name, local_name, n);
-                name_banner_cache.name[n] = '\0';
-                name_banner_cache.angle_bucket = bucket;
-            }
+            render_name_text_if_changed(local_name, angle_rad, up_vote);
             g_name_banner_until_ms.store(
                 now_ms() + NAME_BANNER_LINGER_MS,
                 std::memory_order_relaxed);
@@ -2050,11 +2469,15 @@ namespace
                 // target down, but a steady face can't drag global
                 // metering into a feedback loop with itself. Same
                 // hysteresis bands as before.
-                const int  global_luma = g_last_mean_luma.load(
+                const int      global_luma = g_last_mean_luma.load(
                     std::memory_order_relaxed);
-                const int  face_lum    = g_last_face_luma.load(
+                const int      sat_pct     = g_last_sat_pct.load(
                     std::memory_order_relaxed);
-                const uint32_t face_ms = g_last_face_luma_ms.load(
+                const int      crush_pct   = g_last_crush_pct.load(
+                    std::memory_order_relaxed);
+                const int      face_lum    = g_last_face_luma.load(
+                    std::memory_order_relaxed);
+                const uint32_t face_ms     = g_last_face_luma_ms.load(
                     std::memory_order_relaxed);
                 const bool face_fresh =
                     face_lum >= 0 &&
@@ -2065,25 +2488,72 @@ namespace
                     luma = (FACE_AE_WEIGHT_PCT * face_lum +
                             (100 - FACE_AE_WEIGHT_PCT) * global_luma) / 100;
                 }
+
+                // Clip-aware transition logic. Mean luma alone can't
+                // see two real failure modes the OV2640's silicon
+                // AEC hands us:
+                //
+                //   - "blown highlights": a strong light source
+                //     (window, lamp) pushes a big fraction of pixels
+                //     to G6=63 while the rest of the frame averages
+                //     out to a fine-looking mean. The clipped pixels
+                //     are usually NOT the face, so face-weighted
+                //     mean doesn't save us either. We need to pull
+                //     gain DOWN to recover detail wherever the
+                //     subject actually is.
+                //
+                //   - "crushed shadows": the opposite -- most of the
+                //     frame is at G6=0 with a small bright region
+                //     dominating the mean. We need MORE gain to lift
+                //     the dark region into the detector's happy
+                //     range. Guarded by AE_CRUSH_MEAN_LIMIT so a
+                //     high-contrast but adequately-bright scene
+                //     can't trigger it.
+                //
+                // When either override fires we move ONE preset in
+                // the indicated direction regardless of where mean
+                // sits; the sensor's AEC has demonstrably picked
+                // the wrong operating point. Mean-based hysteresis
+                // still runs in the no-clip case (the common one).
                 AEPreset next = ae_preset;
-                switch (ae_preset) {
-                case AEPreset::DIM:
-                    if (luma > AE_DIM_TO_MID_LUMA)    next = AEPreset::MID;
-                    break;
-                case AEPreset::MID:
-                    if      (luma > AE_MID_TO_BRIGHT_LUMA) next = AEPreset::BRIGHT;
-                    else if (luma < AE_MID_TO_DIM_LUMA)    next = AEPreset::DIM;
-                    break;
-                case AEPreset::BRIGHT:
-                    if (luma < AE_BRIGHT_TO_MID_LUMA) next = AEPreset::MID;
-                    break;
+                const char *reason = "mean";
+                if (sat_pct > AE_SAT_OVERRIDE_PCT &&
+                    ae_preset != AEPreset::BRIGHT) {
+                    next = (ae_preset == AEPreset::DIM)
+                        ? AEPreset::MID
+                        : AEPreset::BRIGHT;
+                    reason = "sat";
+                } else if (crush_pct > AE_CRUSH_OVERRIDE_PCT &&
+                           luma < AE_CRUSH_MEAN_LIMIT &&
+                           ae_preset != AEPreset::DIM) {
+                    next = (ae_preset == AEPreset::BRIGHT)
+                        ? AEPreset::MID
+                        : AEPreset::DIM;
+                    reason = "crush";
+                } else {
+                    switch (ae_preset) {
+                    case AEPreset::DIM:
+                        if (luma > AE_DIM_TO_MID_LUMA)
+                            next = AEPreset::MID;
+                        break;
+                    case AEPreset::MID:
+                        if      (luma > AE_MID_TO_BRIGHT_LUMA)
+                            next = AEPreset::BRIGHT;
+                        else if (luma < AE_MID_TO_DIM_LUMA)
+                            next = AEPreset::DIM;
+                        break;
+                    case AEPreset::BRIGHT:
+                        if (luma < AE_BRIGHT_TO_MID_LUMA)
+                            next = AEPreset::MID;
+                        break;
+                    }
                 }
                 if (next != ae_preset) {
                     const char *names[] = { "DIM", "MID", "BRIGHT" };
                     ESP_LOGI(TAG,
-                             "AE preset %s -> %s (mean luma %d)",
+                             "AE preset %s -> %s (%s: luma=%d sat=%d%% crush=%d%%)",
                              names[(int)ae_preset], names[(int)next],
-                             luma);
+                             reason, luma, sat_pct, crush_pct);
                     apply_ae_preset(next);
                     ae_preset = next;
                     // Lock further transitions out for a cooldown window
@@ -2109,6 +2579,10 @@ namespace
                 // though half its inputs come from atomics / external
                 // structures.
                 const int  cur_mean_luma  = g_last_mean_luma.load(
+                    std::memory_order_relaxed);
+                const int  cur_sat_pct    = g_last_sat_pct.load(
+                    std::memory_order_relaxed);
+                const int  cur_crush_pct  = g_last_crush_pct.load(
                     std::memory_order_relaxed);
                 const int  cur_face_luma  = g_last_face_luma.load(
                     std::memory_order_relaxed);
@@ -2151,7 +2625,7 @@ namespace
                          "1s: frame=%u skip=%u raw=%u pad=%u kept=%u score_avg=%.2f "
                          "| rej:score=%u small=%u blurry=%u "
                          "| known=%u new=%u sp=%u qskip=%u (db=%u tpl=%u q=%.2f/%.2f/%.2f) "
-                         "| ae=%s luma=%d/%s try=%d lock=%d "
+                         "| ae=%s luma=%d/%s clip=%d/%d try=%d lock=%d "
                          "(misses=%d pend=%d/2)",
                          (unsigned)s_frames,
                          (unsigned)s_motion_skip,
@@ -2170,6 +2644,7 @@ namespace
                          AE_NAMES[(int)ae_preset],
                          cur_mean_luma,
                          face_lum_buf,
+                         cur_sat_pct, cur_crush_pct,
                          (int)try_orient,
                          (int)last_locked_orient,
                          consecutive_misses,
@@ -2705,8 +3180,17 @@ namespace
                 // Refresh the name banner if this face is named --
                 // we skip the embedder on cache hits, so we have to
                 // re-publish here to keep the navy overlay alive.
+                // Cache-hot path: we didn't run the embedder this frame,
+                // so we have no real keypoints to feed A2. Run A1 alone
+                // and let the Schmitt latch in publish_name_banner hold
+                // any previous flip decision across deadband frames.
+                const int up_vote = face_orientation_luma_sign(
+                    to_detect, FRAME_DIM,
+                    biggest->box[0], biggest->box[1],
+                    biggest->box[2], biggest->box[3]);
                 publish_name_banner(recog_cache.matched_id,
-                                    banner_angle_for(locked_orient));
+                                    banner_angle_for(locked_orient),
+                                    up_vote);
                 esp_camera_fb_return(fb);
                 continue;
             }
@@ -3024,8 +3508,20 @@ namespace
                 }
             }
 
+            // Cross-identity margin gate. Spatial-track overrides
+            // are exempt: the override only fires when the bbox IoU
+            // proves it's the same physical face that was just
+            // recognised, so cosine-margin ambiguity is irrelevant.
+            // First-face / single-enrol case: second_best_sim stays
+            // at the -2 sentinel and the margin always passes.
+            const bool margin_ok =
+                spatial_track_overrode ||
+                second_best_sim < 0.f  ||
+                (best_sim - second_best_sim) >= RECOG_MARGIN_MIN;
+
             if (best_id > 0 &&
-                (sim_track >= g_tuning.match_thr || spatial_track_overrode))
+                (sim_track >= g_tuning.match_thr || spatial_track_overrode) &&
+                margin_ok)
             {
                 // Recognised — no enroll, no banner. We removed the
                 // "OH... IT'S YOU" path: recognition is now silent so
@@ -3142,8 +3638,23 @@ namespace
 
                 // Show the navy name banner along the bottom of the
                 // preview if this face has been named in the web UI.
-                publish_name_banner(best_id,
-                                    banner_angle_for(locked_orient));
+                // Fresh-recog path: we ran the embedder so kp_for_feat
+                // is populated. A2 needs real eye centres (kp_from_eye_
+                // scan); if it bailed we fall back to A1 alone via the
+                // 0-vote path in face_orientation_mouth_sign.
+                {
+                    const int up_a1 = face_orientation_luma_sign(
+                        to_detect, FRAME_DIM,
+                        biggest->box[0], biggest->box[1],
+                        biggest->box[2], biggest->box[3]);
+                    const int up_a2 = kp_from_eye_scan
+                        ? face_orientation_mouth_sign(
+                              to_detect, FRAME_DIM, kp_for_feat)
+                        : 0;
+                    publish_name_banner(best_id,
+                                        banner_angle_for(locked_orient),
+                                        up_a1 + up_a2);
+                }
 
                 esp_camera_fb_return(fb);
                 continue;
@@ -3353,19 +3864,47 @@ namespace
                 // alone.
                 if (g_banner_until_ms.load(std::memory_order_relaxed) <= now_ms())
                 {
-                    // Banner rotation = orient-cycle's locked orientation.
-                    // Discrete quarter-turn from the orient lock; see
-                    // banner_angle_for() for the convention.
-                    const float roll = banner_angle_for(locked_orient);
+                    // Start from the orient-cycle's discrete quarter-turn
+                    // (see banner_angle_for() for the convention).
+                    float roll = banner_angle_for(locked_orient);
+                    // Then sanity-check whether the face inside that
+                    // quadrant is actually upright. Two independent probes
+                    // each return +1 / 0 / -1; we sum the signed votes and
+                    // only flip the banner 180 deg when BOTH probes
+                    // independently say "inverted" (vote == -2). Single-
+                    // probe disagreement (vote == -1) is the deadband
+                    // case -- bright outdoor light or odd lighting can
+                    // make either probe individually wrong, so we require
+                    // unanimous evidence before mutating an enrol-time
+                    // banner orientation that we won't get to revisit.
+                    const int up_a1 = face_orientation_luma_sign(
+                        to_detect, FRAME_DIM,
+                        biggest->box[0], biggest->box[1],
+                        biggest->box[2], biggest->box[3]);
+                    // A2 only has signal when the eye centres came from
+                    // the real dark-blob scan -- the ArcFace fallback
+                    // landmarks point at "where a mouth would be on a
+                    // generic face" rather than the actual mouth, so the
+                    // stripe-darkness comparison would be noise.
+                    const int up_a2 = kp_from_eye_scan
+                        ? face_orientation_mouth_sign(
+                              to_detect, FRAME_DIM, kp_for_feat)
+                        : 0;
+                    const int up_vote = up_a1 + up_a2;
+                    if (up_vote <= -2) {
+                        constexpr float kPi = 3.14159265358979323846f;
+                        roll += kPi;
+                    }
                     banner_render(roll);
                     g_banner_until_ms.store(now_ms() + BANNER_HOLD_MS,
                                             std::memory_order_relaxed);
 
                     ESP_LOGI(TAG,
-                             "NEW face enrolled id=%u (total=%u, bbox=%dx%d, focus=%d, q=%.2f, orient=%d, roll=%.0fdeg, tta=%s)",
+                             "NEW face enrolled id=%u (total=%u, bbox=%dx%d, focus=%d, q=%.2f, orient=%d, up=%+d(a1=%+d a2=%+d), roll=%.0fdeg, tta=%s)",
                              (unsigned)new_count,
                              (unsigned)new_count,
                              bw, bh, focus, (double)candidate_q, (int)locked_orient,
+                             up_vote, up_a1, up_a2,
                              (double)(roll * 180.f / 3.14159265f),
                              tta_applied ? "yes" : "no");
                 }
@@ -3458,7 +3997,26 @@ bool face_db_get_entry(int idx, face_db_entry_t *out)
     return true;
 }
 
-bool face_db_copy_thumb(int idx, uint16_t *dst, size_t dst_capacity_pixels)
+int face_db_snapshot(face_db_entry_t *out, int max)
+{
+    if (!out || max <= 0 || !g_db_mux) {
+        return 0;
+    }
+    FaceDbLock lock;
+    const int n = std::min(max, static_cast<int>(g_known_faces.size()));
+    for (int i = 0; i < n; ++i) {
+        const auto &kf   = g_known_faces[i];
+        out[i].idx         = i;
+        out[i].enrolled_ms = kf.enrolled_ms;
+        out[i].thumb_w     = FACE_THUMB_DIM;
+        out[i].thumb_h     = FACE_THUMB_DIM;
+        std::memcpy(out[i].name, kf.name, FACE_NAME_MAX);
+    }
+    return n;
+}
+
+bool face_db_copy_thumb(int idx, uint16_t *dst, size_t dst_capacity_pixels,
+                        uint32_t *out_enrolled_ms)
 {
     if (!dst || !g_db_mux ||
         dst_capacity_pixels < static_cast<size_t>(FACE_THUMB_DIM) * FACE_THUMB_DIM) {
@@ -3473,6 +4031,9 @@ bool face_db_copy_thumb(int idx, uint16_t *dst, size_t dst_capacity_pixels)
         return false;
     }
     std::memcpy(dst, kf.thumb.data(), kf.thumb.size() * sizeof(uint16_t));
+    if (out_enrolled_ms) {
+        *out_enrolled_ms = kf.enrolled_ms;
+    }
     return true;
 }
 

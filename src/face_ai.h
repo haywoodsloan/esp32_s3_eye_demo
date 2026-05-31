@@ -63,8 +63,9 @@ void face_ai_get_overlay(face_overlay_t *out);
 // pixels). Declared as `static constexpr int` (not `#define`) so
 // header consumers get type-safety and so the values appear in the
 // debug symbol table.
-static constexpr int FACE_THUMB_DIM = 64;
-static constexpr int FACE_NAME_MAX  = 32;
+static constexpr int FACE_THUMB_DIM   = 64;
+static constexpr int FACE_NAME_MAX    = 32;
+static constexpr int MAX_KNOWN_FACES  = 32;
 
 typedef struct {
     int      idx;                 // 0-based position in the face DB
@@ -81,12 +82,25 @@ int  face_db_count(void);
 // out of range. Thread-safe.
 bool face_db_get_entry(int idx, face_db_entry_t *out);
 
+// Atomically copy metadata for all currently-enrolled faces into
+// `out`. Copies at most `max` entries; returns the number actually
+// copied. The entire copy happens under a single lock, so the result
+// is a coherent snapshot even if other tasks add or delete faces
+// concurrently. Prefer this over count+get_entry loops, which can
+// see torn state when a DELETE shifts the gallery between calls.
+int  face_db_snapshot(face_db_entry_t *out, int max);
+
 // Copy thumbnail pixels (RGB565 big-endian, FACE_THUMB_DIM ** 2 pixels)
 // for face `idx` into `dst`. `dst_capacity_pixels` must be at least
-// FACE_THUMB_DIM*FACE_THUMB_DIM. Returns false if `idx` is out of
-// range or `dst` is too small. Thread-safe.
+// FACE_THUMB_DIM*FACE_THUMB_DIM. If `out_enrolled_ms` is non-null,
+// the entry's enrolled_ms is written there atomically under the same
+// DB lock that fetches the pixels -- callers using it as an ETag
+// validator are then race-free against concurrent deletes / re-enrols.
+// Returns false if `idx` is out of range or `dst` is too small.
+// Thread-safe.
 bool face_db_copy_thumb(int idx, uint16_t *dst,
-                        size_t dst_capacity_pixels);
+                        size_t dst_capacity_pixels,
+                        uint32_t *out_enrolled_ms = nullptr);
 
 // Set the human-readable name for face `idx`. The string is copied;
 // at most FACE_NAME_MAX-1 chars are stored (truncated, NUL-terminated).
