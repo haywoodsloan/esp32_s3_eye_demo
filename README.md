@@ -8,7 +8,7 @@ DETECTED" banner whenever a face is enrolled, a navy name banner whenever
 a known face is recognised, and an mDNS-discoverable web UI for browsing,
 naming, and deleting everyone the camera has seen since boot.
 
-Built with PlatformIO + ESP-IDF on top of the
+Built with ESP-IDF on top of the
 [ESP-WHO](https://github.com/espressif/esp-who) face stack (MSR + MNP
 detector, MobileFaceNet embedder). Everything runs on the S3's two
 Xtensa LX7 cores — no cloud, no companion app, no off-device inference.
@@ -83,16 +83,17 @@ and [`src/camera.cpp`](src/camera.cpp) (sensor config).
 
 ### Prerequisites
 
-- [PlatformIO Core](https://platformio.org/install/cli) — the VS Code
-  extension works too.
-- Python 3.10+ on `PATH`. Used by two `pre:` extra scripts:
-  - [`scripts/embed_web_html.py`](scripts/embed_web_html.py) bakes
-    [`src/web/index.html`](src/web/index.html) into a C++ raw-string
-    header that the firmware serves over HTTP.
-  - [`scripts/flash_espdl_models.py`](scripts/flash_espdl_models.py)
-    packs the ESP-DL model blobs and appends them to PlatformIO's
-    `FLASH_EXTRA_IMAGES` so they land in their own flash partitions
-    on every `pio run -t upload`.
+- [ESP-IDF v6.0.1](https://docs.espressif.com/projects/esp-idf/en/v6.0.1/esp32s3/get-started/index.html)
+  with the esp32s3 toolchain. The [ESP-IDF VS Code
+  extension](https://github.com/espressif/vscode-esp-idf-extension) is the
+  easiest way to install it and is what this repo's `.vscode/` settings
+  target, but a command-line `idf.py` install works just as well.
+- Python 3.10+ — the interpreter bundled with ESP-IDF is used
+  automatically. [`scripts/embed_web_html.py`](scripts/embed_web_html.py)
+  bakes [`src/web/index.html`](src/web/index.html) into a pre-gzipped C++
+  byte-array header that the firmware serves over HTTP; it runs as a
+  build-time CMake custom command (see
+  [`src/CMakeLists.txt`](src/CMakeLists.txt)).
 
 ### One-time setup
 
@@ -108,18 +109,21 @@ notepad src\wifi_credentials.h
 ### Build, flash, monitor
 
 ```pwsh
-pio run                 # build app + bootloader + partition table
-pio run -t upload       # also packs and flashes the ESP-DL model partitions
-pio device monitor      # 115200 baud
+idf.py set-target esp32s3   # one-time: generates sdkconfig from sdkconfig.defaults
+idf.py build                # app + bootloader + partition table + packed model blobs
+idf.py flash                # also flashes the ESP-DL model partitions (auto-detects port)
+idf.py monitor              # 115200 baud; Ctrl-] to exit
 ```
 
+`idf.py flash monitor` chains the last two; add `-p COMx` to either to
+pin a specific serial port instead of auto-detecting.
+
 The two ESP-DL model partitions (`human_face_det`, `human_face_feat`)
-are packed and uploaded by
-[`scripts/flash_espdl_models.py`](scripts/flash_espdl_models.py), which
-PlatformIO invokes as a `pre:` extra script (see
-[`platformio.ini`](platformio.ini)). This works around the
-[upstream esp-dl bug](#workarounds) with PlatformIO's relative
-`BUILD_DIR`.
+are packed and flashed automatically by the upstream `human_face_detect`
+/ `human_face_recognition` components: their CMake hooks
+`esptool_py_flash_to_partition(flash …)` into the `flash` target, so
+`idf.py flash` writes them alongside the app. No project-side script is
+involved (see [workarounds](#workarounds)).
 ### Web UI
 
 Once the device logs `got IP: ...` and `mDNS up: http://esp-face-detect.local/`,
@@ -527,10 +531,9 @@ src/
 ├── idf_component.yml           ESP-IDF managed-component dependencies
 └── CMakeLists.txt
 scripts/
-├── flash_espdl_models.py       packs + appends model partitions to FLASH_EXTRA_IMAGES
-└── embed_web_html.py           regenerates src/web/index_html_data.h from index.html before each build
+└── embed_web_html.py           regenerates src/web/index_html_data.h from index.html at build time
 partitions.csv                  see partition layout above
-platformio.ini                  PIO env config, extra_script hooks
+CMakeLists.txt                  top-level IDF project; registers src/ as the app component
 sdkconfig.defaults              key ESP-IDF knobs (PSRAM, exception support, brownout, etc.)
 ```
 
@@ -592,30 +595,37 @@ model partitions resident in flash:
 A few non-obvious things this codebase has to do; documented here so
 they don't get re-discovered the hard way.
 
-1. **`-fuse-cxa-atexit` leaks into C compiles** when `CONFIG_COMPILER_CXX_EXCEPTIONS=y`
-   (needed by ESP-DL), causing `-Werror` builds to fail. Worked around
-   with `build_unflags = -fuse-cxa-atexit` in [`platformio.ini`](platformio.ini).
+1. **ESP-DL models live in dedicated flash partitions** (`_IN_FLASH_PARTITION`,
+   not `_IN_FLASH_RODATA` in the app image). The `human_face_detect` /
+   `human_face_recognition` components pack the `.espdl` blobs and hook
+   `esptool_py_flash_to_partition(flash …)` into the `flash` target, so
+   `idf.py flash` writes them to the `human_face_det` / `human_face_feat`
+   partitions automatically. The partition names in
+   [`partitions.csv`](partitions.csv) must match what those components
+   expect.
 
-2. **ESP-DL `_IN_FLASH_RODATA` mode has a doubled-path bug under PlatformIO**:
-   `idf_build_get_property(BUILD_DIR)` returns a relative path under PIO,
-   which CMake then re-resolves against `CMAKE_CURRENT_BINARY_DIR`. We
-   sidestep it entirely by using `_IN_FLASH_PARTITION` and dedicated
-   model partitions.
+2. **Only the ESPDET detector blob is packed.** The `human_face_detect`
+   component's Kconfig defaults the legacy MSR+MNP cascade to "flash" too;
+   packing all three overflows the 512 KB `human_face_det` partition
+   (671 KB). [`sdkconfig.defaults`](sdkconfig.defaults) sets
+   `CONFIG_FLASH_HUMAN_FACE_DETECT_MSRMNP_S8_V1=n` so only the ~484 KB
+   ESPDET blob is packed.
 
-3. **PIO doesn't pack or auto-flash extra ESP-DL partitions** — the
-   upstream esp-dl model packing is hooked into CMake (`add_custom_target ALL`
-   + `add_dependencies(flash …)`), which SCons-driven PIO never invokes.
-   [`scripts/flash_espdl_models.py`](scripts/flash_espdl_models.py) runs as
-   a `pre:` extra script, packs the `.espdl` blobs, and appends them to
-   `FLASH_EXTRA_IMAGES` so PIO's espressif32 platform picks them up.
+3. **`src/` is the app component, not `main/`.** The top-level
+   [`CMakeLists.txt`](CMakeLists.txt) adds it via `EXTRA_COMPONENT_DIRS`,
+   which IDF registers as a single component because it carries its own
+   `CMakeLists.txt`. A renamed main gets no implicit dependency on every
+   other component, so [`src/CMakeLists.txt`](src/CMakeLists.txt) lists its
+   `REQUIRES` explicitly.
 
-4. **`target_add_binary_data` / `EMBED_TXTFILES` hit the same doubled-
-   path bug as #2** when used to embed `src/web/index.html`. Same
-   root-cause: PIO's relative `BUILD_DIR` doubled by CMake's
-   re-resolution. Sidestepped with [`scripts/embed_web_html.py`](scripts/embed_web_html.py)
-   — a `pre:` script that reads the HTML and emits a C++ raw-string
-   literal header, which [`src/webserver.cpp`](src/webserver.cpp)
-   includes directly. The generated header is gitignored.
+4. **The web UI is embedded pre-gzipped.** `EMBED_TXTFILES` would embed the
+   raw HTML verbatim; instead
+   [`scripts/embed_web_html.py`](scripts/embed_web_html.py) gzips
+   [`src/web/index.html`](src/web/index.html) on the build host and emits a
+   C++ byte-array header that [`src/webserver.cpp`](src/webserver.cpp)
+   serves with a `Content-Encoding: gzip` header. It runs as a CMake custom
+   command (see [`src/CMakeLists.txt`](src/CMakeLists.txt)); the generated
+   header is gitignored.
 
 5. **Brownout detector lowered** from the IDF default `SEL_7` (~3.19 V)
    to `SEL_4` (~2.79 V). Transient peak-current dips when camera + LCD
@@ -672,4 +682,5 @@ they don't get re-discovered the hard way.
   kernels.
 - [esp32-camera](https://github.com/espressif/esp32-camera) for the
   OV2640 HAL.
-- [PlatformIO](https://platformio.org/) for the build orchestration.
+- [ESP-IDF](https://github.com/espressif/esp-idf) for the build system
+  and toolchain.

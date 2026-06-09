@@ -65,11 +65,12 @@ static void mdns_bringup(void)
 }
 // --- HTML page ------------------------------------------------------
 
-// The UI source of truth is src/web/index.html. A PlatformIO pre-script
+// The UI source of truth is src/web/index.html. A CMake custom command
 // (scripts/embed_web_html.py) regenerates src/web/index_html_data.h on
-// every build, embedding the file as a raw-string literal in the
-// web:: namespace. That gives us a single-round-trip self-contained
-// page without dragging in SPIFFS or littering this file with HTML.
+// every build, embedding the file as a pre-gzipped byte array in the
+// web:: namespace (served with Content-Encoding: gzip). That gives us a
+// single-round-trip self-contained page without dragging in SPIFFS or
+// littering this file with HTML.
 
 // --- helpers --------------------------------------------------------
 

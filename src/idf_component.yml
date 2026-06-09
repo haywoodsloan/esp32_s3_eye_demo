@@ -1,5 +1,6 @@
-## IDF Component Manager manifest for the project's "main" component (src/).
-## PlatformIO + ESP-IDF will pull these in automatically on the next build.
+## IDF Component Manager manifest for the project's app component (src/).
+## The IDF Component Manager fetches these into managed_components/ on the
+## next `idf.py build`.
 dependencies:
   espressif/esp32-camera: "^2.0.15"
 

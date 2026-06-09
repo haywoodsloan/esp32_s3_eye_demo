@@ -1,6 +1,11 @@
 """Generate a C++ header embedding ``src/web/index.html`` as a pre-gzipped
-byte array. Runs as a PlatformIO ``pre:`` extra script so the header is
-always up to date before the C++ compile starts.
+byte array.
+
+Usage:
+    python embed_web_html.py <input.html> <output_header.h>
+
+Invoked from ``src/CMakeLists.txt`` as a build-time CMake custom command
+so the header is always up to date before the C++ compile starts.
 
 Why pre-gzipped: the page compresses to roughly a third of its source
 size. Shipping the compressed bytes with a ``Content-Encoding: gzip``
@@ -8,13 +13,12 @@ header off-loads compression to the build host and cuts wifi airtime
 on every page load. The IDF http server doesn't compress on the fly,
 so without this every request would push the raw HTML.
 
-Why this is here rather than ``target_add_binary_data`` / ``EMBED_TXTFILES``:
-both of those upstream ESP-IDF helpers walk through
-``idf_build_get_property(BUILD_DIR)`` which PIO returns as a *relative*
-path. CMake then re-resolves that against ``CMAKE_CURRENT_BINARY_DIR``,
-producing a doubled ``.pio/build/<env>/.pio/build/<env>/...`` path that
-the generated asm rule can't find. Same root-cause as the ESP-DL model
-embed bug worked around in ``scripts/flash_espdl_models.py``.
+Why this rather than ``target_add_binary_data`` / ``EMBED_TXTFILES``:
+those upstream ESP-IDF helpers embed the file's raw bytes verbatim with
+no compression. Pre-gzipping on the build host lets the firmware ship the
+page at roughly a third of its size and serve it with a
+``Content-Encoding: gzip`` header, so this small custom generator earns
+its keep.
 
 The generated header is gitignored and lives next to its source, so
 editing the HTML feels like editing a normal asset file: change
@@ -22,26 +26,19 @@ editing the HTML feels like editing a normal asset file: change
 firmware boot serves the new page.
 """
 
-# SCons exposes the PIO build environment via dependency injection.
-Import("env")  # noqa: F821  pylint: disable=undefined-variable
-
 import gzip
+import sys
 from pathlib import Path
-
-PROJECT_DIR = Path(env["PROJECT_DIR"])  # noqa: F821
-SRC_DIR     = PROJECT_DIR / "src" / "web"
-HTML_PATH   = SRC_DIR / "index.html"
-HEADER_PATH = SRC_DIR / "index_html_data.h"
 
 # Level 9 buys a few percent over 6 on text and is essentially free at
 # build time for a file this size.
 GZIP_LEVEL = 9
 
 
-def generate_header() -> None:
+def generate_header(html_path: Path, header_path: Path) -> None:
     # Normalise line endings before compressing so the output is
     # bit-identical regardless of git's autocrlf setting on Windows.
-    raw = HTML_PATH.read_text(encoding="utf-8").replace("\r\n", "\n").encode("utf-8")
+    raw = html_path.read_text(encoding="utf-8").replace("\r\n", "\n").encode("utf-8")
 
     # mtime=0 strips the modification-time field from the gzip header
     # (Python 3.8+). Without this every build produces a different blob
@@ -82,13 +79,26 @@ def generate_header() -> None:
 
     # Only rewrite if the contents actually changed -- avoids forcing a
     # downstream recompile of webserver.cpp on every build.
-    if HEADER_PATH.exists() and HEADER_PATH.read_text(encoding="utf-8") == header:
+    if header_path.exists() and header_path.read_text(encoding="utf-8") == header:
         return
-    HEADER_PATH.write_text(header, encoding="utf-8")
+    header_path.parent.mkdir(parents=True, exist_ok=True)
+    header_path.write_text(header, encoding="utf-8")
     print(
-        f"embed_web_html: regenerated {HEADER_PATH.relative_to(PROJECT_DIR)}"
+        f"embed_web_html: regenerated {header_path.name}"
         f" ({len(raw)} B -> {len(gz)} B gz)"
     )
 
 
-generate_header()
+def main(argv: list[str]) -> int:
+    if len(argv) != 3:
+        print(
+            "usage: embed_web_html.py <input.html> <output_header.h>",
+            file=sys.stderr,
+        )
+        return 2
+    generate_header(Path(argv[1]), Path(argv[2]))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

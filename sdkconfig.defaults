@@ -6,6 +6,11 @@ CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
 CONFIG_ESPTOOLPY_HEADER_FLASHSIZE_UPDATE=y
 
+# Flash read mode: DIO. Carries over the PlatformIO board_build.flash_mode
+# = dio setting so the native idf.py build keeps the exact bootloader
+# flash configuration this board was validated on.
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+
 # Custom partition table: 6 MB app + 1 MB SPIFFS for the face DB
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
@@ -15,9 +20,9 @@ CONFIG_COMPILER_CXX_EXCEPTIONS=y
 
 # ESP-WHO face detection (ESPDet PICO 224x224 single-stage detector)
 # flashed to its own partition. FLASH_PARTITION (rather than
-# FLASH_RODATA) avoids a PlatformIO + esp-dl CMake bug where the
-# BUILD_DIR relative path gets doubled when generating the embedded-
-# binary .S file. It also keeps the app binary small.
+# FLASH_RODATA) keeps the app binary small and lets the component's
+# CMake pack the .espdl blob and flash it straight to the dedicated
+# partition via esptool_py_flash_to_partition on `idf.py flash`.
 #
 # The two-stage MSR+MNP cascade that was previously the default got
 # benchmarked at mAP50-95 = 0.367 on Espressif's val set; ESPDet PICO
@@ -29,6 +34,15 @@ CONFIG_HUMAN_FACE_DETECT_MODEL_IN_FLASH_PARTITION=y
 CONFIG_FLASH_ESPDET_PICO_224_224_FACE=y
 CONFIG_ESPDET_PICO_224_224_FACE=y
 CONFIG_DEFAULT_HUMAN_FACE_DETECT_MODEL=1
+
+# Pack ONLY the selected ESPDET model into the human_face_det partition.
+# The human_face_detect component's Kconfig defaults the legacy MSR+MNP
+# cascade blobs to "flash" as well; packing all three produces a 671 KB
+# blob that overflows the 512 KB partition (and we don't use MSR+MNP).
+# Under PlatformIO this never bit us because the old pre-script packed
+# espdet alone -- native IDF packs whatever CONFIG_FLASH_* selects, so we
+# must turn the cascade off explicitly here.
+CONFIG_FLASH_HUMAN_FACE_DETECT_MSRMNP_S8_V1=n
 
 # ESP-WHO face recognition (MobileFaceNet, smaller/faster of the two) also
 # in its own partition for the same reason.
